@@ -6,6 +6,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-14
+
 ### Added
 - An HTTP client in `std/http`: `get`, `head`, `post`, `post_form` and `request` (any method,
   headers, body, timeout, redirects on or off), giving a `ClientResponse` (status, headers, body,
@@ -138,7 +140,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 - Benchmark against Go, Rust and Python (`bench/compare`).
 - Release package, installer (`install.sh`) and GitHub workflows. MIT license.
 
-[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/cajulang/cajulang/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cajulang/cajulang/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cajulang/cajulang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cajulang/cajulang/compare/v0.2.0...v0.3.0
