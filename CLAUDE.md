@@ -76,8 +76,8 @@ expect(v).to_equal(w) }) })`. There are no `.out` files. Compile/run errors of a
 `run_file("testdata/x.caju")` → `r.output`, `r.code`. Known bug not fixed yet: write the correct
 test with `skip("... (known bug)", ...)`.
 
-In wasm (`--target wasm tests/lang lib examples`) everything passes except `net` and `http` (no
-sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
+In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`, `http` and `http_client`
+(no sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
 Expected result today: **888 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows

@@ -6,6 +6,19 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Added
+- An HTTP client in `std/http`: `get`, `head`, `post`, `post_form` and `request` (any method,
+  headers, body, timeout, redirects on or off), giving a `ClientResponse` (status, headers, body,
+  final URL). It keeps connections alive and reuses them, replacing one the server closed; follows
+  301/302/303/307/308 redirects (up to 10); reads bodies by Content-Length, chunked or until the
+  close; skips 100 Continue. Plain `http://` only: `https://` URLs are refused (no TLS yet).
+  `docs/http.md`.
+- `http.query_escape`, `http.query_unescape`, `http.encode_form` and `http.parse_form`.
+- `net.resolve(host)`: host names to IPv4 addresses, from `/etc/hosts` and then the DNS servers of
+  `/etc/resolv.conf` (A records, cached for their TTL). `net.dial` now takes names too.
+- `net.dial_timeout(host, port, ms)`, `Conn.set_timeout(ms)` (reads and writes that wait longer
+  fail with "timed out") and `Conn.readable()`.
+
 ### Fixed
 - Slicing a `str` (`s[a:b]`) keeps the bytes as they are. It used to replace bytes that are not
   UTF-8 with U+FFFD, which corrupted binary data (network protocols, compressed data) and could

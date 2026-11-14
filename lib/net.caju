@@ -1,9 +1,12 @@
-# std/net: TCP sockets over IPv4 (Linux x86-64).
+# std/net: TCP sockets over IPv4 (Linux x86-64), and host names resolved to IPv4 addresses
+# (/etc/hosts, then the DNS servers of /etc/resolv.conf).
 
 import "std/strings"
 import "std/strconv"
+import "std/os"
 
 const SYS_CLOSE = 3
+const SYS_POLL = 7
 const SYS_SOCKET = 41
 const SYS_CONNECT = 42
 const SYS_ACCEPT = 43
@@ -21,6 +24,9 @@ const SYS_SCHED_GETAFFINITY = 204
 
 const AF_INET = 2
 const SOCK_STREAM = 1
+const SOCK_DGRAM = 2
+const SO_RCVTIMEO = 20
+const SO_SNDTIMEO = 21
 const SOL_SOCKET = 1
 const SO_REUSEADDR = 2
 const SO_REUSEPORT = 15
@@ -34,7 +40,7 @@ const MSG_NOSIGNAL = 0x4000      # a write to a closed connection returns an err
 fn sys_error(what: str, r: int) -> error {
   e := -r
   msg := "error " + str(e)
-  if e == 98 { msg = "address already in use" } else if e == 111 { msg = "connection refused" } else if e == 13 { msg = "permission denied" } else if e == 104 { msg = "connection reset by peer" } else if e == 32 { msg = "broken pipe" } else if e == 110 { msg = "connection timed out" } else if e == 101 { msg = "network is unreachable" } else if e == 99 { msg = "cannot assign requested address" }
+  if e == 98 { msg = "address already in use" } else if e == 111 { msg = "connection refused" } else if e == 13 { msg = "permission denied" } else if e == 104 { msg = "connection reset by peer" } else if e == 32 { msg = "broken pipe" } else if e == 110 { msg = "connection timed out" } else if e == 101 { msg = "network is unreachable" } else if e == 99 { msg = "cannot assign requested address" } else if e == 11 || e == 115 { msg = "timed out" } else if e == 113 { msg = "no route to host" }
   return errors.New(what + ": " + msg)
 }
 
@@ -137,18 +143,48 @@ fn (l: *Listener) accept_flags(flags: int) -> (*Conn, int) {
 }
 export fn (l: *Listener) close() { __syscall(SYS_CLOSE, l.fd, 0, 0, 0, 0, 0) }
 
-# connects to host:port
-export fn dial(host: str, port: int) -> (*Conn, error) {
-  ip := parse_ipv4(host)
-  if ip < 0 { return nil, errors.New("dial: invalid IPv4 address \"" + host + "\"") }
-  fd := __syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0, 0, 0, 0)
+# connects to host:port; host is an IPv4 address or a name (see resolve)
+export fn dial(host: str, port: int) -> (*Conn, error) { return dial_timeout(host, port, 0) }
+
+# dial that gives up after timeout_ms (0: the system's limit, about two minutes)
+export fn dial_timeout(host: str, port: int, timeout_ms: int) -> (*Conn, error) {
+  addr, rerr := resolve(host)
+  if rerr != nil { return nil, errors.New("dial " + host + ":" + str(port) + ": " + rerr.Error()) }
+  ip := parse_ipv4(addr)
+  fd := __syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0)
   if fd < 0 { return nil, sys_error("socket", fd) }
+  # a blocking connect gives up after SO_SNDTIMEO (EINPROGRESS)
+  if timeout_ms > 0 { set_timeouts(fd, timeout_ms) }
   r := __syscall(SYS_CONNECT, fd, sockaddr(ip, port), 16, 0, 0, 0)
   if r < 0 {
     __syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
     return nil, sys_error("dial " + host + ":" + str(port), r)
   }
-  return &Conn{fd: fd}, nil
+  if timeout_ms > 0 { set_timeouts(fd, 0) }
+  return &Conn{fd: fd, remote_addr: addr + ":" + str(port)}, nil
+}
+
+# SO_RCVTIMEO and SO_SNDTIMEO (struct timeval); 0 waits forever
+fn set_timeouts(fd: int, ms: int) {
+  tv := __newstr(16) + 8
+  __store64(tv, ms / 1000)
+  __store64(tv + 8, ms % 1000 * 1000)
+  __syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16, 0)
+  __syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16, 0)
+}
+
+# a read or write that waits longer than ms fails with "timed out" (0: wait forever)
+export fn (c: *Conn) set_timeout(ms: int) { set_timeouts(c.fd, ms) }
+
+# whether the connection has something to read or was closed by the other side, without
+# waiting (an idle kept-alive connection that is readable was closed, or sent something unasked)
+export fn (c: *Conn) readable() -> bool {
+  if c.closed { return true }
+  pfd := __newstr(8) + 8
+  __store32(pfd, c.fd)
+  __store32(pfd + 4, 1)         # events: POLLIN (revents, the upper half, zero)
+  r := __syscall(SYS_POLL, pfd, 1, 0, 0, 0, 0)
+  return r != 0
 }
 
 # reads up to max bytes; "" with a nil error means the other side closed the connection
@@ -275,4 +311,154 @@ export fn num_cpus() -> int {
   }
   if n < 1 { return 1 }
   return n
+}
+
+# ---------------------------------------------------------------- names
+
+# what resolve found, until it expires (os.nanotime)
+let dns_cache = map[str]str{}
+let dns_expires = map[str]int{}
+let dns_servers = []str{}
+let dns_loaded: bool = false
+let hosts = map[str]str{}
+
+# the IPv4 address ("a.b.c.d") of host: an address as it is, "localhost", a name in /etc/hosts,
+# or the first A record the DNS servers of /etc/resolv.conf give (cached for its TTL)
+export fn resolve(host: str) -> (str, error) {
+  if host == "" || host == "localhost" { return "127.0.0.1", nil }
+  if parse_ipv4(host) >= 0 { return host, nil }
+  name := strings.to_lower(strings.trim_suffix(host, "."))
+  load_dns_config()
+  ip, ok := hosts[name]
+  if ok { return ip, nil }
+  cached, hit := dns_cache[name]
+  if hit && dns_expires[name] > os.nanotime() { return cached, nil }
+  if len(dns_servers) == 0 { return "", errors.New("no DNS server in /etc/resolv.conf") }
+  last := errors.New("no answer")
+  for attempt := 0; attempt < 2; attempt++ {
+    for _, server := range dns_servers {
+      addr, ttl, err := query_a(server, name)
+      if err == nil {
+        if addr == "" { return "", errors.New("no address for " + name) }
+        if ttl < 5 { ttl = 5 }
+        dns_cache[name] = addr
+        dns_expires[name] = os.nanotime() + ttl * 1000000000
+        return addr, nil
+      }
+      last = err
+    }
+  }
+  return "", errors.New("resolve " + name + ": " + last.Error())
+}
+
+fn load_dns_config() {
+  if dns_loaded { return }
+  dns_loaded = true
+  text, err := os.read_file("/etc/hosts")
+  if err == nil {
+    for _, line := range strings.split(text, "\n") {
+      h := strings.index_byte(line, 35)          # '#'
+      if h >= 0 { line = line[0:h] }
+      f := strings.fields(line)
+      if len(f) < 2 || parse_ipv4(f[0]) < 0 { continue }
+      for i := 1; i < len(f); i++ {
+        n := strings.to_lower(f[i])
+        _, seen := hosts[n]
+        if !seen { hosts[n] = f[0] }
+      }
+    }
+  }
+  conf, err2 := os.read_file("/etc/resolv.conf")
+  if err2 == nil {
+    for _, line := range strings.split(conf, "\n") {
+      f := strings.fields(line)
+      if len(f) >= 2 && f[0] == "nameserver" && parse_ipv4(f[1]) >= 0 { dns_servers = append(dns_servers, f[1]) }
+    }
+  }
+}
+
+# asks server (UDP, port 53) for the A record of name: the address ("" when the name exists but
+# has none), the TTL in seconds, or an error
+fn query_a(server: str, name: str) -> (str, int, error) {
+  id := (os.nanotime() / 1000) & 65535
+  q := strings.Builder{}
+  q.write_byte(id >> 8)
+  q.write_byte(id & 255)
+  q.write_byte(1)          # recursion desired
+  q.write_byte(0)
+  q.write_byte(0)
+  q.write_byte(1)          # one question
+  for i := 0; i < 6; i++ { q.write_byte(0) }
+  for _, label := range strings.split(name, ".") {
+    if len(label) == 0 || len(label) > 63 { return "", 0, errors.New("invalid name") }
+    q.write_byte(len(label))
+    q.write(label)
+  }
+  q.write_byte(0)
+  q.write_byte(0)
+  q.write_byte(1)          # type A
+  q.write_byte(0)
+  q.write_byte(1)          # class IN
+  msg := q.string()
+
+  fd := __syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0, 0, 0, 0)
+  if fd < 0 { return "", 0, sys_error("socket", fd) }
+  set_timeouts(fd, 2000)
+  c := &Conn{fd: fd}
+  r := __syscall(SYS_CONNECT, fd, sockaddr(parse_ipv4(server), 53), 16, 0, 0, 0)
+  if r < 0 {
+    c.close()
+    return "", 0, sys_error(server, r)
+  }
+  werr := c.write(msg)
+  if werr != nil {
+    c.close()
+    return "", 0, werr
+  }
+  while true {
+    reply, err := c.read(1500)
+    if err != nil {
+      c.close()
+      return "", 0, errors.New(server + ": " + strings.trim_prefix(err.Error(), "read: "))
+    }
+    if len(reply) < 12 || ((int(reply[0]) << 8) | int(reply[1])) != id { continue }   # not ours
+    c.close()
+    return parse_a(reply)
+  }
+  return "", 0, nil
+}
+
+# the first A record of a DNS reply (after the CNAMEs that lead to it)
+fn parse_a(m: str) -> (str, int, error) {
+  if (int(m[2]) & 128) == 0 { return "", 0, errors.New("not a reply") }
+  rcode := int(m[3]) & 15
+  if rcode == 3 { return "", 300, nil }                       # no such name
+  if rcode != 0 { return "", 0, errors.New("server failure (rcode " + str(rcode) + ")") }
+  qd := int(m[4]) << 8 | int(m[5])
+  an := int(m[6]) << 8 | int(m[7])
+  p := 12
+  for i := 0; i < qd; i++ { p = skip_name(m, p) + 4 }
+  for i := 0; i < an; i++ {
+    p = skip_name(m, p)
+    if p < 0 || p + 10 > len(m) { return "", 0, errors.New("truncated reply") }
+    ty := int(m[p]) << 8 | int(m[p + 1])
+    ttl := int(m[p + 4]) << 24 | int(m[p + 5]) << 16 | int(m[p + 6]) << 8 | int(m[p + 7])
+    n := int(m[p + 8]) << 8 | int(m[p + 9])
+    p += 10
+    if p + n > len(m) { return "", 0, errors.New("truncated reply") }
+    if ty == 1 && n == 4 { return str(int(m[p])) + "." + str(int(m[p + 1])) + "." + str(int(m[p + 2])) + "." + str(int(m[p + 3])), ttl, nil }
+    p += n
+  }
+  return "", 300, nil
+}
+
+# the position after the name at p (labels, ending in 0 or in a compression pointer), -1 if bad
+fn skip_name(m: str, p: int) -> int {
+  while p >= 0 && p < len(m) {
+    n := int(m[p])
+    if n == 0 { return p + 1 }
+    if (n & 192) == 192 { return p + 2 }
+    p += n + 1
+  }
+  return -1
 }

@@ -1,4 +1,4 @@
-# std/http: a small HTTP/1.1 server.
+# std/http: a small HTTP/1.1 server and client.
 #
 #   import "std/http"
 #   http.handle("/", fn(req: *http.Request, res: *http.Response) { res.write("hello world") })
@@ -230,7 +230,7 @@ fn has_token(v: str, t: str) -> bool {
 # ---------------------------------------------------------------- connections
 
 # one client connection: what arrived and is not handled yet, and what is still to be sent
-struct Client {
+struct Peer {
   conn: *net.Conn
   inb: int        # input buffer memory
   icap: int
@@ -248,27 +248,27 @@ struct Client {
   waiting_out: bool
 }
 
-# Buffers start small (they grow when needed) and closed connections give their Client back for
+# Buffers start small (they grow when needed) and closed connections give their Peer back for
 # the next one, so a burst of short connections makes little garbage.
 const BUF = 4087          # with the string header, a 4 KB allocation
-let free_clients = []*Client{}
+let free_peers = []*Peer{}
 
-fn new_client(c: *net.Conn) -> *Client {
-  n := len(free_clients)
+fn new_peer(c: *net.Conn) -> *Peer {
+  n := len(free_peers)
   if n > 0 {
-    cl := free_clients[n - 1]
-    free_clients = free_clients[0:n - 1]
+    cl := free_peers[n - 1]
+    free_peers = free_peers[0:n - 1]
     cl.conn = c
     return cl
   }
-  return &Client{conn: c, inb: __newstr(BUF) + 8, icap: BUF, outb: __newstr(BUF) + 8, ocap: BUF}
+  return &Peer{conn: c, inb: __newstr(BUF) + 8, icap: BUF, outb: __newstr(BUF) + 8, ocap: BUF}
 }
 
-# closes the connection and keeps the Client (with buffers of the starting size) for reuse
-fn release(cl: *Client) {
+# closes the connection and keeps the Peer (with buffers of the starting size) for reuse
+fn release(cl: *Peer) {
   cl.conn.close()
   cl.conn = nil
-  if len(free_clients) >= 1024 { return }
+  if len(free_peers) >= 1024 { return }
   if cl.icap != BUF {
     cl.inb = __newstr(BUF) + 8
     cl.icap = BUF
@@ -287,11 +287,11 @@ fn release(cl: *Client) {
   cl.closing = false
   cl.dead = false
   cl.waiting_out = false
-  free_clients = append(free_clients, cl)
+  free_peers = append(free_peers, cl)
 }
 
 # room for at least n more bytes of input (moves the unconsumed bytes to the front)
-fn (cl: *Client) in_room(n: int) {
+fn (cl: *Peer) in_room(n: int) {
   if cl.start > 0 {
     k := cl.end - cl.start
     if k > 0 { mcopy(cl.inb, cl.inb + cl.start, k) }
@@ -309,7 +309,7 @@ fn (cl: *Client) in_room(n: int) {
   cl.icap = c
 }
 
-fn (cl: *Client) out_room(n: int) {
+fn (cl: *Peer) out_room(n: int) {
   if cl.ocap - cl.out_n >= n { return }
   c := cl.ocap * 2
   while c - cl.out_n < n { c = c * 2 }
@@ -319,7 +319,7 @@ fn (cl: *Client) out_room(n: int) {
   cl.ocap = c
 }
 
-fn (cl: *Client) put(s: str) {
+fn (cl: *Peer) put(s: str) {
   n := len(s)
   cl.out_room(n)
   mcopy(cl.outb + cl.out_n, __strp(s) + 8, n)
@@ -327,7 +327,7 @@ fn (cl: *Client) put(s: str) {
 }
 
 # the decimal digits of v >= 0
-fn (cl: *Client) put_int(v: int) {
+fn (cl: *Peer) put_int(v: int) {
   cl.out_room(20)
   d := 1
   while d * 10 <= v { d *= 10 }
@@ -338,7 +338,7 @@ fn (cl: *Client) put_int(v: int) {
   }
 }
 
-fn (cl: *Client) put_mem(p: int, n: int) {
+fn (cl: *Peer) put_mem(p: int, n: int) {
   cl.out_room(n)
   mcopy(cl.outb + cl.out_n, p, n)
   cl.out_n += n
@@ -346,7 +346,7 @@ fn (cl: *Client) put_mem(p: int, n: int) {
 
 # Takes one complete request from the input buffer: (req, 0) when one is ready, (nil, 0) when
 # more bytes are needed, (nil, status) for a request that cannot be served.
-fn (cl: *Client) take_request() -> (*Request, int) {
+fn (cl: *Peer) take_request() -> (*Request, int) {
   p := cl.inb
   i := cl.scanned
   if i < cl.start { i = cl.start }
@@ -431,7 +431,7 @@ fn keep_alive(req: *Request) -> bool {
 }
 
 # appends the response to the output buffer
-fn (cl: *Client) put_response(res: *Response, head_only: bool, keep: bool, http10: bool) {
+fn (cl: *Peer) put_response(res: *Response, head_only: bool, keep: bool, http10: bool) {
   cl.put("HTTP/1.1 ")
   cl.put_int(res.status)
   cl.put(" ")
@@ -460,7 +460,7 @@ fn error_response(code: int) -> *Response {
 }
 
 # answers every complete request in the input buffer, in order
-fn (cl: *Client) handle_input() {
+fn (cl: *Peer) handle_input() {
   while !cl.closing {
     req, code := cl.take_request()
     if req == nil {
@@ -485,7 +485,7 @@ fn (cl: *Client) handle_input() {
 }
 
 # sends what it can of the output; true when everything went out
-fn (cl: *Client) flush() -> bool {
+fn (cl: *Peer) flush() -> bool {
   while cl.out_off < cl.out_n {
     w := cl.conn.write_from(cl.outb + cl.out_off, cl.out_n - cl.out_off)
     if w == -11 { return false }
@@ -502,7 +502,7 @@ fn (cl: *Client) flush() -> bool {
 }
 
 # reads what arrived and answers the complete requests
-fn (cl: *Client) on_readable() {
+fn (cl: *Peer) on_readable() {
   cl.in_room(4096)
   r := cl.conn.read_into(cl.inb + cl.end, cl.icap - cl.end)
   if r == -11 { return }
@@ -531,7 +531,7 @@ fn serve_loop(l: *net.Listener) -> error {
   p, err := net.new_poller(512)
   if err != nil { return err }
   if p.add(l.fd, net.EV_IN, LISTENER) < 0 { return errors.New("epoll_ctl: cannot watch the listener") }
-  clients := map[int]*Client{}
+  clients := map[int]*Peer{}
   last_sweep := now_ms()
   while true {
     tick := 1000
@@ -547,7 +547,7 @@ fn serve_loop(l: *net.Listener) -> error {
           c, _ := l.accept_nb()
           if c == nil { break }
           c.set_nodelay()
-          nc := new_client(c)
+          nc := new_peer(c)
           nc.last = t
           clients[c.fd] = nc
           p.add(c.fd, net.EV_IN | net.EV_RDHUP, c.fd)
@@ -600,7 +600,7 @@ fn serve_loop(l: *net.Listener) -> error {
 
 # serves one connection, blocking: one request, then the connection is closed
 export fn serve_conn(c: *net.Conn) {
-  cl := new_client(c)
+  cl := new_peer(c)
   while true {
     req, code := cl.take_request()
     if req != nil || code != 0 {
@@ -668,4 +668,472 @@ export fn listen_and_serve_workers(host: str, port: int, n: int) -> error {
   }
   for j := 1; j < n; j++ { socks[j].close() }
   return serve_loop(socks[0])
+}
+
+# ---------------------------------------------------------------- client
+#
+#   r, err := http.get("http://localhost:3800/api/produtos")
+#   if err == nil && r.ok() { print(r.body) }
+#   r2, err2 := http.post("http://api.local/orders", "application/json", "{\"id\":1}")
+#   r3, err3 := http.request(&http.ClientRequest{method: "PUT", url: u, body: b,
+#                                                  headers: map[str]str{"Authorization": "Bearer x"}})
+#
+# HTTP/1.1 over plain TCP: "https://" URLs are refused (there is no TLS yet). Hosts are names or
+# IPv4 addresses (net.resolve). Connections are kept alive and reused for the next request to the
+# same host:port; redirects are followed (up to 10); bodies come whole, by Content-Length, chunked
+# or until the server closes. Each read, write and connect waits at most the request's timeout.
+
+export struct ClientRequest {
+  method: str               # "" is GET
+  url: str                  # http://host[:port]/path?query
+  headers: map[str]str      # sent as written; Host, Content-Length and User-Agent are added when missing
+  body: str
+  timeout_ms: int           # 0: the default (set_client_timeout, 30 s)
+  no_redirects: bool        # give 3xx responses back instead of following them
+}
+
+export struct ClientResponse {
+  status: int
+  status_text: str          # the reason phrase the server sent ("OK", "Not Found"...)
+  headers: map[str]str      # names in lower case; repeated headers joined with ", "
+  body: str
+  url: str                  # the URL that answered (after the redirects)
+}
+
+# the header value for name (any case), or ""
+export fn (r: *ClientResponse) header(name: str) -> str { return r.headers[strings.to_lower(name)] }
+# a 2xx status
+export fn (r: *ClientResponse) ok() -> bool { return r.status >= 200 && r.status < 300 }
+
+let client_timeout_ms: int = 30000
+let user_agent: str = "caju-http/1"
+# idle kept-alive connections by "host:port"
+let idle_conns = map[str][]*net.Conn{}
+const MAX_IDLE_PER_HOST = 8
+
+# the timeout of requests that do not give one
+export fn set_client_timeout(ms: int) { client_timeout_ms = ms }
+# the User-Agent sent when a request has none
+export fn set_user_agent(ua: str) { user_agent = ua }
+# closes the idle kept-alive connections
+export fn close_idle_connections() {
+  for _, conns := range idle_conns {
+    for _, c := range conns { c.close() }
+  }
+  idle_conns = map[str][]*net.Conn{}
+}
+
+export fn get(url: str) -> (*ClientResponse, error) {
+  return request(&ClientRequest{method: "GET", url: url})
+}
+
+export fn head(url: str) -> (*ClientResponse, error) {
+  return request(&ClientRequest{method: "HEAD", url: url})
+}
+
+export fn post(url: str, content_type: str, body: str) -> (*ClientResponse, error) {
+  return request(&ClientRequest{method: "POST", url: url, body: body, headers: map[str]str{"Content-Type": content_type}})
+}
+
+# posts fields as application/x-www-form-urlencoded (in the order of their names)
+export fn post_form(url: str, fields: map[str]str) -> (*ClientResponse, error) {
+  return post(url, "application/x-www-form-urlencoded", encode_form(fields))
+}
+
+# sends a request and reads its response, following redirects unless no_redirects
+export fn request(req: *ClientRequest) -> (*ClientResponse, error) {
+  method := strings.to_upper(req.method)
+  if method == "" { method = "GET" }
+  url := req.url
+  body := req.body
+  timeout := req.timeout_ms
+  if timeout <= 0 { timeout = client_timeout_ms }
+  for hop := 0; hop <= 10; hop++ {
+    res, err := round_trip(method, url, req.headers, body, timeout)
+    if err != nil { return nil, err }
+    loc := res.headers["location"]
+    if req.no_redirects || loc == "" || (res.status != 301 && res.status != 302 && res.status != 303 && res.status != 307 && res.status != 308) {
+      return res, nil
+    }
+    url = resolve_url(url, loc)
+    # 303, and 301/302 after a POST, become a GET without body (as browsers do)
+    if res.status == 303 || ((res.status == 301 || res.status == 302) && method == "POST") {
+      if method != "HEAD" { method = "GET" }
+      body = ""
+    }
+  }
+  return nil, errors.New("http: " + req.url + ": too many redirects")
+}
+
+# the parts of an http URL: host, port, the request target (path and query)
+fn split_url(url: str) -> (str, int, str, error) {
+  rest := ""
+  if strings.has_prefix(url, "http://") {
+    rest = url[7:len(url)]
+  } else if strings.has_prefix(url, "https://") {
+    return "", 0, "", errors.New("http: " + url + ": https is not supported (std/http has no TLS yet)")
+  } else {
+    return "", 0, "", errors.New("http: " + url + ": not an http:// URL")
+  }
+  h := strings.index_byte(rest, 35)                 # drop the fragment
+  if h >= 0 { rest = rest[0:h] }
+  cut := len(rest)
+  for i := 0; i < len(rest); i++ {
+    c := int(rest[i])
+    if c == 47 || c == 63 {                         # '/' or '?'
+      cut = i
+      break
+    }
+  }
+  authority := rest[0:cut]
+  target := rest[cut:len(rest)]
+  if target == "" || int(target[0]) == 63 { target = "/" + target }
+  if strings.index_byte(authority, 64) >= 0 { return "", 0, "", errors.New("http: " + url + ": user info in URLs is not supported (send an Authorization header)") }
+  host := authority
+  port := 80
+  colon := strings.last_index(authority, ":")
+  if colon >= 0 {
+    host = authority[0:colon]
+    p, err := strconv.atoi(authority[colon + 1:len(authority)])
+    if err != nil || p <= 0 || p > 65535 { return "", 0, "", errors.New("http: " + url + ": invalid port") }
+    port = p
+  }
+  if host == "" { return "", 0, "", errors.New("http: " + url + ": no host") }
+  return host, port, target, nil
+}
+
+# a Location header made absolute against the URL that sent it
+fn resolve_url(base: str, loc: str) -> str {
+  if strings.has_prefix(loc, "http://") || strings.has_prefix(loc, "https://") { return loc }
+  if strings.has_prefix(loc, "//") { return "http:" + loc }
+  rest := base[7:len(base)]
+  slash := strings.index_byte(rest, 47)
+  origin := "http://" + rest
+  path := "/"
+  if slash >= 0 {
+    origin = "http://" + rest[0:slash]
+    path = rest[slash:len(rest)]
+  }
+  if strings.has_prefix(loc, "/") { return origin + loc }
+  q := strings.index_byte(path, 63)
+  if q >= 0 { path = path[0:q] }
+  if strings.has_prefix(loc, "?") { return origin + path + loc }
+  dir := path[0:strings.last_index(path, "/") + 1]
+  return origin + dir + loc
+}
+
+# one request on a kept-alive connection or a new one; a reused connection the server had
+# already closed is replaced once
+fn round_trip(method: str, url: str, headers: map[str]str, body: str, timeout: int) -> (*ClientResponse, error) {
+  host, port, target, err := split_url(url)
+  if err != nil { return nil, err }
+  key := host + ":" + str(port)
+  msg := request_text(method, host, port, target, headers, body)
+  for attempt := 0; attempt < 2; attempt++ {
+    c, reused := take_idle(key)
+    if c == nil {
+      nc, derr := net.dial_timeout(host, port, timeout)
+      if derr != nil { return nil, errors.New("http: " + derr.Error()) }
+      c = nc
+    }
+    c.set_timeout(timeout)
+    werr := c.write(msg)
+    if werr != nil {
+      c.close()
+      if reused { continue }
+      return nil, errors.New("http: " + key + ": " + werr.Error())
+    }
+    res, got, keep, rerr := read_reply(c, method)
+    if rerr != nil {
+      c.close()
+      # nothing came back on a reused connection: the server closed it, try a new one
+      if reused && !got { continue }
+      return nil, errors.New("http: " + key + ": " + rerr.Error())
+    }
+    res.url = url
+    if keep { put_idle(key, c) } else { c.close() }
+    return res, nil
+  }
+  return nil, errors.New("http: " + key + ": the connection was closed")
+}
+
+fn take_idle(key: str) -> (*net.Conn, bool) {
+  conns := idle_conns[key]
+  while len(conns) > 0 {
+    c := conns[len(conns) - 1]
+    conns = conns[0:len(conns) - 1]
+    idle_conns[key] = conns
+    # readable while idle: closed by the server (or it sent something unasked)
+    if !c.readable() { return c, true }
+    c.close()
+  }
+  return nil, false
+}
+
+fn put_idle(key: str, c: *net.Conn) {
+  conns := idle_conns[key]
+  if len(conns) >= MAX_IDLE_PER_HOST {
+    c.close()
+    return
+  }
+  idle_conns[key] = append(conns, c)
+}
+
+fn has_header(headers: map[str]str, name: str) -> bool {
+  for k, _ := range headers {
+    if eq_fold(k, name) { return true }
+  }
+  return false
+}
+
+fn request_text(method: str, host: str, port: int, target: str, headers: map[str]str, body: str) -> str {
+  b := strings.Builder{}
+  b.write(method)
+  b.write(" ")
+  b.write(target)
+  b.write(" HTTP/1.1\r\n")
+  if !has_header(headers, "host") {
+    b.write("Host: ")
+    b.write(host)
+    if port != 80 { b.write(":" + str(port)) }
+    b.write("\r\n")
+  }
+  if !has_header(headers, "user-agent") { b.write("User-Agent: " + user_agent + "\r\n") }
+  if !has_header(headers, "content-length") && (len(body) > 0 || method == "POST" || method == "PUT" || method == "PATCH") {
+    b.write("Content-Length: " + str(len(body)) + "\r\n")
+  }
+  for _, k := range sorted_keys(headers) {
+    b.write(k)
+    b.write(": ")
+    b.write(headers[k])
+    b.write("\r\n")
+  }
+  b.write("\r\n")
+  b.write(body)
+  return b.string()
+}
+
+fn sorted_keys(m: map[str]str) -> []str {
+  keys := []str{}
+  for k, _ := range m { keys = append(keys, k) }
+  for i := 1; i < len(keys); i++ {
+    k := keys[i]
+    j := i - 1
+    while j >= 0 && keys[j] > k {
+      keys[j + 1] = keys[j]
+      j--
+    }
+    keys[j + 1] = k
+  }
+  return keys
+}
+
+# reads the bytes of a response as they arrive
+struct Reader {
+  conn: *net.Conn
+  buf: str
+  pos: int
+  got: bool       # something arrived
+  eof: bool
+}
+
+fn (r: *Reader) fill() -> error {
+  if r.eof { return errors.New("unexpected end of the response") }
+  chunk, err := r.conn.read(65536)
+  if err != nil { return err }
+  if chunk == "" {
+    r.eof = true
+    return errors.New("the connection was closed before the response")
+  }
+  r.got = true
+  if r.pos > 0 {
+    r.buf = r.buf[r.pos:len(r.buf)]
+    r.pos = 0
+  }
+  r.buf = r.buf + chunk
+  return nil
+}
+
+# a line without its CRLF
+fn (r: *Reader) line() -> (str, error) {
+  while true {
+    nl := strings.index_from(r.buf, "\n", r.pos)
+    if nl >= 0 {
+      s := r.buf[r.pos:nl]
+      r.pos = nl + 1
+      return strings.trim_suffix(s, "\r"), nil
+    }
+    if len(r.buf) - r.pos > 65536 { return "", errors.New("header line too long") }
+    err := r.fill()
+    if err != nil { return "", err }
+  }
+  return "", nil
+}
+
+# exactly n bytes
+fn (r: *Reader) take(n: int) -> (str, error) {
+  while len(r.buf) - r.pos < n {
+    err := r.fill()
+    if err != nil { return "", err }
+  }
+  s := r.buf[r.pos:r.pos + n]
+  r.pos += n
+  return s, nil
+}
+
+# everything until the server closes
+fn (r: *Reader) rest() -> (str, error) {
+  b := strings.Builder{}
+  b.write(r.buf[r.pos:len(r.buf)])
+  r.buf = ""
+  r.pos = 0
+  while true {
+    chunk, err := r.conn.read(65536)
+    if err != nil { return "", err }
+    if chunk == "" { break }
+    b.write(chunk)
+  }
+  r.eof = true
+  return b.string(), nil
+}
+
+# reads one response: it, whether any byte arrived, whether the connection can be kept
+fn read_reply(c: *net.Conn, method: str) -> (*ClientResponse, bool, bool, error) {
+  r := &Reader{conn: c}
+  while true {
+    status_line, err := r.line()
+    if err != nil { return nil, r.got, false, err }
+    if status_line == "" { continue }
+    parts := strings.split(status_line, " ")
+    if len(parts) < 2 || !strings.has_prefix(parts[0], "HTTP/") { return nil, true, false, errors.New("malformed status line \"" + status_line + "\"") }
+    status, serr := strconv.atoi(parts[1])
+    if serr != nil { return nil, true, false, errors.New("malformed status line \"" + status_line + "\"") }
+    res := &ClientResponse{status: status, headers: map[str]str{}}
+    if len(parts) > 2 { res.status_text = strings.join(parts[2:len(parts)], " ") }
+    while true {
+      hl, herr := r.line()
+      if herr != nil { return nil, true, false, herr }
+      if hl == "" { break }
+      colon := strings.index_byte(hl, 58)
+      if colon <= 0 { continue }
+      name := strings.to_lower(strings.trim_space(hl[0:colon]))
+      value := strings.trim_space(hl[colon + 1:len(hl)])
+      prev, seen := res.headers[name]
+      if seen { res.headers[name] = prev + ", " + value } else { res.headers[name] = value }
+    }
+    if status >= 100 && status < 200 { continue }    # 100 Continue and friends: the real one follows
+    keep := parts[0] == "HTTP/1.1" && !has_token(strings.to_lower(res.headers["connection"]), "close")
+    if parts[0] == "HTTP/1.0" && has_token(strings.to_lower(res.headers["connection"]), "keep-alive") { keep = true }
+    if method == "HEAD" || status == 204 || status == 304 { return res, true, keep && r.pos == len(r.buf), nil }
+    te := strings.to_lower(res.headers["transfer-encoding"])
+    if te != "" && te != "identity" {
+      if !strings.has_suffix(te, "chunked") { return nil, true, false, errors.New("unsupported Transfer-Encoding \"" + te + "\"") }
+      body, cerr := read_chunked(r)
+      if cerr != nil { return nil, true, false, cerr }
+      res.body = body
+    } else if res.headers["content-length"] != "" {
+      n, nerr := strconv.atoi(res.headers["content-length"])
+      if nerr != nil || n < 0 { return nil, true, false, errors.New("invalid Content-Length") }
+      body, berr := r.take(n)
+      if berr != nil { return nil, true, false, berr }
+      res.body = body
+    } else {
+      body, berr := r.rest()
+      if berr != nil { return nil, true, false, berr }
+      res.body = body
+      keep = false
+    }
+    return res, true, keep && r.pos == len(r.buf), nil
+  }
+  return nil, false, false, nil
+}
+
+fn read_chunked(r: *Reader) -> (str, error) {
+  b := strings.Builder{}
+  while true {
+    size_line, err := r.line()
+    if err != nil { return "", err }
+    semi := strings.index_byte(size_line, 59)        # chunk extensions
+    if semi >= 0 { size_line = size_line[0:semi] }
+    n, perr := strconv.parse_int(strings.trim_space(size_line), 16)
+    if perr != nil || n < 0 { return "", errors.New("invalid chunk size \"" + size_line + "\"") }
+    if n == 0 {
+      while true {                                    # trailers, up to the empty line
+        t, terr := r.line()
+        if terr != nil { return "", terr }
+        if t == "" { break }
+      }
+      return b.string(), nil
+    }
+    data, derr := r.take(n)
+    if derr != nil { return "", derr }
+    b.write(data)
+    _, lerr := r.line()
+    if lerr != nil { return "", lerr }
+  }
+  return "", nil
+}
+
+# ---------------------------------------------------------------- URL encoding
+
+# s with every byte but letters, digits and -_.~ written as %XX (a query value or path segment)
+export fn query_escape(s: str) -> str {
+  hexd := "0123456789ABCDEF"
+  b := strings.Builder{}
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126 {
+      b.write_byte(c)
+    } else {
+      b.write_byte(37)
+      b.write_byte(int(hexd[c >> 4]))
+      b.write_byte(int(hexd[c & 15]))
+    }
+  }
+  return b.string()
+}
+
+fn hex_val(c: int) -> int {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return -1
+}
+
+# undoes query_escape; "+" becomes a space (forms); a malformed %XX stays as it is
+export fn query_unescape(s: str) -> str {
+  if strings.index_byte(s, 37) < 0 && strings.index_byte(s, 43) < 0 { return s }
+  b := strings.Builder{}
+  i := 0
+  while i < len(s) {
+    c := int(s[i])
+    if c == 43 {
+      b.write_byte(32)
+    } else if c == 37 && i + 2 < len(s) && hex_val(int(s[i + 1])) >= 0 && hex_val(int(s[i + 2])) >= 0 {
+      b.write_byte(hex_val(int(s[i + 1])) * 16 + hex_val(int(s[i + 2])))
+      i += 2
+    } else {
+      b.write_byte(c)
+    }
+    i++
+  }
+  return b.string()
+}
+
+# fields as "a=1&b=2" (names in order, values escaped)
+export fn encode_form(fields: map[str]str) -> str {
+  parts := []str{}
+  for _, k := range sorted_keys(fields) { parts = append(parts, query_escape(k) + "=" + query_escape(fields[k])) }
+  return strings.join(parts, "&")
+}
+
+# "a=1&b=x%20y" as a map (the last value of a repeated name wins)
+export fn parse_form(s: str) -> map[str]str {
+  m := map[str]str{}
+  for _, part := range strings.split(s, "&") {
+    if part == "" { continue }
+    eq := strings.index_byte(part, 61)
+    if eq < 0 { m[query_unescape(part)] = "" } else { m[query_unescape(part[0:eq])] = query_unescape(part[eq + 1:len(part)]) }
+  }
+  return m
 }

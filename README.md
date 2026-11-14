@@ -76,7 +76,11 @@ and generated help, `docs/cli.md`), `testing`.
 - `std/json`: `json.marshal(v)` / `json.unmarshal(text, &v)` for structs, lists, maps and `any`,
   in the style of Go's `encoding/json` (the key is the field name), and `json.parse` for a tree.
 - `std/http`: an HTTP/1.1 server with keep-alive and an event loop (epoll); several processes on the
-  same port with `http.listen_and_serve_workers(host, port, n)`.
+  same port with `http.listen_and_serve_workers(host, port, n)`. And a client: `http.get(url)`,
+  `http.post(url, content_type, body)`, `http.request(&http.ClientRequest{...})`, with kept-alive
+  connections, redirects, chunked bodies and timeouts (plain `http://` only: no TLS yet). See
+  `docs/http.md`.
+- `std/net`: TCP sockets, and `net.resolve(host)` for host names (`/etc/hosts` and DNS).
 
 For REST APIs there is a Gin-style framework, [`github.com/cajulang/web`](https://github.com/cajulang/web):
 

@@ -1,0 +1,177 @@
+# The client of std/http, against std/http's own server (testdata/http_server.caju) and a server
+# of raw replies (testdata/http_raw.caju), each in another process.
+import "std/http"
+import "std/net"
+import "std/os"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+let next_port: int = 20000 + os.getpid() % 10000
+let pids = []str{}
+
+fn tmp() -> str {
+  t := os.getenv("TMPDIR")
+  if t == "" { t = "/tmp" }
+  return t
+}
+
+# builds a test server and starts it in the background; its base URL
+fn start(name: str) -> str { return start_env(name, "") }
+
+fn start_env(name: str, env: str) -> str {
+  bin := tmp() + "/caju-http-client-" + name + "-" + str(os.getpid())
+  if !os.exists(bin) {
+    p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "-o", bin, "testdata/" + name + ".caju"}, nil, true)
+    if err != nil || p.code != 0 { panic("cannot build " + name + ": " + p.output) }
+  }
+  next_port++
+  port := next_port
+  p, err := os.run([]str{"sh", "-c", "PORT=" + str(port) + " " + env + " " + bin + " >/dev/null 2>&1 & echo $!"}, nil, false)
+  if err != nil { panic(err.Error()) }
+  pids = append(pids, strings.trim_space(p.output))
+  deadline := os.nanotime() + 20000000000
+  while os.nanotime() < deadline {
+    c, err2 := net.dial("127.0.0.1", port)
+    if err2 == nil {
+      c.close()
+      return "http://127.0.0.1:" + str(port)
+    }
+  }
+  panic("the test server " + name + " did not start")
+  return ""
+}
+
+fn stop_all() {
+  http.close_idle_connections()
+  for _, pid := range pids { os.run([]str{"kill", pid}, nil, true) }
+  pids = []str{}
+}
+
+describe("http client", fn() {
+  it("gets a page with its status, headers and body", fn() {
+    base := start("http_server")
+    r, err := http.get(base + "/a/b?x=1")
+    stop_all()
+    expect(err).to_be_nil()
+    expect(r.status).to_equal(200)
+    expect(r.status_text).to_equal("OK")
+    expect(r.ok()).to_be_true()
+    expect(r.header("Content-Type")).to_equal("text/plain")
+    expect(r.body).to_start_with("GET /a/b q=x=1 body=0")
+  })
+  it("posts a body with its content type, and sends the given headers", fn() {
+    base := start("http_server")
+    r, err := http.post(base + "/echo", "application/json", "{\"a\":1}")
+    h, err2 := http.request(&http.ClientRequest{method: "post", url: base + "/headers", body: "x", headers: map[str]str{"Authorization": "Bearer t", "content-type": "text/plain"}})
+    stop_all()
+    expect(err).to_be_nil()
+    expect(r.body).to_equal("{\"a\":1}")
+    expect(err2).to_be_nil()
+    expect(h.status).to_equal(201)
+    expect(h.header("x-got")).to_equal("Bearer t|caju-http/1|text/plain")
+  })
+  it("posts a form, escaped", fn() {
+    base := start("http_server")
+    r, err := http.post_form(base + "/echo", map[str]str{"q": "pão de açúcar", "a": "1&2"})
+    stop_all()
+    expect(err).to_be_nil()
+    expect(r.body).to_equal("a=1%262&q=p%C3%A3o%20de%20a%C3%A7%C3%BAcar")
+    expect(http.parse_form(r.body)).to_equal(map[str]str{"a": "1&2", "q": "pão de açúcar"})
+  })
+  it("reuses a kept-alive connection, and replaces it after the server closed it", fn() {
+    base := start_env("http_server", "IDLE_MS=200")
+    a, _ := http.get(base + "/from")
+    b, _ := http.get(base + "/from")
+    os.run([]str{"sleep", "0.5"}, nil, true)       # the server closes the idle connection
+    c, err := http.get(base + "/from")
+    stop_all()
+    expect(a.body).to_equal(b.body)
+    expect(err).to_be_nil()
+    expect(c.body).to_start_with("127.0.0.1:")
+    expect(c.body == a.body).to_be_false()
+  })
+  it("gives 4xx and 5xx back as responses, not errors", fn() {
+    base := start("http_server")
+    r, err := http.get(base + "/missing")
+    stop_all()
+    expect(err).to_be_nil()
+    expect(r.status).to_equal(404)
+    expect(r.ok()).to_be_false()
+    expect(r.body).to_equal("nope")
+  })
+  it("follows redirects: 302 and 303 become GET, 307 keeps the method and body", fn() {
+    base := start("http_server")
+    a, _ := http.post(base + "/redirect?k=v", "text/plain", "data")
+    b, _ := http.post(base + "/see-other", "text/plain", "data")
+    c, _ := http.post(base + "/keep", "text/plain", "data")
+    d, _ := http.request(&http.ClientRequest{url: base + "/redirect", no_redirects: true})
+    _, loop := http.get(base + "/loop")
+    stop_all()
+    expect(a.body).to_equal("GET k=v ")
+    expect(a.url).to_equal(base + "/echo-method?k=v")
+    expect(b.body).to_equal("GET  ")
+    expect(c.body).to_equal("POST  data")
+    expect(d.status).to_equal(302)
+    expect(d.header("location")).to_equal("/echo-method?")
+    expect(loop.Error()).to_end_with("too many redirects")
+  })
+  it("reads chunked bodies, bodies up to the close, 100 Continue and HTTP/1.0", fn() {
+    base := start("http_raw")
+    a, e1 := http.get(base + "/chunked")
+    b, e2 := http.get(base + "/close")
+    c, e3 := http.get(base + "/continue")
+    d, e4 := http.get(base + "/old")
+    e, e5 := http.head(base + "/nothing")
+    stop_all()
+    expect(e1).to_be_nil()
+    expect(a.body).to_equal("hello, caju!")
+    expect(a.header("x-a")).to_equal("1, 2")
+    expect(e2).to_be_nil()
+    expect(b.body).to_equal("until the end")
+    expect(e3).to_be_nil()
+    expect(c.status_text).to_equal("Fine Thanks")
+    expect(c.body).to_equal("ok")
+    expect(e4).to_be_nil()
+    expect(d.body).to_equal("old")
+    expect(e5).to_be_nil()
+    expect(e.status).to_equal(404)
+  })
+  it("gives up after the timeout", fn() {
+    base := start("http_raw")
+    t0 := os.nanotime()
+    _, err := http.request(&http.ClientRequest{url: base + "/slow", timeout_ms: 300})
+    ms := (os.nanotime() - t0) / 1000000
+    stop_all()
+    expect(err).to_be_error("http: 127.0.0.1:" + base[len(base) - 5:len(base)] + ": read: timed out")
+    expect(ms).to_be_less_than(1500)
+  })
+  it("refuses https and malformed URLs, and reports refused connections", fn() {
+    _, a := http.get("https://example.com/")
+    _, b := http.get("ftp://x/")
+    _, c := http.get("http://127.0.0.1:1/")
+    _, d := http.get("http://host:99999/")
+    expect(a.Error()).to_contain("https is not supported")
+    expect(b.Error()).to_contain("not an http:// URL")
+    expect(c).to_be_error("http: dial 127.0.0.1:1: connection refused")
+    expect(d.Error()).to_contain("invalid port")
+    os.run([]str{"sh", "-c", "rm -f " + tmp() + "/caju-http-client-*-" + str(os.getpid())}, nil, true)
+  })
+})
+
+describe("http url encoding", fn() {
+  it("escapes all but letters, digits and -_.~", fn() {
+    expect(http.query_escape("a b/c?d=é~-_.")).to_equal("a%20b%2Fc%3Fd%3D%C3%A9~-_.")
+  })
+  it("unescapes %XX and +, leaving malformed escapes alone", fn() {
+    expect(http.query_unescape("a+b%20c%C3%A9%zz%4")).to_equal("a b cé%zz%4")
+  })
+})
+
+describe("net.resolve", fn() {
+  it("gives addresses and localhost as they are", fn() {
+    a, _ := net.resolve("10.1.2.3")
+    b, _ := net.resolve("localhost")
+    expect(a).to_equal("10.1.2.3")
+    expect(b).to_equal("127.0.0.1")
+  })
+})
