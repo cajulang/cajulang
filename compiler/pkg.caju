@@ -85,6 +85,85 @@ fn cmp_text(a: str, b: str) -> int {
   return compare_versions(va, vb)
 }
 
+# ---------------------------------------------------------------- compiler requirements
+#
+# The caju field of caju.toml says which versions of the compiler a package works with:
+#
+#   caju = "0.6.0"             0.6.0 or newer (a bare version is a minimum)
+#   caju = ">=0.6.0"           the same
+#   caju = ">=0.5.0, <0.7.0"   every clause must hold (separated by commas)
+#   caju = "^0.6.0"            compatible: >=0.6.0, <0.7.0 (for 1.2.3: >=1.2.3, <2.0.0)
+#   caju = "~0.6.1"            the same minor: >=0.6.1, <0.7.0
+#   caju = "=0.6.0"            exactly
+#
+# Operators: >=, >, <=, <, =, ^, ~. A version may leave out the patch (">=0.6" is ">=0.6.0").
+
+export struct Clause {
+  op: str           # ">=", ">", "<=", "<", "="
+  v: *Version
+}
+
+# the clauses of a requirement, with ^ and ~ turned into a pair of >= and <
+export fn parse_requirement(s: str) -> ([]*Clause, error) {
+  out := []*Clause{}
+  if strings.trim_space(s) == "" { return nil, errors.New("empty requirement") }
+  for _, part := range strings.split(s, ",") {
+    t := strings.trim_space(part)
+    op := ""
+    for _, o := range []str{">=", "<=", ">", "<", "=", "^", "~"} {
+      if strings.has_prefix(t, o) {
+        op = o
+        break
+      }
+    }
+    t = strings.trim_space(t[len(op):])
+    if strings.count(t, ".") == 1 && strings.index(t, "-") < 0 { t = t + ".0" }
+    v, err := parse_version(t)
+    if err != nil { return nil, errors.New("invalid requirement \"" + s + "\" (expected something like \">=0.6.0\" or \">=0.5.0, <0.7.0\")") }
+    if op == "" { op = ">=" }
+    if op == "^" || op == "~" {
+      up := &Version{major: v.major + 1}
+      if op == "~" || v.major == 0 { up = &Version{major: v.major, minor: v.minor + 1} }
+      if op == "^" && v.major == 0 && v.minor == 0 { up = &Version{major: 0, minor: 0, patch: v.patch + 1} }
+      out = append(out, &Clause{op: ">=", v: v})
+      out = append(out, &Clause{op: "<", v: up})
+    } else {
+      out = append(out, &Clause{op: op, v: v})
+    }
+  }
+  return out, nil
+}
+
+# whether version meets every clause
+export fn satisfies(version: str, clauses: []*Clause) -> bool {
+  v, err := parse_version(version)
+  if err != nil { return false }
+  for _, c := range clauses {
+    d := compare_versions(v, c.v)
+    ok := true
+    switch c.op {
+    case ">=": ok = d >= 0
+    case ">": ok = d > 0
+    case "<=": ok = d <= 0
+    case "<": ok = d < 0
+    case "=": ok = d == 0
+    }
+    if !ok { return false }
+  }
+  return true
+}
+
+# nil if this compiler (VERSION) meets the requirement of who (a package or the project)
+export fn check_compiler(who: str, requirement: str) -> error { return check_compiler_version(who, requirement, VERSION) }
+
+export fn check_compiler_version(who: str, requirement: str, version: str) -> error {
+  if requirement == "" { return nil }
+  clauses, err := parse_requirement(requirement)
+  if err != nil { return errors.New(who + ": " + err.Error()) }
+  if satisfies(version, clauses) { return nil }
+  return errors.New(who + " needs caju " + requirement + ", but this is caju " + version + " (install another version: curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh)")
+}
+
 # ---------------------------------------------------------------- names
 
 # a package name is "github.com/<owner>/<repo>" with letters, digits, ".", "-", "_"
@@ -119,7 +198,7 @@ export struct Manifest {
   license: str
   authors: []str
   entry: str       # the file imported by `import "<name>"` (default: <repo>.caju)
-  caju: str        # the minimum version of the compiler, or ""
+  caju: str        # the versions of the compiler it works with (">=0.6.0"...), or ""
   deps: []*Dep     # in the order of caju.toml
 }
 
@@ -161,7 +240,7 @@ export fn read_manifest(dir: str) -> (*Manifest, error) {
   if err != nil { return nil, errors.New(file + ": " + err.Error()) }
   if m.entry == "" { m.entry = path.base(m.name) + ".caju" }
   if m.caju != "" {
-    _, err = parse_version(m.caju)
+    _, err = parse_requirement(m.caju)
     if err != nil { return nil, errors.New(file + ": caju: " + err.Error()) }
   }
   au := pkg.get("authors")
@@ -624,6 +703,8 @@ struct Resolver {
 # minimal version selection over the whole graph: every version asked for anywhere is visited
 # (its dependencies count too), and each package ends at the highest version asked for
 fn resolve(m: *Manifest, old: *Lock) -> (*Lock, error) {
+  cerr := check_compiler(m.name, m.caju)
+  if cerr != nil { return nil, cerr }
   r := &Resolver{pins: map[str]*Locked{}, seen: map[str]*Locked{}, selected: map[str]str{}, asked: map[str][]str{}}
   if old != nil { for _, l := range old.pkgs { r.pins[l.name + "@" + l.version] = l } }
   queue := []*Want{}
@@ -661,7 +742,8 @@ fn resolve(m: *Manifest, old: *Lock) -> (*Lock, error) {
     dm, err2 := read_manifest(f.dir)
     if err2 != nil { return nil, errors.New(w.name + "@" + w.version + ": " + err2.Error()) }
     if dm.name != w.name { return nil, errors.New(w.name + "@" + w.version + ": its caju.toml says the name is " + dm.name) }
-    if dm.caju != "" && cmp_text(dm.caju, VERSION) > 0 { return nil, errors.New(w.name + "@" + w.version + " needs caju " + dm.caju + " or newer (this is " + VERSION + ")") }
+    err = check_compiler(w.name + "@" + w.version, dm.caju)
+    if err != nil { return nil, err }
     if dm.version != w.version { return nil, errors.New(w.name + ": the tag v" + w.version + " has version = \"" + dm.version + "\" in its caju.toml") }
     l := &Locked{name: w.name, version: w.version, source: source_url(w.name), commit: f.commit, hash: f.hash, deps: requires_of(dm)}
     if os.getenv("CAJU_PKG_SOURCE") != "" { l.source = "https://" + w.name }
@@ -714,9 +796,15 @@ export fn install(root: str) -> (*Lock, error) {
     old = lk
   }
   if old != nil && same_list(old.requires, requires_of(m)) {
+    err = check_compiler(m.name, m.caju)
+    if err != nil { return nil, err }
     for _, l := range old.pkgs {
-      _, err3 := fetch(l.name, l.version, l.commit, l.hash)
+      f, err3 := fetch(l.name, l.version, l.commit, l.hash)
       if err3 != nil { return nil, err3 }
+      dm, err5 := read_manifest(f.dir)
+      if err5 != nil { return nil, err5 }
+      err = check_compiler(l.name + "@" + l.version, dm.caju)
+      if err != nil { return nil, err }
     }
     return old, nil
   }
@@ -733,6 +821,8 @@ export fn packages_for(entry: str) -> (map[str]*project.Package, error) {
   root := find_root(path.dir(path.abs(entry)))
   if root == "" { return nil, nil }
   m, err := read_manifest(root)
+  if err != nil { return nil, err }
+  err = check_compiler(m.name, m.caju)
   if err != nil { return nil, err }
   pkgs := map[str]*project.Package{}
   if len(m.deps) == 0 { return pkgs, nil }
@@ -751,6 +841,8 @@ export fn packages_for(entry: str) -> (map[str]*project.Package, error) {
     }
     pm, err4 := read_manifest(dir)
     if err4 != nil { return nil, err4 }
+    err = check_compiler(l.name + "@" + l.version, pm.caju)
+    if err != nil { return nil, err }
     pkgs[l.name] = &project.Package{name: l.name, dir: dir, entry: pm.entry}
   }
   return pkgs, nil
@@ -975,7 +1067,7 @@ fn cmd_init(name: str) {
   if name == "" { die("give the package name: caju pkg init github.com/owner/repo") }
   err := check_name(name)
   if err != nil { die(err.Error()) }
-  src := "[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\ndescription = \"\"\nlicense = \"\"\nauthors = []\n\n[dependencies]\n"
+  src := "[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\ndescription = \"\"\nlicense = \"\"\nauthors = []\ncaju = \">=" + VERSION + "\"\n\n[dependencies]\n"
   err = os.write_file("caju.toml", src, 0o644)
   if err != nil { die(err.Error()) }
   print("created caju.toml for " + name)

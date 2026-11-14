@@ -22,11 +22,44 @@ description = "Saudações"
 license = "MIT"
 authors = ["Acme"]
 entry = "greet.caju"               # optional; default: <repository name>.caju
-caju = "0.1.0"                     # optional; minimum compiler version
+caju = ">=0.6.0"                   # optional; the compiler versions it works with
 
 [dependencies]
 "github.com/acme/strutil" = "1.1.0"   # the MINIMUM version this package needs
 ```
+
+## The compiler version (`caju`)
+
+The `caju` field says which versions of the compiler (`caju version`) the package or project
+works with. Use it when the code needs something a release added (a function of the standard
+library, a language feature):
+
+| `caju = ` | means |
+|---|---|
+| `"0.6.0"` or `">=0.6.0"` | 0.6.0 or newer |
+| `">=0.5.0, <0.7.0"` | every clause holds (separated by commas) |
+| `"^0.6.0"` | compatible: `>=0.6.0, <0.7.0` (for `^1.2.3`: `>=1.2.3, <2.0.0`) |
+| `"~0.6.1"` | the same minor: `>=0.6.1, <0.7.0` |
+| `"=0.6.0"` | exactly 0.6.0 |
+| `">0.6.0"`, `"<=0.7.0"`, `"<1.0.0"` | as written |
+
+The patch can be left out (`">=0.6"` is `">=0.6.0"`), and a pre-release comes before its release
+(`0.6.0-beta.1` does not meet `>=0.6.0`). `caju pkg init` writes `caju = ">=<the current version>"`.
+
+It is checked for the project and for every package it depends on, directly or not:
+
+- by `caju pkg add`, `install` and `update`, before anything is written (`add` leaves `caju.toml`
+  as it was);
+- by `caju build`, `run`, `test` and `check`, so a project cloned with its `caju.lock` gives a
+  clear error with an older compiler instead of a compile error in some package.
+
+```
+caju pkg: github.com/acme/greet@1.0.0 needs caju >=0.7.0, but this is caju 0.6.0 (install another version: curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh)
+```
+
+Version selection does not look for an older release of a package that would suit the compiler:
+it picks versions as usual and then checks them. Ask for a version that works with your compiler,
+or update the compiler.
 
 ## Publishing a version
 

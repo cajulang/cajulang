@@ -16,8 +16,19 @@ notes from the section of its version here (`tools/changelog.sh`).
 - `http.query_escape`, `http.query_unescape`, `http.encode_form` and `http.parse_form`.
 - `net.resolve(host)`: host names to IPv4 addresses, from `/etc/hosts` and then the DNS servers of
   `/etc/resolv.conf` (A records, cached for their TTL). `net.dial` now takes names too.
+- The `caju` field of `caju.toml` takes a requirement on the compiler version: a minimum
+  (`"0.6.0"`, `">=0.6.0"`), `>`, `<`, `<=`, `=`, ranges (`">=0.5.0, <0.7.0"`), `^` and `~`. It is
+  checked for the project and every package it uses (directly or not) by `caju pkg add`,
+  `install` and `update`, and by `caju build`, `run`, `test` and `check`, with a message that
+  names the package, the requirement and the running version. `caju pkg init` writes
+  `caju = ">=<current version>"`. See docs/packages.md.
 - `net.dial_timeout(host, port, ms)`, `Conn.set_timeout(ms)` (reads and writes that wait longer
   fail with "timed out") and `Conn.readable()`.
+
+### Changed
+- The compiler requirement of `caju.toml` is checked for the project itself too, and also when
+  `caju.lock` is already up to date (before, only dependencies were checked, and only while
+  resolving them).
 
 ### Fixed
 - Slicing a `str` (`s[a:b]`) keeps the bytes as they are. It used to replace bytes that are not

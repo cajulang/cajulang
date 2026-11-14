@@ -45,6 +45,59 @@ describe("versions", fn() {
   })
 })
 
+fn meets(version: str, req: str) -> str {
+  clauses, err := pkg.parse_requirement(req)
+  if err != nil { return "error: " + err.Error() }
+  if pkg.satisfies(version, clauses) { return "yes" }
+  return "no"
+}
+
+describe("compiler requirements", fn() {
+  it("take a bare version as a minimum", fn() {
+    expect(meets("0.6.0", "0.6.0")).to_equal("yes")
+    expect(meets("0.7.2", "0.6.0")).to_equal("yes")
+    expect(meets("0.5.9", "0.6.0")).to_equal("no")
+  })
+  it("compare with >=, >, <=, < and =, leaving out the patch if wanted", fn() {
+    expect(meets("0.6.0", ">=0.6")).to_equal("yes")
+    expect(meets("0.6.0", ">0.6.0")).to_equal("no")
+    expect(meets("0.6.1", "> 0.6.0")).to_equal("yes")
+    expect(meets("0.6.0", "<=0.6.0")).to_equal("yes")
+    expect(meets("0.6.0", "<0.6.0")).to_equal("no")
+    expect(meets("0.6.0", "=0.6.0")).to_equal("yes")
+    expect(meets("0.6.1", "=0.6.0")).to_equal("no")
+  })
+  it("need every clause of a range", fn() {
+    expect(meets("0.5.0", ">=0.5.0, <0.7.0")).to_equal("yes")
+    expect(meets("0.6.9", ">=0.5.0, <0.7.0")).to_equal("yes")
+    expect(meets("0.7.0", ">=0.5.0, <0.7.0")).to_equal("no")
+    expect(meets("0.4.9", ">=0.5.0, <0.7.0")).to_equal("no")
+  })
+  it("read ^ as compatible and ~ as the same minor", fn() {
+    expect(meets("1.9.0", "^1.2.3")).to_equal("yes")
+    expect(meets("2.0.0", "^1.2.3")).to_equal("no")
+    expect(meets("0.6.5", "^0.6.0")).to_equal("yes")
+    expect(meets("0.7.0", "^0.6.0")).to_equal("no")
+    expect(meets("0.0.4", "^0.0.3")).to_equal("no")
+    expect(meets("1.2.9", "~1.2.3")).to_equal("yes")
+    expect(meets("1.3.0", "~1.2.3")).to_equal("no")
+  })
+  it("put a pre-release before its release", fn() {
+    expect(meets("0.6.0-beta.1", ">=0.6.0")).to_equal("no")
+    expect(meets("0.6.0-beta.1", ">=0.6.0-beta.1")).to_equal("yes")
+  })
+  it("refuse what is not a requirement", fn() {
+    expect(meets("0.6.0", "")).to_equal("error: empty requirement")
+    expect(meets("0.6.0", "lots")).to_start_with("error: invalid requirement \"lots\"")
+    expect(meets("0.6.0", ">=0.6.0,")).to_start_with("error: invalid requirement")
+  })
+  it("explain which version is needed and which one is running", fn() {
+    expect(pkg.check_compiler_version("github.com/a/b@1.0.0", ">=0.7.0", "0.6.0")).to_be_error("github.com/a/b@1.0.0 needs caju >=0.7.0, but this is caju 0.6.0 (install another version: curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh)")
+    expect(pkg.check_compiler_version("x", "", "0.6.0")).to_be_nil()
+    expect(pkg.check_compiler_version("x", "^0.6.0", "0.6.3")).to_be_nil()
+  })
+})
+
 describe("package names", fn() {
   it("are github.com/owner/repository", fn() {
     expect(pkg.check_name("github.com/acme/json")).to_be_nil()
@@ -232,7 +285,7 @@ describe("caju pkg, step by step", fn() {
     out, code := caju([]str{"pkg", "init", "github.com/me/app"})
     expect(out).to_equal("created caju.toml for github.com/me/app")
     expect(code).to_equal(0)
-    expect(read_app("caju.toml")).to_equal("[package]\nname = \"github.com/me/app\"\nversion = \"0.1.0\"\ndescription = \"\"\nlicense = \"\"\nauthors = []\n\n[dependencies]\n")
+    expect(read_app("caju.toml")).to_equal("[package]\nname = \"github.com/me/app\"\nversion = \"0.1.0\"\ndescription = \"\"\nlicense = \"\"\nauthors = []\ncaju = \">=" + pkg.VERSION + "\"\n\n[dependencies]\n")
   })
   it("add downloads the package and, recursively, its dependencies", fn() {
     out, code := caju([]str{"pkg", "add", "github.com/acme/greet@0.2.0"})
@@ -395,5 +448,45 @@ describe("caju pkg, step by step", fn() {
   })
   it("cleans up its work directory", fn() {
     expect(fs.remove_all(W)).to_be_nil()
+  })
+})
+
+describe("caju pkg and the compiler version", fn() {
+  before_each(fn() { setup() })
+
+  it("refuses a dependency that needs a newer compiler, and leaves caju.toml as it was", fn() {
+    files := package("github.com/acme/future", "1.0.0", "", "export const X = 1\n")
+    files["caju.toml"] = strings.replace_all(files["caju.toml"], "license = \"MIT\"\n", "license = \"MIT\"\ncaju = \">=99.0.0\"\n")
+    publish("github.com/acme/future", "1.0.0", files)
+    fs.mkdir_all(W + "/app3", 0o755)
+    toml := "[package]\nname = \"github.com/me/app3\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+    os.write_file(W + "/app3/caju.toml", toml, 0o644)
+    out, code := in_dir("app3", []str{os.getenv("CAJU_BIN"), "pkg", "add", "github.com/acme/future@1.0.0"})
+    expect(out).to_contain("caju pkg: github.com/acme/future@1.0.0 needs caju >=99.0.0, but this is caju " + pkg.VERSION)
+    expect(code).to_equal(1)
+    got, _ := os.read_file(W + "/app3/caju.toml")
+    expect(got).to_equal(toml)
+  })
+  it("refuses to build, run or install a project that needs another compiler", fn() {
+    os.write_file(W + "/app3/main.caju", "print(1)\n", 0o644)
+    os.write_file(W + "/app3/caju.toml", "[package]\nname = \"github.com/me/app3\"\nversion = \"0.1.0\"\ncaju = \"<0.1.0\"\n", 0o644)
+    out, code := in_dir("app3", []str{os.getenv("CAJU_BIN"), "run", "main.caju"})
+    expect(out).to_start_with("Package error: github.com/me/app3 needs caju <0.1.0, but this is caju " + pkg.VERSION)
+    expect(code).to_equal(1)
+    out2, code2 := in_dir("app3", []str{os.getenv("CAJU_BIN"), "pkg", "install"})
+    expect(out2).to_start_with("caju pkg: github.com/me/app3 needs caju <0.1.0")
+    expect(code2).to_equal(1)
+  })
+  it("builds a project whose requirement this compiler meets", fn() {
+    os.write_file(W + "/app3/caju.toml", "[package]\nname = \"github.com/me/app3\"\nversion = \"0.1.0\"\ncaju = \">=0.1, <99.0.0\"\n", 0o644)
+    out, code := in_dir("app3", []str{os.getenv("CAJU_BIN"), "run", "main.caju"})
+    expect(out).to_equal("1")
+    expect(code).to_equal(0)
+  })
+  it("refuses a caju field that is not a requirement", fn() {
+    os.write_file(W + "/app3/caju.toml", "[package]\nname = \"github.com/me/app3\"\nversion = \"0.1.0\"\ncaju = \"latest\"\n", 0o644)
+    out, code := in_dir("app3", []str{os.getenv("CAJU_BIN"), "run", "main.caju"})
+    expect(out).to_contain("caju.toml: caju: invalid requirement \"latest\"")
+    expect(code).to_equal(1)
   })
 })
