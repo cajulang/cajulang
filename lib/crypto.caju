@@ -1034,6 +1034,78 @@ export fn ed25519_verify(public_key: str, msg: str, sig: str) -> bool {
   return constant_time_eq(ed_str(ed_pack(p)), sig[0:32])
 }
 
+# ---------------------------------------------------------------- SHA-384 (FIPS 180-4)
+#
+# SHA-512 with other initial values, truncated to 48 bytes.
+
+export fn new_sha384() -> *Hasher { return new_hasher(ALG_SHA384) }
+export fn sha384(s: str) -> str { return digest(ALG_SHA384, s) }
+export fn sha384_hex(s: str) -> str { return hex.encode(sha384(s)) }
+
+export fn new_hmac_sha384(key: str) -> *Hmac { return new_hmac(ALG_SHA384, key) }
+export fn hmac_sha384(key: str, msg: str) -> str {
+  m := new_hmac(ALG_SHA384, key)
+  m.write(msg)
+  return m.sum()
+}
+export fn hmac_sha384_hex(key: str, msg: str) -> str { return hex.encode(hmac_sha384(key, msg)) }
+
+# ---------------------------------------------------------------- HKDF (RFC 5869)
+#
+# hash names the HMAC hash: "sha256" or "sha384" (the TLS 1.3 cipher suites).
+
+fn hkdf_algo(hash: str) -> int {
+  if hash == "sha256" { return ALG_SHA256 }
+  if hash == "sha384" { return ALG_SHA384 }
+  if hash == "sha512" { return ALG_SHA512 }
+  return 0
+}
+
+fn hkdf_hash_error(hash: str) -> error { return errors.New("crypto: unknown HKDF hash \"" + hash + "\" (use \"sha256\" or \"sha384\")") }
+
+# HKDF-Extract: the pseudorandom key (hash-sized) of the input keying material ikm; an empty salt
+# means hash-size zero bytes. Panics on an unknown hash name.
+export fn hkdf_extract(hash: str, salt: str, ikm: str) -> str {
+  algo := hkdf_algo(hash)
+  if algo == 0 { panic(hkdf_hash_error(hash).Error()) }
+  m := new_hmac(algo, salt)
+  m.write(ikm)
+  return m.sum()
+}
+
+# HKDF-Expand: length bytes of output keying material from the pseudorandom key prk and the
+# context info; length is at most 255 times the hash size
+export fn hkdf_expand(hash: str, prk: str, info: str, length: int) -> (str, error) {
+  algo := hkdf_algo(hash)
+  if algo == 0 { return "", hkdf_hash_error(hash) }
+  base := new_hmac(algo, prk)
+  hlen := base.inner.dsize
+  if length < 0 || length > 255 * hlen { return "", errors.New("crypto: HKDF length " + str(length) + " out of range (0 to " + str(255 * hlen) + ")") }
+  out := __newstr(length)
+  o := out + 8
+  done := 0
+  t := ""
+  i := 1
+  ib := __newstr(1)
+  while done < length {
+    m := base.clone()
+    m.write(t)
+    m.write(info)
+    __store8(ib + 8, i)
+    m.write(__pstr(ib))
+    t = m.sum()
+    tp := __strp(t) + 8
+    j := 0
+    while j < hlen && done < length {
+      __store8(o + done, __load8(tp + j))
+      done++
+      j++
+    }
+    i++
+  }
+  return __pstr(out), nil
+}
+
 # ---------------------------------------------------------------- X25519 (RFC 7748)
 #
 # Diffie-Hellman on Curve25519: each side picks a random 32-byte scalar (random_bytes(32)), sends
@@ -1110,75 +1182,4 @@ export fn x25519_base(scalar: str) -> (str, error) {
   nine := __newstr(32)
   __store8(nine + 8, 9)
   return x25519(scalar, __pstr(nine))
-
-# ---------------------------------------------------------------- SHA-384 (FIPS 180-4)
-#
-# SHA-512 with other initial values, truncated to 48 bytes.
-
-export fn new_sha384() -> *Hasher { return new_hasher(ALG_SHA384) }
-export fn sha384(s: str) -> str { return digest(ALG_SHA384, s) }
-export fn sha384_hex(s: str) -> str { return hex.encode(sha384(s)) }
-
-export fn new_hmac_sha384(key: str) -> *Hmac { return new_hmac(ALG_SHA384, key) }
-export fn hmac_sha384(key: str, msg: str) -> str {
-  m := new_hmac(ALG_SHA384, key)
-  m.write(msg)
-  return m.sum()
-}
-export fn hmac_sha384_hex(key: str, msg: str) -> str { return hex.encode(hmac_sha384(key, msg)) }
-
-# ---------------------------------------------------------------- HKDF (RFC 5869)
-#
-# hash names the HMAC hash: "sha256" or "sha384" (the TLS 1.3 cipher suites).
-
-fn hkdf_algo(hash: str) -> int {
-  if hash == "sha256" { return ALG_SHA256 }
-  if hash == "sha384" { return ALG_SHA384 }
-  if hash == "sha512" { return ALG_SHA512 }
-  return 0
-}
-
-fn hkdf_hash_error(hash: str) -> error { return errors.New("crypto: unknown HKDF hash \"" + hash + "\" (use \"sha256\" or \"sha384\")") }
-
-# HKDF-Extract: the pseudorandom key (hash-sized) of the input keying material ikm; an empty salt
-# means hash-size zero bytes. Panics on an unknown hash name.
-export fn hkdf_extract(hash: str, salt: str, ikm: str) -> str {
-  algo := hkdf_algo(hash)
-  if algo == 0 { panic(hkdf_hash_error(hash).Error()) }
-  m := new_hmac(algo, salt)
-  m.write(ikm)
-  return m.sum()
-}
-
-# HKDF-Expand: length bytes of output keying material from the pseudorandom key prk and the
-# context info; length is at most 255 times the hash size
-export fn hkdf_expand(hash: str, prk: str, info: str, length: int) -> (str, error) {
-  algo := hkdf_algo(hash)
-  if algo == 0 { return "", hkdf_hash_error(hash) }
-  base := new_hmac(algo, prk)
-  hlen := base.inner.dsize
-  if length < 0 || length > 255 * hlen { return "", errors.New("crypto: HKDF length " + str(length) + " out of range (0 to " + str(255 * hlen) + ")") }
-  out := __newstr(length)
-  o := out + 8
-  done := 0
-  t := ""
-  i := 1
-  ib := __newstr(1)
-  while done < length {
-    m := base.clone()
-    m.write(t)
-    m.write(info)
-    __store8(ib + 8, i)
-    m.write(__pstr(ib))
-    t = m.sum()
-    tp := __strp(t) + 8
-    j := 0
-    while j < hlen && done < length {
-      __store8(o + done, __load8(tp + j))
-      done++
-      j++
-    }
-    i++
-  }
-  return __pstr(out), nil
 }
