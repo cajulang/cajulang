@@ -30,3 +30,24 @@ fn rt_os_sleep(s: num) {
   __store64(ts + 8, int((s - num(sec)) * 1000000000.0))
   __syscall(35, ts, 0, 0, 0, 0, 0)
 }
+# the standard library's view of the system (RT_INTRINSICS: __nanotime, __random...), as in rt/linux.caju
+fn rt_os_clock(id: int) -> int {
+  ts := rt_tmp + 64
+  __syscall(228, id, ts, 0, 0, 0, 0)
+  return __load64(ts) * 1000000000 + __load64(ts + 8)
+}
+fn rt_os_nanotime() -> int { return rt_os_clock(1) }
+fn rt_os_unix_nano() -> int { return rt_os_clock(0) }
+fn rt_os_random(p: int, n: int) -> int {
+  got := 0
+  while got < n {
+    r := __syscall(318, p + got, n - got, 0, 0, 0, 0)
+    if r == -4 { continue }
+    if r < 0 { return r }
+    got += r
+  }
+  return n
+}
+fn rt_os_write_fd(fd: int, p: int, n: int) -> int { return __syscall(1, fd, p, n, 0, 0, 0) }
+fn rt_os_read_fd(fd: int, p: int, n: int) -> int { return __syscall(0, fd, p, n, 0, 0, 0) }
+fn rt_os_isatty(fd: int) -> bool { return __syscall(16, fd, 21505, rt_tmp + 64, 0, 0, 0) == 0 }

@@ -3,6 +3,7 @@
 # "MZ"). The programs are in testdata/windows/ (migrated from tests/windows/).
 import "std/os"
 import "std/fs"
+import "std/strings"
 import { describe, it, skip, expect } from "std/testing"
 
 # builds a program for Windows; the compiler's output and the first two bytes of the .exe
@@ -44,13 +45,49 @@ describe("building for Windows", fn() {
   skip("builds a DLL program that uses channels (needs goroutines and channels: phase 6)", fn() {
     build_windows("testdata/windows/dll-prog.caju")
   })
-  skip("builds a program that reads wide strings from a DLL (needs readwstr: phase 7)", fn() {
+  skip("builds a program that reads wide strings from a DLL (it also uses channels: phase 6)", fn() {
     build_windows("testdata/windows/ffi.caju")
   })
-  skip("builds a program that reads the date and the computer name (needs alloc: phase 7)", fn() {
-    build_windows("testdata/windows/windows-date-and-computer.caju")
+  it("builds a program that reads the date and the computer name (alloc, peek, readstr)", fn() {
+    _, head := build_windows("testdata/windows/windows-date-and-computer.caju")
+    expect(head).to_equal("MZ")
   })
-  skip("builds a program that reads the system memory status (needs alloc: phase 7)", fn() {
-    build_windows("testdata/windows/windows-system-memory.caju")
+  it("builds a program that reads the system memory status (alloc, poke, peek)", fn() {
+    _, head := build_windows("testdata/windows/windows-system-memory.caju")
+    expect(head).to_equal("MZ")
+  })
+})
+
+# runs a Windows program when this Linux can (WSL with interop): its output with the standard
+# error merged, and its exit code; ok false elsewhere (CI), where the tests only build
+# (the standard error comes after the output: WSL relays the two through different pipes)
+fn run_windows(file: str, input: str) -> (out: str, code: int, ok: bool) {
+  if !os.exists("/proc/sys/fs/binfmt_misc/WSLInterop") && !os.exists("/proc/sys/fs/binfmt_misc/WSLInterop-late") { return "", 0, false }
+  tmp, err0 := fs.temp_dir("", "caju-windows-run-")
+  expect(err0).to_be_nil()
+  defer fs.remove_all(tmp)
+  exe := tmp + "/program.exe"
+  p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "--target", "windows", "-o", exe, file}, nil, true)
+  expect(err).to_be_nil()
+  expect(p.output).to_equal("")
+  fs.write_file(tmp + "/input", input, 0o644)
+  script := "CAJU_WIN_TEST=olá WSLENV=CAJU_WIN_TEST \"$0\" 'a b' é < \"$1/input\" 2> \"$1/err\"; c=$?; cat \"$1/err\"; exit $c"
+  r, err2 := os.run([]str{"sh", "-c", script, exe, tmp}, nil, true)
+  expect(err2).to_be_nil()
+  return strings.replace_all(r.output, "\r\n", "\n"), r.code, true
+}
+
+describe("running on Windows (only under WSL; elsewhere these only build)", fn() {
+  it("gives the arguments, the environment, the standard streams, the clocks and random bytes", fn() {
+    out, code, ok := run_windows("testdata/windows/portable.caju", "first\nsecond\nthird\n")
+    if !ok { return }
+    expect(out).to_equal("3 a b é\nolá\ntrue true true\ntrue 32\nto stdout\nfirst true second\nthird\n\nto stderr\n")
+    expect(code).to_equal(4)
+  })
+  it("has raw memory for DLL calls: alloc, poke, peek, readstr, readwstr", fn() {
+    out, code, ok := run_windows("testdata/windows/memory.caju", "")
+    if !ok { return }
+    expect(out).to_equal("123456 65535 44 12666369657135680\nHiá H\nRuntime error in memory.caju, line 14: Null pointer in peek32.\n")
+    expect(code).to_equal(1)
   })
 })

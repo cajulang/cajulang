@@ -1,0 +1,6 @@
+fn buffer() -> int {
+  p := alloc(16)
+  poke32(p, 1)
+  return p
+}
+print(peek32(buffer()))

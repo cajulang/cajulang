@@ -1,5 +1,8 @@
-# std/os: the program's arguments and environment, files, and processes (Linux x86-64).
-# Everything here talks to the kernel with system calls.
+# std/os: the program's arguments and environment, files, and processes.
+# Files and processes talk to the kernel with Linux system calls (emulated by the WebAssembly host;
+# not on Windows yet). The arguments, the environment, the standard input and output, the clocks,
+# sleep and is_terminal go through the runtime, which does them its own way on every target
+# (docs/platform-matrix.md).
 
 import "std/strings"
 
@@ -16,7 +19,6 @@ const SYS_GETCWD = 79
 const SYS_MKDIR = 83
 const SYS_UNLINK = 87
 const SYS_CHMOD = 90
-const SYS_CLOCK_GETTIME = 228
 const SYS_MEMFD_CREATE = 319
 const SYS_EXECVEAT = 322
 const SYS_CAJU_SPAWN = 1000      # not Linux: the WebAssembly host's "run a program" (Linux: ENOSYS)
@@ -96,6 +98,19 @@ export fn lookup_env(name: str) -> (str, bool) {
 # ends the program now (print's pending output is written first)
 export fn exit(code: int) { __exit(code) }
 
+# writes s to the standard output (1) or error (2), through the runtime (every target)
+fn write_std(fd: int, s: str) {
+  __flush()
+  p := cstr(s)
+  n := len(s)
+  while n > 0 {
+    w := __write(fd, p, n)
+    if w <= 0 { return }
+    p += w
+    n -= w
+  }
+}
+
 fn write_fd(fd: int, s: str) -> int {
   p := cstr(s)
   n := len(s)
@@ -108,23 +123,29 @@ fn write_fd(fd: int, s: str) -> int {
   return 0
 }
 # writes s to the standard output, in order with print
-export fn stdout(s: str) {
-  __flush()
-  write_fd(1, s)
-}
+export fn stdout(s: str) { write_std(1, s) }
 # writes s to the standard error
-export fn stderr(s: str) {
-  __flush()
-  write_fd(2, s)
-}
+export fn stderr(s: str) { write_std(2, s) }
 # writes a line to the standard error
 export fn eprintln(s: str) { stderr(s + "\n") }
 
-# reads the whole standard input
-export fn read_stdin() -> str { return read_all(0) }
-
 let stdin_rest: str = ""         # bytes read by read_line after the last line it returned
 let stdin_done: bool = false
+
+# reads the whole standard input (the rest of it, after read_line)
+export fn read_stdin() -> str {
+  b := strings.Builder{}
+  b.write(stdin_rest)                # what read_line read past its last line
+  stdin_rest = ""
+  buf := __newstr(65536)
+  while true {
+    r := __read(0, buf + 8, 65536)
+    if r <= 0 { break }
+    for i := 0; i < r; i++ { b.write_byte(__load8(buf + 8 + i)) }
+  }
+  return b.string()
+}
+
 
 # reads one line of the standard input, without the line break (and a "\r" before it); false at
 # the end of the input. Reads as much as is available and keeps the rest for the next call.
@@ -144,7 +165,7 @@ export fn read_line() -> (str, bool) {
       return line, true
     }
     if buf == 0 { buf = __newstr(65536) }
-    r := __syscall(SYS_READ, 0, buf + 8, 65536, 0, 0, 0)
+    r := __read(0, buf + 8, 65536)
     if r <= 0 {
       stdin_done = true
       continue
@@ -226,31 +247,25 @@ export fn getwd() -> str {
 export fn getpid() -> int { return __syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0) }
 
 # monotonic clock, in nanoseconds (for measuring durations)
-export fn nanotime() -> int {
-  ts := __newstr(16)
-  __syscall(SYS_CLOCK_GETTIME, 1, ts + 8, 0, 0, 0, 0)
-  return __load64(ts + 8) * 1000000000 + __load64(ts + 16)
-}
+export fn nanotime() -> int { return __nanotime() }
 
 # waits seconds (fractions too: os.sleep(0.25)). Under `caju test` (CAJU_SKIP_SLEEP) it returns at
 # once. In a browser page's program it blocks the program's worker, not the page.
 export fn sleep(seconds: num) { __sleep(seconds) }
 
 # the wall clock: seconds since 1970-01-01 UTC
-export fn unix_time() -> int {
-  ts := __newstr(16)
-  __syscall(SYS_CLOCK_GETTIME, 0, ts + 8, 0, 0, 0, 0)
-  return __load64(ts + 8)
+export fn unix_time() -> int { return floor_div(__unix_nano(), 1000000000) }
+# the wall clock in nanoseconds since 1970-01-01 UTC
+export fn unix_nano() -> int { return __unix_nano() }
+
+fn floor_div(a: int, b: int) -> int {
+  q := a / b
+  if a % b < 0 { q-- }
+  return q
 }
 
-const SYS_IOCTL = 16
-const TCGETS = 0x5401
-
-# is the file descriptor fd (0 stdin, 1 stdout, 2 stderr) a terminal?
-export fn is_terminal(fd: int) -> bool {
-  t := __newstr(64)
-  return __syscall(SYS_IOCTL, fd, TCGETS, t + 8, 0, 0, 0) == 0
-}
+# is the file descriptor fd (0 stdin, 1 stdout, 2 stderr) a terminal? (always false in a browser)
+export fn is_terminal(fd: int) -> bool { return __isatty(fd) }
 
 # a NULL-terminated array of C strings, for execve
 fn cstr_array(xs: []str) -> int {
@@ -260,7 +275,8 @@ fn cstr_array(xs: []str) -> int {
   return a + 8
 }
 
-# replaces this process by the program at path; returns only if that fails
+# replaces this process by the program at path; returns only if that fails (always in a
+# WebAssembly host, which cannot replace its program: "function not implemented")
 export fn exec(path: str, argv: []str, env: []str) -> error {
   __flush()
   r := __syscall(SYS_EXECVE, cstr(path), cstr_array(argv), cstr_array(env), 0, 0, 0)
@@ -269,6 +285,7 @@ export fn exec(path: str, argv: []str, env: []str) -> error {
 
 # replaces this process by a program given as bytes (an ELF executable), without writing it
 # to a file: the bytes go into an anonymous memory file that is executed directly
+# (a WebAssembly host returns an error: "function not implemented")
 export fn exec_bytes(name: str, image: str, argv: []str, env: []str) -> error {
   fd := __syscall(SYS_MEMFD_CREATE, cstr(name), 0, 0, 0, 0, 0)
   if fd < 0 { return sys_error("memfd_create", name, fd) }

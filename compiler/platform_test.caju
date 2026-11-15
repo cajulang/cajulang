@@ -1,5 +1,5 @@
 # Platforms (platform.caju): code that declares where it runs (# caju:platforms, caju.toml's
-# platforms, system calls on Windows) is refused at compile time when the program can reach it
+# platforms, system calls on Windows, DLL calls and raw memory outside Windows) is refused at compile time when the program can reach it
 # on another target; imported but unreachable code is fine.
 import "std/os"
 import "std/strings"
@@ -45,6 +45,27 @@ describe("platforms", fn() {
   it("refuse std/net (sockets) in WebAssembly, while std/http's helpers stay usable", fn() {
     expect(build("http_client", "wasm")).to_start_with("Platform error in http_client.caju, line 3: net.dial_timeout (std/net) is not available when compiling for wasm: it runs on linux (declared in its header). Called through get → http.get")
     expect(build("pure", "wasm")).to_equal("ok")
+  })
+  it("let the arguments, environment, standard streams, clocks, sleep and randomness run everywhere", fn() {
+    expect(build("portable", "windows")).to_equal("ok")
+    expect(build("portable", "wasm")).to_equal("ok")
+    expect(build("portable", "linux")).to_equal("ok")
+  })
+  it("refuse DLL calls (extern) outside Windows, with the chain, unless nothing reaches them", fn() {
+    expect(build("dll_call", "linux")).to_equal("Platform error in dll_call.caju, line 2: a DLL call (Beep) is not available when compiling for linux: it runs on windows (extern functions are Windows DLLs). Called through alert → beep → a DLL call (Beep).")
+    expect(build("dll_call", "wasm")).to_start_with("Platform error in dll_call.caju, line 2: a DLL call (Beep) is not available when compiling for wasm")
+    expect(build("dll_call", "windows")).to_equal("ok")
+    expect(build("dll_unused", "linux")).to_equal("ok")
+    expect(build("dll_unused", "wasm")).to_equal("ok")
+  })
+  it("refuse the raw-memory built-ins (alloc, peek, poke...) outside Windows", fn() {
+    expect(build("memory", "linux")).to_equal("Platform error in memory.caju, line 6: peek32 is not available when compiling for linux: it runs on windows (raw memory for DLL calls).")
+    expect(build("memory", "wasm")).to_start_with("Platform error in memory.caju, line 6: peek32 is not available when compiling for wasm")
+    expect(build("memory", "windows")).to_equal("ok")
+  })
+  it("check a program of one file too", fn() {
+    expect(build("one_file", "linux")).to_equal("ok")
+    expect(build("one_file", "wasm")).to_equal("Platform error in one_file.caju, line 4: native_only (one_file) is not available when compiling for wasm: it runs on linux (declared above it). Called through native_only.")
   })
   it("make caju test skip a test file that needs another platform", fn() {
     p, _ := os.run([]str{os.getenv("CAJU_BIN"), "test", "testdata/platform/wasm_only_test.caju"}, nil, true)

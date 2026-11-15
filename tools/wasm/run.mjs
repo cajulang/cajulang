@@ -4,6 +4,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
+import tty from "node:tty"
 import { Worker, isMainThread } from "node:worker_threads"
 import { runCaju } from "./caju-host.mjs"
 
@@ -88,6 +89,7 @@ const spawn = (p, argv, envp, merge) => {
 }
 const code = await runCaju(fs.readFileSync(file), {
   args: [path.basename(file, ".wasm"), ...rest], env, fsys, stdout: out(1), stderr: out(2), stdin, spawn,
+  isatty: (fd) => tty.isatty(fd),
 })
 process.exit(code)
 }

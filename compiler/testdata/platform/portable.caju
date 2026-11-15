@@ -1,0 +1,10 @@
+import "std/os"
+import "std/crypto"
+# what every target has: the runtime does it its own way on each one
+t0 := os.nanotime()
+os.sleep(0.001)
+b, _ := crypto.random_bytes(8)
+os.stdout(str(len(os.args())) + os.getenv("HOME") + str(os.unix_time()) + str(os.nanotime() - t0) + str(len(b)) + "\n")
+os.stderr(str(os.is_terminal(1)) + "\n")
+line, _ := os.read_line()
+print(line + os.read_stdin())

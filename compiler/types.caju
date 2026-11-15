@@ -277,6 +277,13 @@ let BUILTIN_SIG = map[str]*Sig{
   "poke8": &Sig{[]str{"int", "int"}, "void"}, "poke16": &Sig{[]str{"int", "int"}, "void"}, "poke32": &Sig{[]str{"int", "int"}, "void"},
   "readstr": &Sig{[]str{"int"}, "str"}, "readwstr": &Sig{[]str{"int"}, "str"},
 }
+# Intrinsics that are a plain call to a function every runtime (rt/linux, rt/windows, rt/wasm)
+# defines: the arguments go on the stack as for any runtime call
+export let RT_INTRINSICS = map[str]str{"__nanotime": "rt_os_nanotime", "__unix_nano": "rt_os_unix_nano", "__random": "rt_os_random",
+  "__write": "rt_os_write_fd", "__read": "rt_os_read_fd", "__isatty": "rt_os_isatty"}
+# Built-ins for raw memory, for the arguments and results of DLL calls (extern): only Windows
+# has them (the platform pass refuses them elsewhere, docs/platforms.md)
+export let MEMORY_BUILTINS = []str{"alloc", "free", "peek8", "peek16", "peek32", "peek64", "poke8", "poke16", "poke32", "readstr", "readwstr"}
 # Low-level operations, only for the native compiler's runtime (written in Caju)
 let INTRINSIC_SIG = map[str]*Sig{
   "__load8": &Sig{[]str{"int"}, "int"}, "__load32": &Sig{[]str{"int"}, "int"}, "__store32": &Sig{[]str{"int", "int"}, "void"}, "__load64": &Sig{[]str{"int"}, "int"}, "__store8": &Sig{[]str{"int", "int"}, "void"}, "__store64": &Sig{[]str{"int", "int"}, "void"},
@@ -285,6 +292,11 @@ let INTRINSIC_SIG = map[str]*Sig{
   "__sqrt": &Sig{[]str{"num"}, "num"}, "__fmod": &Sig{[]str{"num", "num"}, "num"},
   "__newstr": &Sig{[]str{"int"}, "int"}, "__flush": &Sig{[]str{}, "void"}, "__exit": &Sig{[]str{"int"}, "void"},
   "__sleep": &Sig{[]str{"num"}, "void"},   # std/os.sleep: each runtime waits its own way (rt_os_sleep)
+  # what the standard library asks of the system, which each runtime does its own way
+  # (RT_INTRINSICS: Linux system calls, kernel32 on Windows, the host's emulated calls in wasm)
+  "__nanotime": &Sig{[]str{}, "int"}, "__unix_nano": &Sig{[]str{}, "int"}, "__random": &Sig{[]str{"int", "int"}, "int"},
+  "__write": &Sig{[]str{"int", "int", "int"}, "int"}, "__read": &Sig{[]str{"int", "int", "int"}, "int"},
+  "__isatty": &Sig{[]str{"int"}, "bool"},
   "__depth": &Sig{[]str{}, "int"}, "__set_depth": &Sig{[]str{"int"}, "void"},
   # reflection for std/json: the box of an any and back, and the runtime's allocators
   "__anyp": &Sig{[]str{"any"}, "int"}, "__pany": &Sig{[]str{"int"}, "any"},

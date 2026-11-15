@@ -6,12 +6,42 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Added
+- `docs/platform-matrix.md`: what every built-in, standard-library module and `caju` command does on
+  linux, windows, wasm in Node and wasm in a browser (works, emulated, refused at compile time,
+  error at run time).
+- Windows: `alloc`, `free`, `peek8/16/32/64`, `poke8/16/32`, `readstr` and `readwstr` (raw memory
+  for DLL calls) now work.
+- Windows: `os.nanotime`, `os.unix_time`, `os.sleep`, `os.stdout`, `os.stderr`, `os.eprintln`,
+  `os.read_line`, `os.read_stdin`, `os.is_terminal` and `crypto.random_bytes` now build and work
+  (QueryPerformanceCounter, GetSystemTimeAsFileTime, WriteFile/ReadFile, GetConsoleMode,
+  BCryptGenRandom). The standard library reaches the system through intrinsics each runtime
+  implements (`__nanotime`, `__unix_nano`, `__random`, `__write`, `__read`, `__isatty`).
+- `os.unix_nano()`: the wall clock in nanoseconds.
+- The WebAssembly host answers `os.is_terminal` (option `isatty`; `tools/wasm/run.mjs` uses Node's
+  `tty.isatty`).
+
 ### Changed
+- **Breaking:** a program that can reach an `extern` (DLL) call or a raw-memory built-in (`alloc`,
+  `free`, `peek*`, `poke*`, `readstr`, `readwstr`) is refused with a Platform error when compiling
+  for `linux` or `wasm` (before, raw memory was "not supported yet" everywhere, and an `extern`
+  call was refused even in code nothing called; now unreachable code builds).
 - `caju pkg` resolves versions before downloading: visiting a version reads only its `caju.toml`
   (from the cache, or from git without the rest of the files) and only the versions it chooses are
   downloaded. Installing a project whose dependencies ask for ui 0.3.0 and ui 0.4.1 no longer
   downloads ui 0.3.0. A release with a wrong caju.toml, a missing repository or a conflict of
   major versions is now reported before anything is downloaded.
+
+### Fixed
+- Windows: `os.args`, `os.environ`, `os.getenv` and `os.lookup_env` crashed at run time (the
+  arguments pointer was never set); the runtime now builds them from the command line and the
+  environment block, in UTF-8.
+- The platform pass skipped programs made of a single file: their `# caju:platforms` lines above
+  functions were ignored.
+- `CAJU_SKIP_SLEEP=0` skipped `os.sleep` as `=1` does (the browser host sets `=0`, so sleep never
+  waited in a browser); only `CAJU_SKIP_SLEEP=1` skips now.
+- `crypto.random_bytes` above 64 KB failed in WebAssembly (the limit of `getRandomValues`).
+- `os.read_stdin` after `os.read_line` lost what `read_line` had read past its line.
 
 ## [0.9.1] - 2026-11-15
 

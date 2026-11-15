@@ -83,6 +83,9 @@
     __sqrt: [["num"], "num"], __fmod: [["num", "num"], "num"],
     // for the standard library: a new string block [length n][bytes][0] (bytes not zeroed), flush print's buffer, exit
     __newstr: [["int"], "int"], __flush: [[], "void"], __exit: [["int"], "void"], __sleep: [["num"], "void"],
+    // what std asks of the system: a call to the runtime's function for it (RT_INTRINSICS in native.js)
+    __nanotime: [[], "int"], __unix_nano: [[], "int"], __random: [["int", "int"], "int"],
+    __write: [["int", "int", "int"], "int"], __read: [["int", "int", "int"], "int"], __isatty: [["int"], "bool"],
   };
   // language functions with their own typing rules
   const SPECIAL_BUILTINS = ["print", "len", "cap", "append", "copy", "delete", "make", "new", "panic", "recover", "close"];

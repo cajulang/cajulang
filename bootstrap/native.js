@@ -88,6 +88,9 @@
 
   // ---- runtime in Caju (the source is in NATIVE_RT, see below) ----
   const NATIVE_KIND_SIGNED = new Set([0, 1, 2, 3, 4]);
+  // intrinsics that call a function each runtime defines (compiler/types.caju, RT_INTRINSICS)
+  const RT_INTRINSICS = { __nanotime: "rt_os_nanotime", __unix_nano: "rt_os_unix_nano", __random: "rt_os_random",
+    __write: "rt_os_write_fd", __read: "rt_os_read_fd", __isatty: "rt_os_isatty" };
 
   function compileNative(files, { target = "linux" } = {}) {
     const fileNames = files.map((f) => f.name);
@@ -996,6 +999,12 @@
         if (nm === "panic") { whereArg(n); exprTo(args[0], "any"); A.push(RAX); rt("rt_panic_val", 2); return; }
         if (nm === "recover") { rt("rt_recover", 0); return; }
         if (!U.isRuntime && !n.privileged) fail(`the function ${nm} is not supported yet`, n);
+        if (RT_INTRINSICS[nm]) {
+          // a call to the runtime's function for this system (bootstrap/rt/linux.caju)
+          for (const a of args) { exprTo(a, "int"); A.push(RAX); }
+          rt(RT_INTRINSICS[nm], args.length);
+          return;
+        }
         // low-level operations of the runtime
         const two = () => { expr(args[0]); A.push(RAX); expr(args[1]); A.mov(RCX, RAX); A.pop(RAX); };
         switch (nm) {

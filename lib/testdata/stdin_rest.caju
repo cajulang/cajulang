@@ -1,0 +1,4 @@
+import "std/os"
+line, _ := os.read_line()
+print("line: " + line)
+print("rest: " + os.read_stdin())

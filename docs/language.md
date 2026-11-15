@@ -392,7 +392,9 @@ Package error: checksum mismatch for github.com/acme/strutil@1.1.0
 
 ## System calls on Windows
 
-`extern` declares a function from a Windows DLL, using the `stdcall` (default) or `cdecl` calling convention. Parameters use interface types: `i32`, `u32`, `i64`, `u64`, `f32`, `f64`, `ptr`, `bool`, `str` and `wstr`, and the result can be `void`. These calls are only available in programs compiled with `--target windows`.
+`extern` declares a function from a Windows DLL, using the `stdcall` (default) or `cdecl` calling convention. Parameters use interface types: `i32`, `u32`, `i64`, `u64`, `f32`, `f64`, `ptr`, `bool`, `str` and `wstr`, and the result can be `void`. These calls are only available in programs compiled with `--target windows`: on `linux` and `wasm` a program that can reach one is refused at compile time with a Platform error (see `docs/platforms.md`).
+
+For the arguments and results of these calls, Windows programs also have raw memory: `alloc(n)` (zeroed bytes outside the collector, an `int` address), `free(p)`, `peek8/16/32/64(p)`, `poke8/16/32(p, v)`, `readstr(p)` (a C string) and `readwstr(p)` (a UTF-16 string). Like `extern`, they exist only on Windows; elsewhere they are a Platform error.
 
 `message.caju`:
 
@@ -417,5 +419,5 @@ MessageBoxA(0, "Hello from Caju", "caju", 0)
 ## In progress
 
 - Goroutines, channels and `select` in the native compiler. The keywords `go`, `chan` and `select` are already reserved.
-- On Windows: `alloc`, `peek`, `poke`, `readstr`, `dllexport` and native DLLs.
+- On Windows: `dllexport` and native DLLs.
 - Maps with struct, array or `any` keys.

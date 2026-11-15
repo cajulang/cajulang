@@ -1,0 +1,4 @@
+extern "kernel32.dll" fn Beep(freq: u32, ms: u32) -> bool
+fn beep() { Beep(440, 100) }
+fn alert() { beep() }
+alert()

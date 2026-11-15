@@ -2,9 +2,10 @@
 
 Caju compiles for `linux` (x86-64), `windows` (x86-64) and `wasm` (WebAssembly, in Node or a
 browser). Not everything runs everywhere: sockets exist only on Linux (the WebAssembly host has
-none, and the Windows runtime does not have them yet), and the standard library talks to the
-system with Linux system calls, which the WebAssembly host emulates in part and Windows does not
-have. Instead of a program that builds and then fails when it runs, the compiler refuses it:
+none, and the Windows runtime does not have them yet); files and processes use Linux system
+calls, which the WebAssembly host emulates and Windows does not have; DLL calls (`extern`) and raw
+memory (`alloc`, `peek`...) exist only on Windows. Instead of a program that builds and then fails
+when it runs, the compiler refuses it:
 
 ```
 $ caju build --target wasm app.caju
@@ -47,16 +48,31 @@ platforms = ["linux"]
 ```
 
 The targets are `linux`, `windows` and `wasm`; words after them on the line are a note. With no
-declaration, code runs everywhere, except that on `windows` a function that makes a system call
-(`__syscall`) is not available.
+declaration, code runs everywhere, except that:
+
+- on `windows`, a function that makes a Linux system call (`__syscall`) is not available;
+- on `linux` and `wasm`, a call to an `extern` function (a Windows DLL) and the raw-memory
+  built-ins `alloc`, `free`, `peek8/16/32/64`, `poke8/16/32`, `readstr` and `readwstr` are not
+  available.
+
+What the standard library needs from the system on every target (the arguments and environment,
+the standard input and output, the clocks, `os.sleep`, `os.is_terminal`, `crypto.random_bytes`)
+goes through intrinsics that each runtime implements its own way (`__nanotime`, `__unix_nano`,
+`__random`, `__write`, `__read`, `__isatty`, `__sleep`: Linux system calls, kernel32 and bcrypt on
+Windows, the host in WebAssembly), so those functions are not refused anywhere.
 
 What the standard library declares today:
 
 | | linux | wasm | windows |
 |---|---|---|---|
 | `std/net` (and so `std/http`'s server and client, `std/websocket`, `std/tls`) | yes | no | no |
-| functions with system calls (`std/os`, `std/fs`, `crypto.random_bytes`...) | yes | yes (emulated by the host) | no |
+| files and processes (`os.read_file`, `os.run`, `std/fs`...) | yes | yes (emulated by the host) | no |
+| arguments, environment, standard streams, clocks, `os.sleep`, `os.is_terminal`, `crypto.random_bytes` | yes | yes | yes |
+| `extern` DLL calls and raw memory (`alloc`, `peek`, `poke`, `readstr`...) | no | no | yes |
 | everything else (`strings`, `json`, `crypto` hashes, `path.join`...) | yes | yes | yes |
+
+The full picture, function by function and command by command, is in
+[platform-matrix.md](platform-matrix.md).
 
 ## Tests
 

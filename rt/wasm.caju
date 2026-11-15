@@ -8,7 +8,7 @@ fn rt_os_init() {
   argc := __load64(p)
   e := p + 8 * (argc + 2)
   while __load64(e) != 0 {
-    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=") { rt_skip_sleep = true }
+    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=1") { rt_skip_sleep = true }
     e += 8
   }
 }
@@ -37,3 +37,21 @@ fn rt_os_sleep(s: num) {
 }
 # the arena of the collector: 2 GB (a wasm memory has at most 4)
 fn rt_os_arena_size() -> int { return 1 << 31 }
+# the standard library's view of the system (types.RT_INTRINSICS), through the host's emulated
+# Linux calls (tools/wasm/caju-host.mjs)
+fn rt_os_clock(id: int) -> int {
+  ts := rt_tmp + 64
+  __syscall(228, id, ts, 0, 0, 0, 0)                 # clock_gettime
+  return __load64(ts) * 1000000000 + __load64(ts + 8)
+}
+fn rt_os_nanotime() -> int { return rt_os_clock(1) }
+fn rt_os_unix_nano() -> int { return rt_os_clock(0) }
+fn rt_os_random(p: int, n: int) -> int {
+  r := __syscall(318, p, n, 0, 0, 0, 0)              # getrandom (crypto.getRandomValues)
+  if r < 0 { return r }
+  return n
+}
+fn rt_os_write_fd(fd: int, p: int, n: int) -> int { return __syscall(1, fd, p, n, 0, 0, 0) }
+fn rt_os_read_fd(fd: int, p: int, n: int) -> int { return __syscall(0, fd, p, n, 0, 0, 0) }
+# the host answers ioctl(TCGETS) when it knows (Node: tty.isatty); a browser has no terminal
+fn rt_os_isatty(fd: int) -> bool { return __syscall(16, fd, 0x5401, rt_tmp + 64, 0, 0, 0) == 0 }

@@ -8,7 +8,8 @@
 # above a function (that function). A package may declare `platforms = ["linux"]` in its caju.toml
 # (every file of the package). Targets: linux, windows, wasm. Besides, a function that makes a
 # system call (__syscall: Linux numbers, which the WebAssembly host emulates in part) runs only on
-# linux and wasm.
+# linux and wasm, and DLL calls (extern) and the raw-memory built-ins that go with them (alloc,
+# free, peek*, poke*, readstr, readwstr) only on windows.
 #
 # After type checking, the functions the program can reach are followed from the top-level code
 # of every module, through calls, method calls (an interface call reaches the methods of the
@@ -20,6 +21,7 @@
 import "std/strings"
 import "ast"
 import "project"
+import "types"
 
 const DIRECTIVE = "caju:platforms"
 
@@ -180,9 +182,15 @@ export fn check(prog: *ast.Node, files: []*ast.SourceFile, target: str) {
   if er := p.mod_rules[entry]; er != nil && !allows(er, target) {
     ast.fail("platform", entry + " runs on " + strings.join(er.targets, ", ") + " (declared in its header), not on " + target, 1, 0)
   }
-  lines_of := map[str][]str{}
+  # the modules: a program of one file is not wrapped in a Module (its statements are the program's)
+  mods := []*ast.Node{}
+  loose := &ast.Node{kind: "Module", name: entry, stmts: []*ast.Node{}}
   for _, st := range prog.stmts {
-    if st.kind != "Module" { continue }
+    if st.kind == "Module" { mods = append(mods, st) } else { loose.stmts = append(loose.stmts, st) }
+  }
+  if len(loose.stmts) > 0 { mods = append(mods, loose) }
+  lines_of := map[str][]str{}
+  for _, st := range mods {
     for _, d := range st.stmts {
       if d.kind == "Interface" {
         ms := []str{}
@@ -208,8 +216,7 @@ export fn check(prog: *ast.Node, files: []*ast.SourceFile, target: str) {
     }
   }
   # roots: the top-level code of every module
-  for _, st := range prog.stmts {
-    if st.kind != "Module" { continue }
+  for _, st := range mods {
     for _, d := range st.stmts {
       if d.kind == "Func" || d.kind == "Struct" || d.kind == "Interface" || d.kind == "Extern" { continue }
       p.walk("", st.name, d)
@@ -255,6 +262,12 @@ fn (p: *Pass) walk(from_: str, module: str, n: *ast.Node) {
   switch n.kind {
   case "Call":
     if n.call_kind == "func" { p.reach(n.name, from_, module, n.line) }
+    if p.target != "windows" && n.call_kind == "extern" {
+      p.refuse(from_, n.line, "a DLL call (" + types.bare(n.name) + ")", "windows", "extern functions are Windows DLLs")
+    }
+    if p.target != "windows" && n.call_kind == "builtin" && types.contains_str(types.MEMORY_BUILTINS, n.name) {
+      p.refuse(from_, n.line, n.name, "windows", "raw memory for DLL calls")
+    }
   case "MethodCall":
     if n.target_name != "" {
       p.reach(n.target_name, from_, module, n.line)
@@ -285,16 +298,33 @@ fn (p: *Pass) walk(from_: str, module: str, n: *ast.Node) {
 }
 
 fn (p: *Pass) report(name: str, f: *Fn, entry: str) {
+  where := strings.trim_suffix(f.module, ".caju")
+  p.fail_chain(display(name) + " (" + where + ")", name, 0, strings.join(f.rule.targets, ", "), f.rule.why)
+}
+
+# a construct that only exists on some targets (a DLL call, alloc...) reached in the function
+# from_ (or in top-level code, "") at site
+fn (p: *Pass) refuse(from_: str, site: int, what: str, targets: str, why: str) {
+  if from_ == "" {
+    ast.fail("platform", what + " is not available when compiling for " + p.target + ": it runs on " + targets + " (" + why + ")", site, 0)
+    return
+  }
+  p.fail_chain(what, from_, site, targets, why)
+}
+
+# the Platform error for what: the function name itself (site0 0), or something at site0 inside
+# it; with the chain of calls from the program's code
+fn (p: *Pass) fail_chain(what: str, name: str, site0: int, targets: str, why: str) {
   # the chain from the program's code to name
   chain := []str{}
   cur := name
-  site := 0
+  site := site0
   guard := 0
   while cur != "" && guard < 64 {
     chain = append(chain, display(cur))
     r := p.reached[cur]
     if r == nil { break }
-    site = r.site
+    if site0 == 0 || cur != name { site = r.site }
     if r.parent == "" { break }
     cur = r.parent
     guard++
@@ -303,12 +333,16 @@ fn (p: *Pass) report(name: str, f: *Fn, entry: str) {
   cur = name
   user_site := site
   guard = 0
+  if site0 != 0 && p.user_module(p.funcs[name].module) {
+    user_site = site0
+    cur = ""
+  }
   while cur != "" && guard < 64 {
     r := p.reached[cur]
     if r == nil { break }
     m := r.module
     if r.parent != "" { m = p.funcs[r.parent].module }
-    if !strings.has_prefix(m, "std/") && package_rule(m) == nil && !strings.contains(m, "github.com/") {
+    if p.user_module(m) {
       user_site = r.site
       break
     }
@@ -321,7 +355,12 @@ fn (p: *Pass) report(name: str, f: *Fn, entry: str) {
     path = append(path, chain[k])
     k--
   }
-  where := strings.trim_suffix(f.module, ".caju")
-  msg := display(name) + " (" + where + ") is not available when compiling for " + p.target + ": it runs on " + strings.join(f.rule.targets, ", ") + " (" + f.rule.why + "). Called through " + strings.join(path, " → ")
+  if site0 != 0 { path = append(path, what) }
+  msg := what + " is not available when compiling for " + p.target + ": it runs on " + targets + " (" + why + "). Called through " + strings.join(path, " → ")
   ast.fail("platform", msg, user_site, 0)
+}
+
+# the program's own code (not std/ nor a package)
+fn (p: *Pass) user_module(m: str) -> bool {
+  return !strings.has_prefix(m, "std/") && package_rule(m) == nil && !strings.contains(m, "github.com/")
 }

@@ -2313,7 +2313,9 @@ fn (f: *Fn) call(n: *ast.Node) {
     return
   }
   if n.call_kind == "extern" {
-    nfail("DLL calls (" + f.u.externs[nm].symbol + ") only exist on Windows", n)
+    # unreachable here (the platform pass refuses a reachable DLL call outside Windows)
+    f.fail_here(n, "DLL calls (" + f.u.externs[nm].symbol + ") only exist on Windows")
+    return
   }
   if n.call_kind == "value" {
     v := f.lookup(nm, n)
@@ -2732,7 +2734,22 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     f.rt("rt_recover", 0)
     return
   }
+  if types.contains_str(types.MEMORY_BUILTINS, nm) {
+    # raw memory for DLL calls, only on Windows: the platform pass refuses a reachable call
+    f.fail_here(n, nm + " (raw memory for DLL calls) only exists on Windows")
+    return
+  }
   if !f.u.is_runtime && !n.privileged { nfail("the function " + nm + " is not supported yet", n) }
+  rtf, is_rtf := types.RT_INTRINSICS[nm]
+  if is_rtf {
+    # a call to the runtime's function for this system (rt/wasm.caju: the host's emulated calls)
+    for _, a := range args {
+      f.expr_to(a, "int")
+      f.push()
+    }
+    f.rt(rtf, len(args))
+    return
+  }
   switch nm {
   case "__load8":
     f.expr(args[0])

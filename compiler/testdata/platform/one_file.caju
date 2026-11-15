@@ -1,0 +1,4 @@
+print("start")
+# caju:platforms linux    (a program of one file declares its own function)
+fn native_only() { print("native") }
+native_only()

@@ -1,20 +1,86 @@
 # Native runtime: the Windows part (kernel32 functions)
 extern "kernel32.dll" fn GetStdHandle(n: i32) -> ptr
 extern "kernel32.dll" fn WriteFile(h: ptr, buf: ptr, n: u32, written: ptr, ov: ptr) -> bool
+extern "kernel32.dll" fn ReadFile(h: ptr, buf: ptr, n: u32, got: ptr, ov: ptr) -> bool
+extern "kernel32.dll" fn GetLastError() -> u32
+extern "kernel32.dll" fn GetConsoleMode(h: ptr, mode: ptr) -> bool
 extern "kernel32.dll" fn ExitProcess(code: u32)
 extern "kernel32.dll" fn VirtualAlloc(addr: ptr, n: u64, kind: u32, prot: u32) -> ptr
 extern "kernel32.dll" fn Sleep(ms: u32)
-extern "kernel32.dll" fn GetEnvironmentVariableA(name: ptr, buf: ptr, n: u32) -> u32
 extern "kernel32.dll" fn SetConsoleOutputCP(cp: u32) -> bool
+extern "kernel32.dll" fn QueryPerformanceCounter(c: ptr) -> bool
+extern "kernel32.dll" fn QueryPerformanceFrequency(f: ptr) -> bool
+extern "kernel32.dll" fn GetSystemTimeAsFileTime(ft: ptr)
+extern "kernel32.dll" fn GetCommandLineW() -> ptr
+extern "kernel32.dll" fn GetEnvironmentStringsW() -> ptr
+extern "kernel32.dll" fn WideCharToMultiByte(cp: u32, flags: u32, w: ptr, wn: i32, out: ptr, n: i32, dflt: ptr, used: ptr) -> i32
+extern "kernel32.dll" fn GetProcessHeap() -> ptr
+extern "kernel32.dll" fn HeapAlloc(heap: ptr, flags: u32, n: u64) -> ptr
+extern "kernel32.dll" fn HeapFree(heap: ptr, flags: u32, p: ptr) -> bool
+extern "shell32.dll" fn CommandLineToArgvW(cmd: ptr, argc: ptr) -> ptr
+extern "bcrypt.dll" fn BCryptGenRandom(alg: ptr, buf: ptr, n: u32, flags: u32) -> u32
 
 let rt_stdout: int = 0
+let rt_argp: int = 0          # argc, argv..., 0, envp..., 0 in UTF-8, as Linux gives them (__argp)
+let rt_qpf: int = 0           # QueryPerformanceFrequency
 
 fn rt_os_init() {
   SetConsoleOutputCP(65001)
   rt_stdout = GetStdHandle(-11)
-  name := "CAJU_SKIP_SLEEP"
-  if GetEnvironmentVariableA(__strp(name) + 8, 0, 0) > 0 { rt_skip_sleep = true }
+  rt_argp = rt_win_args()
+  e := rt_argp + 8 * (__load64(rt_argp) + 2)
+  while __load64(e) != 0 {
+    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=1") { rt_skip_sleep = true }
+    e += 8
+  }
 }
+
+# the command line (CommandLineToArgvW) and the environment block, converted to UTF-8 C strings
+# in the layout of a Linux process's stack, so std/os reads them the same way everywhere
+fn rt_win_args() -> int {
+  argc_at := rt_tmp + 64
+  __store64(argc_at, 0)
+  wargv := CommandLineToArgvW(GetCommandLineW(), argc_at)
+  argc := __load32(argc_at)
+  if wargv == 0 { argc = 0 }
+  wenv := GetEnvironmentStringsW()
+  nenv := 0
+  size := 0
+  for i := 0; i < argc; i++ { size += WideCharToMultiByte(65001, 0, __load64(wargv + 8 * i), -1, 0, 0, 0, 0) }
+  w := wenv
+  while wenv != 0 && rt_load16(w) != 0 {
+    size += WideCharToMultiByte(65001, 0, w, -1, 0, 0, 0, 0)
+    nenv++
+    w += 2 * (rt_wlen(w) + 1)
+  }
+  head := 8 * (argc + nenv + 3)
+  block := rt_os_mem(head + size + 16)
+  __store64(block, argc)
+  at := block + head
+  for i := 0; i < argc; i++ {
+    __store64(block + 8 + 8 * i, at)
+    at += WideCharToMultiByte(65001, 0, __load64(wargv + 8 * i), -1, at, size, 0, 0)
+  }
+  __store64(block + 8 + 8 * argc, 0)
+  ep := block + 8 * (argc + 2)
+  w = wenv
+  while wenv != 0 && rt_load16(w) != 0 {
+    __store64(ep, at)
+    ep += 8
+    at += WideCharToMultiByte(65001, 0, w, -1, at, size, 0, 0)
+    w += 2 * (rt_wlen(w) + 1)
+  }
+  __store64(ep, 0)
+  return block
+}
+fn rt_load16(p: int) -> int { return __load8(p) | (__load8(p + 1) << 8) }
+# the UTF-16 units of a wide C string, without the final 0
+fn rt_wlen(w: int) -> int {
+  k := 0
+  while rt_load16(w + 2 * k) != 0 { k++ }
+  return k
+}
+
 fn rt_os_write(p: int, n: int) { WriteFile(rt_stdout, p, n, rt_tmp + 64, 0) }
 fn rt_os_mem(n: int) -> int { return VirtualAlloc(0, n, 12288, 4) }
 fn rt_os_reserve(n: int) -> int { return VirtualAlloc(0, n, 8192, 1) }
@@ -25,3 +91,111 @@ fn rt_os_exit(c: int) { ExitProcess(c) }
 fn rt_os_sleep(s: num) { Sleep(int(s * 1000.0)) }
 # the arena of the collector: 16 GB of addresses (only the pages used take memory)
 fn rt_os_arena_size() -> int { return 1 << 34 }
+
+# ---------------------------------------------------------------- the system, for the standard library
+# (types.RT_INTRINSICS; errors are -errno, as on Linux)
+
+# monotonic clock, in nanoseconds (QueryPerformanceCounter)
+fn rt_os_nanotime() -> int {
+  if rt_qpf == 0 {
+    QueryPerformanceFrequency(rt_tmp + 64)
+    rt_qpf = __load64(rt_tmp + 64)
+    if rt_qpf <= 0 { rt_qpf = 1 }
+  }
+  QueryPerformanceCounter(rt_tmp + 64)
+  c := __load64(rt_tmp + 64)
+  return c / rt_qpf * 1000000000 + c % rt_qpf * 1000000000 / rt_qpf
+}
+# the wall clock, in nanoseconds since 1970-01-01 UTC (a FILETIME counts 100 ns since 1601)
+fn rt_os_unix_nano() -> int {
+  GetSystemTimeAsFileTime(rt_tmp + 64)
+  return (__load64(rt_tmp + 64) - 116444736000000000) * 100
+}
+# n secure random bytes at p (BCryptGenRandom with the system's preferred generator)
+fn rt_os_random(p: int, n: int) -> int {
+  if BCryptGenRandom(0, p, n, 2) != 0 { return -5 }
+  return n
+}
+# the standard handles: 0 input, 1 output, 2 error
+fn rt_std_handle(fd: int) -> int {
+  if fd == 0 { return GetStdHandle(-10) }
+  if fd == 1 { return GetStdHandle(-11) }
+  if fd == 2 { return GetStdHandle(-12) }
+  return 0
+}
+fn rt_os_write_fd(fd: int, p: int, n: int) -> int {
+  h := rt_std_handle(fd)
+  if h == 0 || h == -1 { return -9 }
+  done := 0
+  while done < n {
+    __store64(rt_tmp + 64, 0)
+    if !WriteFile(h, p + done, n - done, rt_tmp + 64, 0) { return -5 }
+    w := __load32(rt_tmp + 64)
+    if w == 0 { return -5 }
+    done += w
+  }
+  return n
+}
+fn rt_os_read_fd(fd: int, p: int, n: int) -> int {
+  h := rt_std_handle(fd)
+  if fd != 0 || h == 0 || h == -1 { return -9 }
+  __store64(rt_tmp + 64, 0)
+  if !ReadFile(h, p, n, rt_tmp + 64, 0) {
+    if GetLastError() == 109 { return 0 }       # ERROR_BROKEN_PIPE: the end of a pipe
+    return -5
+  }
+  return __load32(rt_tmp + 64)
+}
+fn rt_os_isatty(fd: int) -> bool {
+  h := rt_std_handle(fd)
+  if h == 0 || h == -1 { return false }
+  return GetConsoleMode(h, rt_tmp + 64)
+}
+
+# ---------------------------------------------------------------- raw memory for DLL calls
+# alloc, free, peek*, poke*, readstr, readwstr (compiler/native.caju, memory_builtin)
+fn rt_ffi_alloc(n: int) -> int {
+  if n <= 0 { n = 1 }
+  return HeapAlloc(GetProcessHeap(), 8, n)          # HEAP_ZERO_MEMORY
+}
+fn rt_ffi_free(p: int) {
+  if p != 0 { HeapFree(GetProcessHeap(), 0, p) }
+}
+fn rt_peek(where: str, p: int, bits: int) -> int {
+  if p == 0 { rt_fail(where, "Null pointer in peek" + rt_int_str(bits)) }
+  if bits == 8 { return __load8(p) }
+  if bits == 16 { return rt_load16(p) }
+  if bits == 32 { return __load32(p) }
+  return __load64(p)
+}
+fn rt_poke(where: str, p: int, v: int, bits: int) {
+  if p == 0 { rt_fail(where, "Null pointer in poke" + rt_int_str(bits)) }
+  if bits == 8 {
+    __store8(p, v)
+  } else if bits == 16 {
+    __store8(p, v)
+    __store8(p + 1, v >> 8)
+  } else if bits == 32 {
+    __store32(p, v)
+  } else {
+    __store64(p, v)
+  }
+}
+# a C string (UTF-8 or ANSI bytes ending in 0) as a Caju string; "" for a null pointer
+fn rt_readstr(p: int) -> str {
+  if p == 0 { return "" }
+  n := 0
+  while __load8(p + n) != 0 { n++ }
+  m := rt_newstr(n)
+  rt_copy(m + 8, p, n)
+  return __pstr(m)
+}
+# a wide C string (UTF-16 ending in 0) as a Caju string (UTF-8)
+fn rt_readwstr(p: int) -> str {
+  if p == 0 { return "" }
+  n := WideCharToMultiByte(65001, 0, p, -1, 0, 0, 0, 0)
+  if n <= 1 { return "" }
+  m := rt_newstr(n - 1)
+  WideCharToMultiByte(65001, 0, p, -1, m + 8, n, 0, 0)
+  return __pstr(m)
+}

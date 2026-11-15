@@ -82,10 +82,11 @@ In wasm (`--target wasm tests/lang lib examples`) the tests that need sockets (`
 `websocket`, `tls`) are skipped (docs/platforms.md) or fail only where they test sockets. Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
-Expected result today: **888 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows
-programs from phases 6 and 7, and 3 known bugs in `tests/lang`: a variable read before being
+Expected result today: **1215 pass, 0 fail, 7 skipped**, plus tests/lang/goroutines_test.caju skipped
+whole (the goroutines example, 2 Windows programs that need channels, and 3 known bugs in `tests/lang`: a variable read before being
 assigned gives garbage; a dynamic method call on `any` neither converts an untyped argument nor
-checks the argument count).
+checks the argument count); in wasm **927 pass, 0 fail, 5 skipped** (goroutines and the socket
+tests). Under WSL, `compiler/windows_test.caju` also runs Windows programs for real (interop).
 
 **The JS compiler is only stage 0**, and only for `compiler/build_main.caju` (tools/release.sh). Since the optimizations (bench/compare/OPTIMIZATION.md), the
 Caju compiler generates better code than the JS one; the JS only compiles the first stage and
@@ -147,7 +148,8 @@ generator):
 ## What's missing
 
 - Goroutines, channels, `select`, sleep with a scheduler, deadlock (phase 6).
-- Windows: `alloc`/`peek`/`poke`/`readstr`, `dllexport` and native DLL (phase 7).
+- Windows: `dllexport` and native DLL (phase 7); files, processes and sockets (std/os, std/fs and
+  std/net use Linux system calls: refused at compile time on Windows).
 - The 3 known bugs above.
 - std/testing's `to_have_length`/`to_contain` only know lists and maps of basic types (the
   language has no `len` on `any`); for others, `expect(len(x)).to_equal(n)`.
@@ -174,6 +176,13 @@ generator):
   `__pany(int) -> any` (the reverse), plus `__alloc`, `__zero(desc)`, `__make_slice(ed, n, c)`,
   `__map_new(kk)`, `__map_set(m, k, v)`, which call the runtime routines. The descriptor layout is
   in `rt/values.caju`; changed the layout? Update `lib/json.caju` too.
+- What std asks of the system on every target goes through intrinsics that call a function each
+  runtime defines (`types.RT_INTRINSICS`: `__nanotime`, `__unix_nano`, `__random`, `__write`,
+  `__read`, `__isatty` → `rt_os_*` in rt/linux, rt/windows, rt/wasm, and bootstrap/rt/linux.caju
+  for stage 0). A std function with `__syscall` is refused on Windows; one with only these runs
+  everywhere. A new intrinsic used by `std/os` needs the JS bootstrap too (types.js, native.js),
+  and the previous compiler cannot build the new std: build the new compiler with the old `lib/`
+  first, or start the chain from the JS. Platform facts per target: docs/platform-matrix.md.
 - `std/http` is an event loop (epoll, `net.Poller`) with keep-alive and pipelining; handlers run
   one at a time. `listen_and_serve_workers` forks n processes with `SO_REUSEPORT` (no shared
   memory; children die with the parent via `PR_SET_PDEATHSIG`). Each connection's buffers are raw

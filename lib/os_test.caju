@@ -90,6 +90,23 @@ describe("os.unix_time", fn() {
   })
 })
 
+describe("os.unix_nano", fn() {
+  it("gives the wall clock in nanoseconds, the same second as os.unix_time", fn() {
+    s := os.unix_time()
+    n := os.unix_nano()
+    expect(n / 1000000000 - s).to_be_at_most(1)
+    expect(n / 1000000000 - s).to_be_at_least(0)
+  })
+})
+
+describe("os.read_line and os.read_stdin", fn() {
+  it("read_stdin gives what read_line read past its line too", fn() {
+    p, err := os.run([]str{"sh", "-c", "printf 'one\\ntwo\\nthree\\n' | \"$0\" run testdata/stdin_rest.caju", os.getenv("CAJU_BIN")}, nil, true)
+    expect(err).to_be_nil()
+    expect(p.output).to_equal("line: one\nrest: two\nthree\n\n")
+  })
+})
+
 describe("os.is_terminal", fn() {
   it("is false for a descriptor that is not open", fn() {
     expect(os.is_terminal(-1)).to_be_false()

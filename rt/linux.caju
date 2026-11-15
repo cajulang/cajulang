@@ -6,7 +6,7 @@ fn rt_os_init() {
   argc := __load64(p)
   e := p + 8 * (argc + 2)
   while __load64(e) != 0 {
-    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=") { rt_skip_sleep = true }
+    if rt_cstr_prefix(__load64(e), "CAJU_SKIP_SLEEP=1") { rt_skip_sleep = true }
     e += 8
   }
 }
@@ -34,3 +34,29 @@ fn rt_os_sleep(s: num) {
 }
 # the arena of the collector: 16 GB of addresses (only the pages used take memory)
 fn rt_os_arena_size() -> int { return 1 << 34 }
+# the standard library's view of the system (types.RT_INTRINSICS)
+fn rt_os_clock(id: int) -> int {
+  ts := rt_tmp + 64
+  __syscall(228, id, ts, 0, 0, 0, 0)                 # clock_gettime
+  return __load64(ts) * 1000000000 + __load64(ts + 8)
+}
+# monotonic clock, in nanoseconds
+fn rt_os_nanotime() -> int { return rt_os_clock(1) }
+# the wall clock: nanoseconds since 1970-01-01 UTC
+fn rt_os_unix_nano() -> int { return rt_os_clock(0) }
+# n secure random bytes at p (getrandom): n, or -errno
+fn rt_os_random(p: int, n: int) -> int {
+  got := 0
+  while got < n {
+    r := __syscall(318, p + got, n - got, 0, 0, 0, 0)
+    if r == -4 { continue }
+    if r < 0 { return r }
+    got += r
+  }
+  return n
+}
+# write and read on a file descriptor (0, 1, 2 for the standard ones): bytes, or -errno
+fn rt_os_write_fd(fd: int, p: int, n: int) -> int { return __syscall(1, fd, p, n, 0, 0, 0) }
+fn rt_os_read_fd(fd: int, p: int, n: int) -> int { return __syscall(0, fd, p, n, 0, 0, 0) }
+# is fd a terminal? (ioctl TCGETS)
+fn rt_os_isatty(fd: int) -> bool { return __syscall(16, fd, 0x5401, rt_tmp + 64, 0, 0, 0) == 0 }

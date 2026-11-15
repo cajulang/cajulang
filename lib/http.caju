@@ -789,12 +789,7 @@ fn (cl: *Peer) on_readable() {
   cl.handle_input()
 }
 
-let ts_buf: int = 0
-fn now_ms() -> int {
-  if ts_buf == 0 { ts_buf = __newstr(16) + 8 }
-  __syscall(228, 1, ts_buf, 0, 0, 0, 0)          # clock_gettime(CLOCK_MONOTONIC)
-  return __load64(ts_buf) * 1000 + __load64(ts_buf + 8) / 1000000
-}
+fn now_ms() -> int { return __nanotime() / 1000000 }
 
 const LISTENER = -1
 

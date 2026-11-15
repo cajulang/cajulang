@@ -2,7 +2,11 @@
 // calls that the runtime and the standard library make (see compiler/wasm.caju and rt/wasm.caju),
 // over a file system object (Node's real one in run.mjs, an in-memory one in the playground).
 //
-//   const code = await runCaju(bytes, { args, env, fsys, stdout, stderr })
+//   const code = await runCaju(bytes, { args, env, fsys, stdout, stderr, stdin, now, spawn, isatty })
+//
+// stdin(n) -> Uint8Array | null (null or empty: the end of the input); now() -> ms of a monotonic
+// clock; spawn(path, argv, envp, merge) -> { output, status } runs another program (os.run);
+// isatty(fd) -> bool (os.is_terminal; without it nothing is a terminal).
 //
 // fsys: { cwd(), stat(path, follow) -> {mode, size, mtimeMs}, open(path, flags, mode) -> handle,
 //   read(h, u8, pos) -> n, write(h, u8, pos) -> n, size(h), close(h), readdir(path) -> [{name, dir}],
@@ -16,14 +20,14 @@ export class Exit extends Error {
   }
 }
 
-const ENOENT = 2, EBADF = 9, ENOMEM = 12, EINVAL = 22, ENOSYS = 38, ENOTDIR = 20
+const ENOENT = 2, EBADF = 9, ENOMEM = 12, EINVAL = 22, ENOSYS = 38, ENOTDIR = 20, ENOTTY = 25
 
 export async function runCaju(bytes, opts) {
   const mod = await WebAssembly.compile(bytes)
   return runModule(mod, opts)
 }
 
-export async function runModule(mod, { args = ["main"], env = [], fsys, stdout, stderr, stdin = null, now = () => performance.now(), spawn = null }) {
+export async function runModule(mod, { args = ["main"], env = [], fsys, stdout, stderr, stdin = null, now = () => performance.now(), spawn = null, isatty = null }) {
   let memory = null
   let view = null
   let u8 = null
@@ -183,6 +187,10 @@ export async function runModule(mod, { args = ["main"], env = [], fsys, stdout, 
           ensure(a1 + a2)
           return 0n
         }
+        case 16: {                                      // ioctl: only TCGETS (is it a terminal?)
+          if (a2 !== 0x5401) return BigInt(-ENOSYS)
+          return isatty && isatty(a1) ? 0n : BigInt(-ENOTTY)
+        }
         case 28: return 0n                              // madvise
         case 35: {                                      // nanosleep
           refresh()
@@ -261,7 +269,8 @@ export async function runModule(mod, { args = ["main"], env = [], fsys, stdout, 
         case 318: {                                     // getrandom
           refresh()
           const b = new Uint8Array(a2)
-          crypto.getRandomValues(b)
+          // getRandomValues gives at most 65536 bytes at a time
+          for (let i = 0; i < a2; i += 65536) crypto.getRandomValues(b.subarray(i, Math.min(a2, i + 65536)))
           u8.set(b, a1)
           return BigInt(a2)
         }

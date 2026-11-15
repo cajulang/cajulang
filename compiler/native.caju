@@ -734,6 +734,11 @@ export fn compile_native(files: []*ast.SourceFile, rt_sources: []str, target: st
   A.lea(RAX, "g.data_hi")
   A.store_sym("r.g.rt_data_hi", RAX)
   A.call(g.rt_call("rt_init"))
+  # Windows: the runtime builds the arguments and the environment in Linux's layout (rt_win_args)
+  if target == "windows" {
+    A.load_sym(RAX, "r.g.rt_argp")
+    A.store_sym("g.argp", RAX)
+  }
   gs := []str{"rt_d_int", "rt_d_num", "rt_d_bool", "rt_d_str", "rt_d_any", "rt_d_err"}
   ts := []str{"int", "num", "bool", "str", "any", "·errstr"}
   for i := 0; i < len(gs); i++ {
@@ -4395,7 +4400,11 @@ fn (f: *Fn) call(n: *ast.Node) {
   }
   if n.call_kind == "extern" {
     e := f.u.externs[nm]
-    if f.g.target != "windows" { nfail("DLL calls (" + e.symbol + ") only exist on Windows", n) }
+    if f.g.target != "windows" {
+      # unreachable here (the platform pass refuses a reachable DLL call on other targets)
+      f.fail_here(n, "DLL calls (" + e.symbol + ") only exist on Windows")
+      return
+    }
     for i := 0; i < len(e.params); i++ {
       lt, ok := types.FFI_LANG[e.ptypes[i]]
       if !ok || lt == "" { lt = "int" }
@@ -4878,7 +4887,21 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     f.rt("rt_recover", 0)
     return
   }
+  if types.contains_str(types.MEMORY_BUILTINS, nm) {
+    f.memory_builtin(n)
+    return
+  }
   if !f.u.is_runtime && !n.privileged { nfail("the function " + nm + " is not supported yet", n) }
+  rtf, is_rtf := types.RT_INTRINSICS[nm]
+  if is_rtf {
+    # a call to the runtime's own function for this system (rt_os_nanotime...)
+    for _, a := range args {
+      f.expr_to(a, "int")
+      A.push(RAX)
+    }
+    f.rt(rtf, len(args))
+    return
+  }
   # low-level operations of the runtime
   switch nm {
   case "__load8":
@@ -4998,6 +5021,50 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     return
   }
   nfail("the function " + nm + " is not supported yet", n)
+}
+# alloc, free, peek*, poke*, readstr, readwstr: raw memory for DLL calls, in rt/windows.caju. On
+# other targets the platform pass refuses a reachable call, so this one is never reached
+fn (f: *Fn) memory_builtin(n: *ast.Node) {
+  A := f.a
+  nm := n.name
+  args := n.args
+  if f.g.target != "windows" {
+    f.fail_here(n, nm + " (raw memory for DLL calls) only exists on Windows")
+    return
+  }
+  if nm == "alloc" || nm == "readstr" || nm == "readwstr" {
+    f.expr_to(args[0], "int")
+    A.push(RAX)
+    if nm == "alloc" { f.rt("rt_ffi_alloc", 1) } else if nm == "readstr" { f.rt("rt_readstr", 1) } else { f.rt("rt_readwstr", 1) }
+    return
+  }
+  if nm == "free" {
+    # memory from alloc; anything else belongs to the collector
+    if !types.is_int_t(types.dflt(args[0].ty)) {
+      f.expr(args[0])
+      return
+    }
+    f.expr_to(args[0], "int")
+    A.push(RAX)
+    f.rt("rt_ffi_free", 1)
+    return
+  }
+  size := int(nm[len(nm) - 1]) - 48
+  if size == 6 { size = 16 } else if size == 2 { size = 32 } else if size == 4 { size = 64 }
+  f.where_arg(n)
+  f.expr_to(args[0], "int")
+  A.push(RAX)
+  if strings.has_prefix(nm, "poke") {
+    if types.dflt(args[1].ty) == "bool" { f.expr(args[1]) } else { f.expr_to(args[1], "int") }
+    A.push(RAX)
+    A.mov_imm(RAX, size)
+    A.push(RAX)
+    f.rt("rt_poke", 4)
+    return
+  }
+  A.mov_imm(RAX, size)
+  A.push(RAX)
+  f.rt("rt_peek", 3)
 }
 fn (f: *Fn) two(args: []*ast.Node) {
   if is_simple(args[1]) {

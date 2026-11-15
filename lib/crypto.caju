@@ -9,7 +9,6 @@
 import "std/hex"
 
 const M32 = 0xFFFFFFFF
-const SYS_GETRANDOM = 318
 
 # ---------------------------------------------------------------- helpers
 
@@ -565,16 +564,19 @@ export fn constant_time_eq(a: str, b: str) -> bool {
   return d == 0
 }
 
-# n bytes from the kernel's secure random generator (getrandom)
+# n bytes from the system's secure random generator (getrandom on Linux, BCryptGenRandom on
+# Windows, crypto.getRandomValues in WebAssembly)
 export fn random_bytes(n: int) -> (str, error) {
   if n < 0 { return "", errors.New("crypto: negative length") }
   m := __newstr(n)
+  # in pieces: a WebAssembly host's getRandomValues gives at most 64 KB at a time
   got := 0
   while got < n {
-    r := __syscall(SYS_GETRANDOM, m + 8 + got, n - got, 0, 0, 0, 0)
-    if r == -4 { continue }      # interrupted
-    if r < 0 { return "", errors.New("crypto: getrandom failed: error " + str(-r)) }
-    got += r
+    k := n - got
+    if k > 65536 { k = 65536 }
+    r := __random(m + 8 + got, k)
+    if r < 0 { return "", errors.New("crypto: the system's random generator failed: error " + str(-r)) }
+    got += k
   }
   return __pstr(m), nil
 }

@@ -1,0 +1,17 @@
+# what every target has (std/os's arguments, environment, standard streams, clocks and sleep,
+# and crypto.random_bytes), run by windows_test.caju on Windows
+import "std/os"
+import "std/crypto"
+a := os.args()
+print(len(a), a[1], a[2])
+print(os.getenv("CAJU_WIN_TEST"))
+t0 := os.nanotime()
+os.sleep(0.01)
+print(os.nanotime() - t0 > 0, os.unix_time() > 1700000000, os.unix_nano() / 1000000000 - os.unix_time() <= 1)
+b, err := crypto.random_bytes(32)
+print(err == nil, len(b))
+os.stdout("to stdout\n")
+os.stderr("to stderr\n")
+line, ok := os.read_line()
+print(line, ok, os.read_stdin())
+os.exit(4)
