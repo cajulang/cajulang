@@ -354,3 +354,17 @@ describe("toml.parse errors", fn() {
     expect(err).to_be_error("toml: line 1: too many quotes at the end of a multi-line string")
   })
 })
+
+describe("toml nesting", fn() {
+  it("refuses arrays and inline tables nested too deep with an error, not a crash", fn() {
+    _, err := toml.parse("a = " + strings.repeat("[", 1000000))
+    expect(err.Error()).to_contain("nesting deeper than 500 levels")
+    _, err2 := toml.parse("a = " + strings.repeat("{b = ", 100000))
+    expect(err2.Error()).to_contain("nesting deeper than 500 levels")
+  })
+  it("still reads reasonable nesting", fn() {
+    v, err := toml.parse("a = " + strings.repeat("[", 100) + "1" + strings.repeat("]", 100))
+    expect(err).to_be_nil()
+    expect(v.get("a").kind).to_equal("array")
+  })
+})

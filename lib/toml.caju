@@ -142,7 +142,12 @@ struct Parser {
   i: int
   n: int
   line: int
+  depth: int      # arrays and inline tables open around the current value
 }
+
+# deeper nesting is an error, not a stack overflow that ends the program (a caju.toml downloaded
+# with a package is untrusted input)
+const MAX_DEPTH = 500
 
 # parses a TOML document into a table
 export fn parse(src: str) -> (root: *Value, err: error) {
@@ -658,7 +663,13 @@ fn (p: *Parser) ml_literal_string() -> str {
   return b.string()
 }
 
+fn (p: *Parser) enter() {
+  p.depth++
+  if p.depth > MAX_DEPTH { p.fail("nesting deeper than " + str(MAX_DEPTH) + " levels") }
+}
+
 fn (p: *Parser) array() -> *Value {
+  p.enter()
   p.i++
   arr := new_array()
   arr.inline = true
@@ -680,16 +691,19 @@ fn (p: *Parser) array() -> *Value {
     }
     p.fail("expected \",\" or \"]\" in the array, found " + p.describe())
   }
+  p.depth--
   return arr
 }
 
 fn (p: *Parser) inline_table() -> *Value {
+  p.enter()
   p.i++
   t := new_table()
   p.skip_ws()
   if p.peek() == RBRACE {
     p.i++
     t.inline = true
+    p.depth--
     return t
   }
   while true {
@@ -708,6 +722,7 @@ fn (p: *Parser) inline_table() -> *Value {
     p.fail("expected \",\" or \"}\" in the inline table, found " + p.describe())
   }
   t.inline = true
+  p.depth--
   return t
 }
 
