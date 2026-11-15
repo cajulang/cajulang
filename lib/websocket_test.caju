@@ -5,7 +5,9 @@ import "std/os"
 import "std/strings"
 import { describe, it, expect } from "std/testing"
 
-let next_port: int = 40000 + os.getpid() % 10000
+# below 32768, where Linux takes the local ports of outgoing connections: a test that dials a
+# port no server holds yet could otherwise connect to itself and think the server is up
+let next_port: int = 22000 + os.getpid() % 5000      # 22000-27099: apart from the other test files
 let pid: str = ""
 let port: int = 0
 
@@ -62,6 +64,24 @@ fn raw(bs: []int) -> str {
   b := strings.Builder{}
   for _, x := range bs { b.write_byte(x) }
   return b.string()
+}
+
+# sends a request and reads until the end of the response head
+fn raw_handshake(req: str) -> str {
+  c, _ := net.dial("127.0.0.1", port)
+  c.write(req)
+  r := ""
+  while strings.index(r, "\r\n\r\n") < 0 {
+    chunk, _ := c.read(4096)
+    if chunk == "" { break }
+    r = r + chunk
+  }
+  c.close()
+  return r
+}
+
+fn handshake(path: str, extra: str) -> str {
+  return raw_handshake("GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1:" + str(port) + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" + extra + "\r\n")
 }
 
 fn dial(url: str) -> *websocket.Conn {
@@ -215,6 +235,80 @@ describe("websocket client and server", fn() {
     }
     stop()
     expect(r).to_start_with("HTTP/1.1 400 Bad Request")
+  })
+  it("accepts browsers only from the request's own origin, unless Options.origins allows more", fn() {
+    base := start("", false)
+    evil := handshake("/echo", "Origin: http://evil.example\r\n")
+    own := handshake("/echo", "Origin: http://127.0.0.1:" + str(port) + "\r\n")
+    none := handshake("/echo", "")
+    any_ok := handshake("/any", "Origin: http://evil.example\r\n")
+    tricky := handshake("/echo", "Origin: http://127.0.0.1:" + str(port) + ".evil.example\r\n")
+    stop()
+    expect(evil).to_start_with("HTTP/1.1 403 ")
+    expect(own).to_start_with("HTTP/1.1 101 ")
+    expect(none).to_start_with("HTTP/1.1 101 ")
+    expect(any_ok).to_start_with("HTTP/1.1 101 ")
+    expect(tricky).to_start_with("HTTP/1.1 403 ")
+    expect(base).to_start_with("ws://")
+  })
+  it("refuses a Sec-WebSocket-Key that is not 16 bytes in base64", fn() {
+    start("", false)
+    r := raw_handshake("GET /echo HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: not-base64!!\r\n\r\n")
+    stop()
+    expect(r).to_start_with("HTTP/1.1 400 ")
+  })
+  it("closes with 1007 on a text message that is not UTF-8", fn() {
+    base := start("", false)
+    ws := dial(base + "/echo")
+    read_text(ws)
+    ws.send_text(raw([]int{0x61, 0xFF, 0xFE}))
+    _, err := ws.read()
+    stop()
+    expect(err.Error()).to_equal("websocket: closed (1007)")
+  })
+  it("answers an invalid close code with 1002", fn() {
+    start("", false)
+    c, _ := net.dial("127.0.0.1", port)
+    c.write("GET /echo HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    c.write(websocket.frame(8, raw([]int{0x03, 0xE7}), true))      # code 999
+    got := ""
+    while true {
+      chunk, _ := c.read(4096)
+      if chunk == "" { break }
+      got = got + chunk
+    }
+    stop()
+    expect(strings.has_suffix(got, raw([]int{0x88, 0x02, 0x03, 0xEA}))).to_be_true()
+  })
+  it("refuses handshake headers and URLs with CR or LF", fn() {
+    _, e1 := websocket.dial_with("ws://127.0.0.1:1/", &websocket.Options{headers: map[str]str{"X-A": "v\r\nX-Injected: 1"}})
+    _, e2 := websocket.dial("ws://127.0.0.1:1/x HTTP/1.1\r\nX-Injected: 1")
+    expect(e1.Error()).to_equal("websocket: invalid handshake header \"X-A\"")
+    expect(e2.Error()).to_start_with("websocket: invalid character in URL")
+  })
+  it("takes a large frame in small pieces without copying it at every piece", fn() {
+    start("", false)
+    c, _ := net.dial("127.0.0.1", port)
+    c.write("GET /echo HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    f := websocket.frame(2, strings.repeat("z", 8000000), true)
+    t0 := os.nanotime()
+    i := 0
+    while i < len(f) {
+      e := i + 4096
+      if e > len(f) { e = len(f) }
+      c.write(f[i:e])
+      i = e
+    }
+    got := 0
+    while got < 8000000 {
+      chunk, _ := c.read(1 << 20)
+      if chunk == "" { break }
+      got += len(chunk)
+    }
+    ms := (os.nanotime() - t0) / 1000000
+    stop()
+    expect(got >= 8000000).to_be_true()
+    expect(ms < 2500).to_be_true()
   })
   it("joins a fragmented message, and works with the browser's client (Node)", fn() {
     base := start("", false)

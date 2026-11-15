@@ -35,6 +35,11 @@ http.handle("/echo", fn(req: *http.Request, res: *http.Response) {
     closes++
   })
 })
+http.handle("/any", fn(req: *http.Request, res: *http.Response) {
+  ws, err := websocket.accept_with(req, res, &websocket.Options{origins: []str{"*"}})
+  if err != nil { return }
+  ws.on_message(fn(c: *websocket.Conn, m: *websocket.Message) { c.send_text(m.text()) })
+})
 http.handle("/plain", fn(req: *http.Request, res: *http.Response) { res.write("not a websocket") })
 http.handle("/ws-only", fn(req: *http.Request, res: *http.Response) { websocket.accept(req, res) })
 

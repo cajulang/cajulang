@@ -29,7 +29,7 @@ ws.close(websocket.NORMAL, "bye")
 | `headers` | extra headers of the handshake (`Authorization`...) |
 | `protocols` | the subprotocols offered; `ws.protocol` is the one the server chose |
 | `timeout_ms` | connect, handshake and each write (default 30 s) |
-| `ping_interval_ms` | when nothing arrived for this long, send a ping; no answer by the next interval ends the connection |
+| `ping_interval_ms` | when nothing arrived for this long, send a ping; no answer by the next interval ends the connection (clients: off by default) |
 | `reconnect` | when the connection drops (or the server closes with a code other than 1000 or 1008), `read` and `send` dial again |
 | `reconnect_max_ms` | the backoff starts at 250 ms and doubles up to this (default 30 s) |
 | `max_retries` | attempts in a row before giving up (0: no limit) |
@@ -68,10 +68,18 @@ http.every(30000, fn() { for _, o := range room { o.send_text("tick") } })
 http.listen_and_serve("0.0.0.0", 3800)
 ```
 
-`accept_with(req, res, &websocket.Options{protocols: ..., ping_interval_ms: ..., max_message: ...})`:
-`protocols` are the ones the server accepts, in order of preference. With `ping_interval_ms`,
-the server pings quiet clients and closes the ones that do not answer. `on_close` runs once,
-with code 1006 (`ABNORMAL`) when the connection just dropped.
+`accept_with(req, res, &websocket.Options{protocols: ..., ping_interval_ms: ..., max_message: ..., origins: ...})`:
+`protocols` are the ones the server accepts, in order of preference. The server pings clients
+that were quiet for `ping_interval_ms` (default 30 s; -1 turns it off) and closes the ones that do
+not answer. `on_close` runs once, with code 1006 (`ABNORMAL`) when the connection just dropped.
+
+Browsers send cookies with a WebSocket handshake from any site, and CORS does not apply to it.
+So a handshake with an `Origin` header is accepted only when the origin is the request's own host
+(`http://<Host>`), or is listed in `origins` (`"https://app.example.com"`, or `"*"` for any);
+otherwise it gets 403. Handshakes without `Origin` (programs, not browsers) are accepted.
+
+Text messages and close reasons must be valid UTF-8 (the connection closes with 1007), close
+frames need a valid code (1002), and `Sec-WebSocket-Key` must be 16 bytes in base64.
 
 Callbacks run one at a time in the event loop, like HTTP handlers: a slow callback delays every
 connection. With `listen_and_serve_workers`, each process has its own connections (a broadcast

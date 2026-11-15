@@ -41,6 +41,38 @@ notes from the section of its version here (`tools/changelog.sh`).
 - The release workflow no longer expands the tag name inside its shell scripts (a crafted tag
   name could run commands).
 
+### Security
+- `std/http` server: requests are parsed strictly and refused with 400 when a proxy could read
+  them differently (request smuggling): Content-Length with Transfer-Encoding, conflicting
+  Content-Lengths, a space before ":", bare CR or LF, folded lines, control bytes, a Content-Length
+  that is not only digits, method names that are not tokens; other versions than HTTP/1.0 and 1.1
+  get 505. Repeated headers are joined (`Cookie` with "; ") instead of the last one winning.
+- `std/http` server: the body buffer grows as bytes arrive instead of reserving what
+  Content-Length announces (a few hundred connections announcing 16 MB each could exhaust the
+  memory). New limits: `set_max_connections` (10000), `set_max_buffered` (1 GiB for every input
+  buffer together; 503 beyond), `set_request_timeout` (30 s for a whole request, against clients
+  that send a byte now and then), `set_max_body` (16 MiB), `set_max_stream_backlog` (16 MiB
+  queued for a stream that does not read).
+- `std/http` server: header values have CR, LF and NUL turned into spaces and invalid header
+  names are dropped (a value taken from the request could add headers or a body: response
+  splitting). A handler that panics gets a 500 response and a line on the standard error instead
+  of ending the server. Paths with `//`, `.` or `..` segments are redirected (301) to the clean
+  path before routing.
+- `std/http` client: a redirect to another host or port drops `Authorization`, `Cookie`,
+  `Proxy-Authorization` and `Host`; a redirect that becomes a GET drops `Content-Type`. URLs,
+  methods and headers with CR, LF, spaces or control bytes are refused. Responses are limited to
+  `set_max_response_size` (64 MiB), 200 header lines and 10 informational responses, and bodies
+  are gathered without copying everything received at each read.
+- `std/websocket` server: a browser handshake is accepted only from the request's own origin, or
+  from `Options.origins` (`"*"` for any), against cross-site WebSocket hijacking; 403 otherwise.
+  `Sec-WebSocket-Key` must be 16 bytes in base64. Server connections ping quiet clients every
+  30 s by default (`ping_interval_ms: -1` turns it off). Large frames arriving in many pieces are
+  joined once.
+- `std/websocket`: text messages and close reasons must be UTF-8 (1007 otherwise), close frames
+  need a valid code (1002 otherwise), the client checks `Connection: Upgrade` in the answer and
+  refuses headers and URLs with CR or LF, and masking keys come from the kernel's secure generator.
+- `std/strings`: `valid_utf8`.
+
 ## [0.6.0] - 2026-11-14
 
 ### Added

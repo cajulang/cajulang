@@ -17,11 +17,16 @@
 # Server, inside std/http's event loop (and so inside github.com/cajulang/web):
 #
 #   http.handle("/live", fn(req: *http.Request, res: *http.Response) {
-#     ws, err := websocket.accept(req, res)          # answers 101, or 400/426 with err
+#     ws, err := websocket.accept(req, res)          # answers 101, or 400/403/426 with err
 #     if err != nil { return }
 #     ws.on_message(fn(c: *websocket.Conn, m: *websocket.Message) { c.send_text("echo " + m.text()) })
 #     ws.on_close(fn(c: *websocket.Conn, code: int, reason: str) { ... })
 #   })
+#
+# A server accepts browsers only from its own origin (the Origin header must have the request's
+# Host): otherwise any web page could open the socket with the visitor's cookies. Other origins go
+# in Options.origins ("https://app.example.com", or "*" for any). Server connections ping quiet
+# clients every 30 s by default and close those that do not answer.
 #
 # Plain ws:// only: wss:// needs TLS, which Caju does not have yet.
 
@@ -81,11 +86,12 @@ export struct Options {
   headers: map[str]str     # extra headers of the handshake (client)
   protocols: []str         # client: the subprotocols offered; server: the ones accepted, in order of preference
   timeout_ms: int          # client: connect, handshake and each write (0: 30 s)
-  ping_interval_ms: int    # send a ping when nothing arrived for this long; no pong by the next one ends the connection (0: off)
+  ping_interval_ms: int    # send a ping when nothing arrived for this long; no pong by the next one ends the connection (0: off on clients, 30 s on servers; -1: off)
   reconnect: bool          # client: when the connection drops, dial again (with backoff) inside read and send
   reconnect_max_ms: int    # the longest wait between attempts (0: 30 s)
   max_retries: int         # attempts in a row before giving up (0: no limit)
   max_message: int         # the largest message accepted (0: 16 MB); larger ones close with 1009
+  origins: []str           # server: the browser origins accepted besides the request's own host ("*": any)
 }
 
 export struct Conn {
@@ -115,6 +121,9 @@ export struct Conn {
   on_message_fn: fn(*Conn, *Message)
   on_close_fn: fn(*Conn, int, str)
   ping_sent: int
+  chunks: []str            # bytes received and not parsed yet
+  in_len: int              # their total length
+  in_need: int             # the length the next frame needs (0: unknown)
 }
 
 fn noop_message(c: *Conn, m: *Message) {}
@@ -126,31 +135,32 @@ fn now_ms() -> int { return os.nanotime() / 1000000 }
 fn defaults(o: *Options) -> *Options {
   if o == nil { o = &Options{} }
   r := &Options{headers: o.headers, protocols: o.protocols, timeout_ms: o.timeout_ms, ping_interval_ms: o.ping_interval_ms,
-    reconnect: o.reconnect, reconnect_max_ms: o.reconnect_max_ms, max_retries: o.max_retries, max_message: o.max_message}
+    reconnect: o.reconnect, reconnect_max_ms: o.reconnect_max_ms, max_retries: o.max_retries, max_message: o.max_message, origins: o.origins}
   if r.timeout_ms <= 0 { r.timeout_ms = 30000 }
   if r.reconnect_max_ms <= 0 { r.reconnect_max_ms = 30000 }
   if r.max_message <= 0 { r.max_message = 16 << 20 }
   if r.headers == nil { r.headers = map[str]str{} }
   if r.protocols == nil { r.protocols = []str{} }
+  if r.origins == nil { r.origins = []str{} }
   return r
 }
 
 # ---------------------------------------------------------------- frames
 
-let rng: int = 0
+# masking keys come from the kernel's secure generator (RFC 6455 wants them unpredictable),
+# fetched 1 KB at a time
+let mask_pool: str = ""
+let mask_pos: int = 0
 fn mask_key() -> str {
-  if rng == 0 {
-    seed, err := crypto.random_bytes(8)
-    rng = os.nanotime() | 1
-    if err == nil { for i := 0; i < 8; i++ { rng = (rng << 8) ^ int(seed[i]) ^ (rng >> 56) } }
-    if rng == 0 { rng = 88172645463325252 }
+  if mask_pos + 4 > len(mask_pool) {
+    r, err := crypto.random_bytes(1024)
+    if err != nil { panic("websocket: no secure random bytes for the mask: " + err.Error()) }
+    mask_pool = r
+    mask_pos = 0
   }
-  rng = rng ^ (rng << 13)
-  rng = rng ^ (rng >> 7)
-  rng = rng ^ (rng << 17)
-  b := strings.Builder{}
-  for i := 0; i < 4; i++ { b.write_byte((rng >> (8 * i)) & 255) }
-  return b.string()
+  k := mask_pool[mask_pos:mask_pos + 4]
+  mask_pos += 4
+  return k
 }
 
 # one frame: FIN set, the opcode, the payload (masked when mask)
@@ -187,6 +197,28 @@ export fn frame(op: int, payload: str, mask: bool) -> str {
     b.write_byte(int(payload[i]) ^ k)
   }
   return b.string()
+}
+
+# how many bytes the frame at the start of s takes, as far as its header tells (at least
+# len(s) + 1 while the header itself is incomplete); 0 when the header is already invalid
+fn frame_need(s: str, max: int) -> int {
+  if len(s) < 2 { return 2 }
+  b1 := int(s[1])
+  n := b1 & 127
+  p := 2
+  if n == 126 {
+    if len(s) < 4 { return 4 }
+    n = (int(s[2]) << 8) | int(s[3])
+    p = 4
+  } else if n == 127 {
+    if len(s) < 10 { return 10 }
+    n = 0
+    for i := 2; i < 10; i++ { n = (n << 8) | int(s[i]) }
+    p = 10
+  }
+  if n < 0 || n > max { return 0 }
+  if (b1 & 128) != 0 { p += 4 }
+  return p + n
 }
 
 # a frame at the start of s: (fin, opcode, payload, bytes used); used 0 when s does not hold a
@@ -247,9 +279,25 @@ fn close_payload(code: int, reason: str) -> str {
   return strings.from_byte(code >> 8) + strings.from_byte(code & 255) + reason
 }
 
+# the code and reason of a close frame; code -1 when it is malformed (a 1-byte payload, a code no
+# one may send, a reason that is not UTF-8)
 fn parse_close(payload: str) -> (int, str) {
-  if len(payload) < 2 { return NO_STATUS, "" }
-  return (int(payload[0]) << 8) | int(payload[1]), payload[2:len(payload)]
+  if len(payload) == 0 { return NO_STATUS, "" }
+  if len(payload) == 1 { return -1, "" }
+  code := (int(payload[0]) << 8) | int(payload[1])
+  reason := payload[2:len(payload)]
+  ok := (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999)
+  if !ok || !strings.valid_utf8(reason) { return -1, "" }
+  return code, reason
+}
+
+# is s fit for a request line or header (no CR, LF, NUL)?
+fn clean_header(s: str) -> bool {
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c == 13 || c == 10 || c == 0 { return false }
+  }
+  return true
 }
 
 # Sec-WebSocket-Accept for a key
@@ -404,6 +452,16 @@ fn header_has(headers: map[str]str, name: str) -> bool {
 fn (c: *Conn) connect() -> error {
   host, port, target, err := split_ws_url(c.url)
   if err != nil { return err }
+  for i := 0; i < len(c.url); i++ {
+    ch := int(c.url[i])
+    if ch <= 32 || ch == 127 { return errors.New("websocket: invalid character in URL " + strconv.quote(c.url)) }
+  }
+  for k, v := range c.opts.headers {
+    if k == "" || !clean_header(k) || strings.contains(k, ":") || strings.contains(k, " ") || !clean_header(v) { return errors.New("websocket: invalid handshake header " + strconv.quote(k)) }
+  }
+  for _, pr := range c.opts.protocols {
+    if !clean_header(pr) { return errors.New("websocket: invalid subprotocol " + strconv.quote(pr)) }
+  }
   sock, derr := net.dial_timeout(host, port, c.opts.timeout_ms)
   if derr != nil { return errors.New("websocket: " + derr.Error()) }
   sock.set_nodelay()
@@ -453,7 +511,7 @@ fn (c: *Conn) connect() -> error {
     colon := strings.index(l, ":")
     if colon > 0 { hs[strings.to_lower(strings.trim_space(l[0:colon]))] = strings.trim_space(l[colon + 1:len(l)]) }
   }
-  if strings.to_lower(hs["upgrade"]) != "websocket" || hs["sec-websocket-accept"] != accept_key(key) {
+  if strings.to_lower(hs["upgrade"]) != "websocket" || !strings.contains(strings.to_lower(hs["connection"]), "upgrade") || hs["sec-websocket-accept"] != accept_key(key) {
     sock.close()
     return errors.New("websocket: handshake: invalid Upgrade or Sec-WebSocket-Accept")
   }
@@ -596,6 +654,10 @@ fn (c: *Conn) on_frame(fin: bool, op: int, payload: str) -> (*Message, bool, err
     return nil, false, nil
   case OP_CLOSE:
     code, reason := parse_close(payload)
+    if code < 0 {
+      c.close(PROTOCOL_ERROR, "")
+      return nil, false, &CloseError{code: PROTOCOL_ERROR, reason: "invalid close frame from the server"}
+    }
     c.sock.write(frame(OP_CLOSE, close_payload(code, ""), true))
     c.drop()
     c.close_code = code
@@ -624,7 +686,10 @@ struct Assembler {
 fn (a: *Assembler) add(fin: bool, op: int, payload: str, max: int) -> (*Message, bool, int) {
   if op == TEXT || op == BINARY {
     if a.kind != 0 { return nil, false, PROTOCOL_ERROR }        # a new message inside a fragmented one
-    if fin { return &Message{kind: op, data: payload}, true, 0 }
+    if fin {
+      if op == TEXT && !strings.valid_utf8(payload) { return nil, false, INVALID_DATA }
+      return &Message{kind: op, data: payload}, true, 0
+    }
     a.kind = op
     a.buf.reset()
     a.buf.write(payload)
@@ -638,6 +703,7 @@ fn (a: *Assembler) add(fin: bool, op: int, payload: str, max: int) -> (*Message,
     m := &Message{kind: a.kind, data: a.buf.string()}
     a.kind = 0
     a.buf.reset()
+    if m.kind == TEXT && !strings.valid_utf8(m.data) { return nil, false, INVALID_DATA }
     return m, true, 0
   }
   return nil, false, PROTOCOL_ERROR
@@ -664,6 +730,18 @@ export fn accept_with(req: *http.Request, res: *http.Response, o: *Options) -> (
     res.set_header("Sec-WebSocket-Version", "13")
     return nil, errors.New("websocket: unsupported version " + req.header("sec-websocket-version"))
   }
+  raw, kerr := base64.decode(key)
+  if kerr != nil || len(raw) != 16 {
+    res.set_status(400)
+    res.write("invalid Sec-WebSocket-Key\n")
+    return nil, errors.New("websocket: invalid Sec-WebSocket-Key")
+  }
+  origin := req.header("origin")
+  if origin != "" && !origin_allowed(origin, req.header("host"), opts.origins) {
+    res.set_status(403)
+    res.write("origin not allowed\n")
+    return nil, errors.New("websocket: origin not allowed: " + origin)
+  }
   next_id++
   c := &Conn{id: next_id, server: true, asm: &Assembler{}, early: []str{}, opts: opts, url: req.path, remote_addr: req.remote_addr, on_open_fn: noop_open, on_message_fn: noop_message, on_close_fn: noop_close}
   offered := req.header("sec-websocket-protocol")
@@ -682,8 +760,20 @@ export fn accept_with(req: *http.Request, res: *http.Response, o: *Options) -> (
   res.set_header("Sec-WebSocket-Accept", accept_key(key))
   if c.protocol != "" { res.set_header("Sec-WebSocket-Protocol", c.protocol) }
   res.upgrade(c)
+  if opts.ping_interval_ms == 0 { opts.ping_interval_ms = 30000 }
   if opts.ping_interval_ms > 0 { watch(c) }
   return c, nil
+}
+
+# may a browser page at origin open a socket on host? Its own host always; others when listed
+fn origin_allowed(origin: str, host: str, allowed: []str) -> bool {
+  o := strings.to_lower(strings.trim_suffix(origin, "/"))
+  i := strings.index(o, "://")
+  if i >= 0 && host != "" && o[i + 3:len(o)] == strings.to_lower(host) { return true }
+  for _, a := range allowed {
+    if a == "*" || o == strings.to_lower(strings.trim_suffix(a, "/")) { return true }
+  }
+  return false
 }
 
 export fn (c: *Conn) on_message(f: fn(*Conn, *Message)) { c.on_message_fn = f }
@@ -704,10 +794,24 @@ export fn (c: *Conn) stream_data(s: *http.Stream, data: str) {
   if c.closed { return }
   c.ping_sent = 0
   c.last_in = now_ms()
-  if c.inbuf == "" { c.inbuf = data } else { c.inbuf = c.inbuf + data }
+  # a large frame arrives in many pieces: they are kept apart and joined once the frame is whole
+  # (joining at every piece would copy everything received so far each time)
+  c.chunks = append(c.chunks, data)
+  c.in_len += len(data)
+  if c.in_need > 0 && c.in_len < c.in_need { return }
+  if len(c.chunks) == 1 && c.inbuf == "" { c.inbuf = c.chunks[0] } else { c.inbuf = c.inbuf + strings.join(c.chunks, "") }
+  c.chunks = []str{}
+  c.in_len = 0
+  c.in_need = 0
   while !c.closed {
     fin, op, payload, used := parse_frame(c.inbuf, true, c.opts.max_message)
-    if used == 0 { return }
+    if used == 0 {
+      c.in_need = frame_need(c.inbuf, c.opts.max_message)
+      c.in_len = len(c.inbuf)
+      c.chunks = []str{c.inbuf}
+      c.inbuf = ""
+      return
+    }
     if used < 0 {
       code := PROTOCOL_ERROR
       if used == -2 { code = TOO_BIG }
@@ -723,6 +827,10 @@ export fn (c: *Conn) stream_data(s: *http.Stream, data: str) {
       continue
     case OP_CLOSE:
       code, reason := parse_close(payload)
+      if code < 0 {
+        c.close(PROTOCOL_ERROR, "")
+        return
+      }
       s.write(frame(OP_CLOSE, close_payload(code, ""), false))
       c.close_code = code
       c.close_reason = reason
