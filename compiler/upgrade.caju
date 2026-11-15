@@ -35,13 +35,16 @@ const DAY = 86400
 
 # the public keys (hex) whose signatures releases may carry; the private key of each lives only in
 # the secret CAJU_RELEASE_KEY of github.com/cajulang/cajulang (docs/releasing.md)
-let RELEASE_KEYS = []str{}
+let RELEASE_KEYS = []str{"84c9600cb86ae42bc76633f6666e59bc28edb297d6f3d5bf3cbb16378d1dc993"}   # created 2026-11-15
 
 # ---------------------------------------------------------------- where releases come from
 
 # CAJU_UPGRADE_SOURCE: a directory with v<version>/<files> in place of the GitHub releases (a
 # mirror, or the tests). With it, CAJU_UPGRADE_KEY adds a trusted public key (hex).
 fn source() -> str { return os.getenv("CAJU_UPGRADE_SOURCE") }
+
+# the release keys built into this caju (hex)
+export fn release_keys() -> []str { return RELEASE_KEYS }
 
 fn trusted_keys() -> []str {
   out := []str{}

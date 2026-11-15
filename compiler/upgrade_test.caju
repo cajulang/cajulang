@@ -58,6 +58,21 @@ describe("signed manifests", fn() {
   })
 })
 
+describe("the release keys", fn() {
+  it("are valid Ed25519 public keys, the same in caju and in install.sh", fn() {
+    keys := upgrade.release_keys()
+    expect(len(keys)).to_be_at_least(1)
+    script, err := os.read_file(os.getenv("CAJU_ROOT") + "/install.sh")
+    expect(err).to_be_nil()
+    for _, k := range keys {
+      b, err2 := hex.decode(k)
+      expect(err2).to_be_nil()
+      expect(len(b)).to_equal(32)
+      expect(script).to_contain("release_keys=\"" + k)
+    }
+  })
+})
+
 # ---------------------------------------------------------------- the whole workflow
 
 let W: str = ""        # src/ (good releases), bad/ (broken ones), home/ (CAJU_HOME), bin/, proj/

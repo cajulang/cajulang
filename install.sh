@@ -26,7 +26,7 @@ bin_dir="${CAJU_BIN_DIR:-$HOME/.local/bin}"
 asset="caju-linux-x86_64.tar.gz"
 # the public release keys (hex), the same as RELEASE_KEYS in compiler/upgrade.caju; another key
 # may be trusted for a local package (CAJU_PACKAGE) only
-release_keys=""
+release_keys="84c9600cb86ae42bc76633f6666e59bc28edb297d6f3d5bf3cbb16378d1dc993"
 if [ -n "${CAJU_PACKAGE:-}" ] && [ -n "${CAJU_RELEASE_PUBKEY:-}" ]; then
   release_keys="$release_keys $CAJU_RELEASE_PUBKEY"
 fi
