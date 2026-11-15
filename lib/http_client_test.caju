@@ -6,7 +6,9 @@ import "std/os"
 import "std/strings"
 import { describe, it, expect } from "std/testing"
 
-let next_port: int = 20000 + os.getpid() % 10000
+# below 32768, where Linux takes the local ports of outgoing connections: a test that dials a
+# port no server holds yet could otherwise connect to itself and think the server is up
+let next_port: int = 10000 + os.getpid() % 5000      # 10000-15099: apart from the other test files
 let pids = []str{}
 
 fn tmp() -> str {
@@ -144,6 +146,39 @@ describe("http client", fn() {
     stop_all()
     expect(err).to_be_error("http: 127.0.0.1:" + base[len(base) - 5:len(base)] + ": read: timed out")
     expect(ms).to_be_less_than(1500)
+  })
+  it("keeps credentials on a redirect to the same host, and drops them for another host", fn() {
+    base := start("http_server")
+    hs := map[str]str{"Authorization": "Bearer SECRET", "Cookie": "sid=SECRET"}
+    same, err := http.request(&http.ClientRequest{url: base + "/same", headers: hs})
+    other, err2 := http.request(&http.ClientRequest{url: base + "/cross", headers: hs})
+    stop_all()
+    expect(err).to_be_nil()
+    expect(same.header("x-got")).to_start_with("Bearer SECRET|")
+    expect(err2).to_be_nil()
+    expect(other.url).to_start_with("http://localhost:")
+    expect(other.header("x-got")).to_start_with("|caju-http/1|")
+  })
+  it("refuses CR, LF and spaces in the URL, method and headers", fn() {
+    _, e1 := http.get("http://127.0.0.1:1/x HTTP/1.1\r\nX-Injected: yes")
+    _, e2 := http.request(&http.ClientRequest{url: "http://127.0.0.1:1/", headers: map[str]str{"X-A": "v\r\nX-Injected: yes"}})
+    _, e3 := http.request(&http.ClientRequest{url: "http://127.0.0.1:1/", headers: map[str]str{"X A": "v"}})
+    _, e4 := http.request(&http.ClientRequest{method: "GET /x", url: "http://127.0.0.1:1/"})
+    expect(e1.Error()).to_start_with("http: invalid character in URL")
+    expect(e2.Error()).to_equal("http: invalid value for header X-A (CR, LF or NUL)")
+    expect(e3.Error()).to_equal("http: invalid header name \"X A\"")
+    expect(e4.Error()).to_equal("http: invalid method \"GET /X\"")
+  })
+  it("refuses responses larger than set_max_response_size", fn() {
+    base := start("http_server")
+    http.set_max_response_size(5000)
+    _, err := http.get(base + "/big")
+    http.set_max_response_size(64 << 20)
+    r, err2 := http.get(base + "/big")
+    stop_all()
+    expect(err.Error()).to_contain("the response is larger than 5000 bytes")
+    expect(err2).to_be_nil()
+    expect(len(r.body)).to_equal(10000)
   })
   it("refuses https and malformed URLs, and reports refused connections", fn() {
     _, a := http.get("https://example.com/")

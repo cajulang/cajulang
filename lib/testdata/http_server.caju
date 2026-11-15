@@ -1,4 +1,5 @@
-# The server the tests of std/http talk to: PORT, IDLE_MS (idle timeout), WORKERS.
+# The server the tests of std/http talk to: PORT, IDLE_MS (idle timeout), WORKERS, REQ_MS
+# (request timeout), MAX_CONNS, MAX_BUFFERED.
 import "std/http"
 import "std/os"
 import "std/strconv"
@@ -39,7 +40,34 @@ http.handle("/missing", fn(req: *http.Request, res: *http.Response) {
   res.set_status(404)
   res.write("nope")
 })
+http.handle("/panic", fn(req: *http.Request, res: *http.Response) {
+  res.write("half")
+  xs := []int{}
+  res.write(str(xs[len(req.query) + 3]))
+})
+http.handle("/inject", fn(req: *http.Request, res: *http.Response) {
+  res.set_header("X-Echo", http.query_unescape(req.query))
+  res.set_header("Bad Name", "x")
+  res.write("ok")
+})
+http.handle("/cross", fn(req: *http.Request, res: *http.Response) {
+  res.set_status(302)
+  res.set_header("Location", "http://localhost:" + os.getenv("PORT") + "/headers")
+})
+http.handle("/same", fn(req: *http.Request, res: *http.Response) {
+  res.set_status(307)
+  res.set_header("Location", "/headers")
+})
+http.handle("/big", fn(req: *http.Request, res: *http.Response) {
+  for i := 0; i < 1000; i++ { res.write("0123456789") }
+})
 port, _ := strconv.atoi(os.getenv("PORT"))
+req_ms, _ := strconv.atoi(os.getenv("REQ_MS"))
+if req_ms > 0 { http.set_request_timeout(req_ms) }
+max_conns, _ := strconv.atoi(os.getenv("MAX_CONNS"))
+if max_conns > 0 { http.set_max_connections(max_conns) }
+max_buf, _ := strconv.atoi(os.getenv("MAX_BUFFERED"))
+if max_buf > 0 { http.set_max_buffered(max_buf) }
 idle, _ := strconv.atoi(os.getenv("IDLE_MS"))
 if idle > 0 { http.set_idle_timeout(idle) }
 workers, _ := strconv.atoi(os.getenv("WORKERS"))

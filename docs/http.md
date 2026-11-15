@@ -18,6 +18,30 @@ A path ending in `/` also handles everything below it. The server runs an event 
 keep-alive and pipelining; handlers run one at a time. For routes with parameters, middlewares
 and JSON, use [`github.com/cajulang/web`](https://github.com/cajulang/web).
 
+### Limits and safety
+
+| setting | default | |
+|---|---|---|
+| `set_idle_timeout(ms)` | 5 s | a kept-alive connection without traffic is closed |
+| `set_request_timeout(ms)` | 30 s | a request must arrive whole within this, from its first byte |
+| `set_max_body(n)` | 16 MiB | larger bodies get 413 |
+| `set_max_connections(n)` | 10000 | more connections are closed as they arrive |
+| `set_max_buffered(n)` | 1 GiB | input buffered by every connection together; beyond it, 503 |
+| `set_max_requests(n)` | 10000 | requests per connection |
+| `set_max_stream_backlog(n)` | 16 MiB | output queued for an upgraded stream (WebSocket) that stopped reading; beyond it, the stream is dropped |
+
+- Requests are parsed strictly: anything a proxy in front could read differently (both
+  Content-Length and Transfer-Encoding, conflicting lengths, bare CR or LF, folded or malformed
+  headers, control bytes in the target) gets 400 and the connection is closed. Repeated headers
+  are joined with `", "` (`Cookie` with `"; "`).
+- The body buffer grows as its bytes arrive, never by what Content-Length announces.
+- `res.set_header` values with CR, LF or NUL are sent with spaces in their place, and names that
+  are not tokens are left out, so a value taken from the request cannot add headers.
+- A handler that panics gets a 500 response (and a line on the standard error); the server goes on.
+- Paths with `//`, `.` or `..` segments are redirected (301) to the clean path before routing, so
+  `/public/../admin` never reaches the handler of `/public/`. The path is not percent-decoded:
+  a handler that decodes it (`%2e%2e`) must check the result itself.
+
 ## Client
 
 ```caju
@@ -52,7 +76,7 @@ r4, err4 := http.request(&http.ClientRequest{
 | `headers` | sent as written; `Host`, `User-Agent` and `Content-Length` are added when missing |
 | `body` | |
 | `timeout_ms` | how long each connect, write and read may wait; 0 is the default (`http.set_client_timeout`, 30 s) |
-| `no_redirects` | give 3xx responses back instead of following them |
+| `no_redirects` | give 3xx responses back instead of following them (do this when the URL comes from a user: a redirect can point inside your network) |
 
 `ClientResponse`: `status`, `status_text`, `headers` (names in lower case, repeated headers joined
 with `", "`), `body`, `url` (the URL that answered, after redirects); `header(name)` in any case,
@@ -80,3 +104,11 @@ and the whole body is read into memory.
 - `http.query_unescape(s)`: the reverse; `+` becomes a space.
 - `http.encode_form(fields)`: `a=1&b=x%20y`, names in order.
 - `http.parse_form(s)`: the reverse, as a `map[str]str`.
+
+## Client safety
+
+- A redirect to another host or port drops `Authorization`, `Cookie`, `Proxy-Authorization` and
+  `Host`; a 303 (or a 301/302 after a POST) becomes a GET without body or `Content-Type`.
+- URLs, methods and headers with CR, LF, spaces or control bytes are refused with an error.
+- A response may have at most `set_max_response_size(n)` bytes (default 64 MiB), 200 header
+  lines and 10 informational (1xx) responses before the real one.

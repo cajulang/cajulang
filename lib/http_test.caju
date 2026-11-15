@@ -8,7 +8,9 @@ import { describe, it, expect, before_each } from "std/testing"
 let server_pid: str = ""
 let built: bool = false
 let port: int = 0
-let next_port: int = 30000 + os.getpid() % 20000
+# below 32768, where Linux takes the local ports of outgoing connections: a test that dials a
+# port no server holds yet could otherwise connect to itself and think the server is up
+let next_port: int = 16000 + os.getpid() % 5000      # 16000-21099: apart from the other test files
 
 fn bin() -> str {
   tmp := os.getenv("TMPDIR")
@@ -202,6 +204,156 @@ describe("http server", fn() {
     r := read_response(c)
     stop()
     expect(body(r)).to_start_with("127.0.0.1:")
+  })
+  it("refuses requests a proxy could read differently (request smuggling) with 400", fn() {
+    start("")
+    bad := []str{
+      "POST /echo HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+      "POST /echo HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!",
+      "POST /echo HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello",
+      "POST /echo HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello",
+      "POST /echo HTTP/1.1\r\nContent-Length: 1_0\r\n\r\nhello12345",
+      "GET /echo HTTP/1.1\r\nX-A: 1\r\n folded\r\n\r\n",
+      "GET /echo HTTP/1.1\r\nX-A: 1\rX-B: 2\r\n\r\n",
+      "GET /echo HTTP/1.1\r\nX-A: a\x01b\r\n\r\n",
+      "GET /echo HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+      "G(T /echo HTTP/1.1\r\n\r\n",
+      "GET echo HTTP/1.1\r\n\r\n",
+    }
+    got := []str{}
+    for _, b := range bad {
+      c := connect()
+      c.write(b)
+      r := read_response(c)
+      c.close()
+      got = append(got, r[0:strings.index(r, "\r\n")])
+    }
+    c2 := connect()
+    c2.write("GET /echo HTTP/2.0\r\n\r\n")
+    r2 := read_response(c2)
+    c2.close()
+    stop()
+    for _, g := range got { expect(g).to_equal("HTTP/1.1 400 Bad Request") }
+    expect(r2).to_start_with("HTTP/1.1 505 ")
+  })
+  it("still accepts the same Content-Length twice and joins repeated headers", fn() {
+    start("")
+    c := connect()
+    c.write("POST /echo HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nhi")
+    r := read_response(c)
+    c.write("GET /hdr HTTP/1.1\r\nX-Custom: a\r\nX-Custom: b\r\nHost: h\r\n\r\n")
+    r2 := read_response(c)
+    stop()
+    expect(body(r)).to_equal("hi")
+    expect(body(r2)).to_equal("a, b|a, b|h")
+  })
+  it("never lets a header value add headers (CR/LF become spaces) and drops invalid names", fn() {
+    start("")
+    c := connect()
+    c.write("GET /inject?a%0d%0aSet-Cookie:%20sid=evil%0d%0a%0d%0a<script> HTTP/1.1\r\n\r\n")
+    r := read_response(c)
+    stop()
+    expect(r).to_contain("\r\nX-Echo: a  Set-Cookie: sid=evil    <script>\r\n")
+    expect(r).not_().to_contain("\r\nSet-Cookie")
+    expect(r).not_().to_contain("Bad Name")
+    expect(body(r)).to_equal("ok")
+  })
+  it("answers 500 when a handler panics, and keeps serving", fn() {
+    start("")
+    c := connect()
+    c.write("GET /panic HTTP/1.1\r\n\r\n")
+    r := read_response(c)
+    c.write("GET /echo HTTP/1.1\r\nContent-Length: 2\r\n\r\nok")
+    r2 := read_response(c)
+    stop()
+    expect(r).to_start_with("HTTP/1.1 500 Internal Server Error\r\n")
+    expect(body(r)).to_equal("500 internal server error\n")
+    expect(body(r2)).to_equal("ok")
+  })
+  it("redirects paths with //, . or .. to the clean path", fn() {
+    start("")
+    c := connect()
+    c.write("GET /api/../echo?x=1 HTTP/1.1\r\n\r\n")
+    r := read_response(c)
+    c.write("GET //evil.com/ HTTP/1.1\r\n\r\n")
+    r2 := read_response(c)
+    c.write("GET /files/./a HTTP/1.1\r\n\r\n")
+    r3 := read_response(c)
+    stop()
+    expect(r).to_start_with("HTTP/1.1 301 ")
+    expect(r).to_contain("\r\nLocation: /echo?x=1\r\n")
+    expect(r2).to_contain("\r\nLocation: /evil.com/\r\n")
+    expect(r3).to_contain("\r\nLocation: /files/a\r\n")
+  })
+  it("does not reserve memory for a body that only was announced", fn() {
+    start("")
+    conns := []*net.Conn{}
+    for i := 0; i < 200; i++ {
+      c := connect()
+      c.write("POST /echo HTTP/1.1\r\nContent-Length: 16000000\r\n\r\nx")
+      conns = append(conns, c)
+    }
+    c2 := connect()
+    c2.write("GET /echo HTTP/1.1\r\nContent-Length: 2\r\n\r\nok")
+    r := read_response(c2)
+    st, _ := os.run([]str{"cat", "/proc/" + server_pid + "/status"}, nil, false)
+    status := st.output
+    rss := 0
+    for _, l := range strings.split(status, "\n") {
+      if strings.has_prefix(l, "VmRSS:") { rss, _ = strconv.atoi(strings.trim_space(strings.trim_suffix(strings.trim_space(l[6:]), "kB"))) }
+    }
+    for _, c := range conns { c.close() }
+    stop()
+    expect(body(r)).to_equal("ok")
+    expect(rss > 0).to_be_true()
+    expect(rss < 200000).to_be_true()          # KB: far from 200 × 16 MB
+  })
+  it("answers 503 when every connection together holds max_buffered", fn() {
+    start("MAX_BUFFERED=100000")
+    c := connect()
+    c.write("POST /echo HTTP/1.1\r\nContent-Length: 300000\r\n\r\n" + strings.repeat("a", 200000))
+    r := read_response(c)
+    c2 := connect()
+    c2.write("GET /echo HTTP/1.1\r\nContent-Length: 2\r\n\r\nok")
+    r2 := read_response(c2)
+    stop()
+    # the 503 may be lost: the server closes while the client still sends, and the reset can
+    # discard the response before it is read
+    if r != "" { expect(r).to_start_with("HTTP/1.1 503 ") }
+    expect(body(r2)).to_equal("ok")
+  })
+  it("closes a request that drips in slower than the request timeout", fn() {
+    start("REQ_MS=600 IDLE_MS=5000")
+    c := connect()
+    t0 := os.nanotime()
+    closed := false
+    for i := 0; i < 20; i++ {
+      err := c.write("X")
+      if err != nil { closed = true }
+      if c.readable() {
+        chunk, _ := c.read(100)
+        if chunk == "" { closed = true }
+      }
+      if closed { break }
+      until := os.nanotime() + 200000000      # sleep() is skipped under caju test
+      while os.nanotime() < until {}
+    }
+    ms := (os.nanotime() - t0) / 1000000
+    stop()
+    expect(closed).to_be_true()
+    expect(ms < 3000).to_be_true()
+  })
+  it("closes connections beyond max_connections right away", fn() {
+    start("MAX_CONNS=3")
+    a := connect()
+    b := connect()
+    d := connect()
+    a.write("GET /echo HTTP/1.1\r\n\r\n")
+    read_response(a)
+    e := connect()
+    chunk, _ := e.read(100)
+    stop()
+    expect(chunk).to_equal("")
   })
   it("spreads the connections over worker processes", fn() {
     start("WORKERS=3")

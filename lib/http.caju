@@ -18,6 +18,7 @@ import "std/net"
 import "std/strings"
 import "std/strconv"
 import "std/os"
+import urlpath "std/path"
 
 export struct Request {
   method: str
@@ -70,10 +71,22 @@ let pending_peers = []*Peer{}       # peers with output queued outside their own
 # the connection becomes a stream of h after this response (send status 101 and the protocol's headers)
 export fn (r: *Response) upgrade(h: StreamHandler) { r.upgrade_to = h }
 
+let max_stream_out: int = 16 << 20
+
+# how much a stream may have queued and not yet sent before it is dropped (default 16 MiB): a
+# client that stops reading cannot make broadcasts pile up in memory
+export fn set_max_stream_backlog(n: int) { max_stream_out = n }
+
 # queues data to send on the stream
 export fn (s: *Stream) write(data: str) {
   if s.closed || s.peer == nil || s.peer.closing { return }
   cl := s.peer
+  if max_stream_out > 0 && cl.out_n - cl.out_off + len(data) > max_stream_out {
+    cl.closing = true
+    cl.dead = true
+    pending_peers = append(pending_peers, cl)
+    return
+  }
   if cl.out_n == 0 { pending_peers = append(pending_peers, cl) }
   cl.put(data)
 }
@@ -147,11 +160,26 @@ export fn handle(path: str, h: fn(*Request, *Response)) {
 
 let idle_timeout_ms: int = 5000
 let max_requests: int = 10000
+let request_timeout_ms: int = 30000
+let max_body: int = 16777216
+let max_connections: int = 10000
+let max_buffered: int = 1 << 30
+let buffered: int = 0               # bytes of input buffers beyond their starting size, all connections
 
 # how long a kept-alive connection may stay without traffic before the server closes it
 export fn set_idle_timeout(ms: int) { idle_timeout_ms = ms }
 # how many requests one connection may make before the server closes it (0: no limit)
 export fn set_max_requests(n: int) { max_requests = n }
+# how long a request may take to arrive whole, from its first byte (0: no limit): a client that
+# sends a byte now and then is closed after it
+export fn set_request_timeout(ms: int) { request_timeout_ms = ms }
+# the largest request body accepted (413 above it; default 16 MiB)
+export fn set_max_body(n: int) { max_body = n }
+# how many connections are served at once; more are closed as soon as they arrive (default 10000)
+export fn set_max_connections(n: int) { max_connections = n }
+# how much memory the input buffers of all connections may take together (default 1 GiB); a
+# request that would go beyond gets 503
+export fn set_max_buffered(n: int) { max_buffered = n }
 
 export fn status_text(code: int) -> str {
   switch code {
@@ -199,7 +227,6 @@ fn find_route(path: str) -> (fn(*Request, *Response), bool) {
 }
 
 const MAX_HEADER = 65536
-const MAX_BODY = 16777216
 
 # ---------------------------------------------------------------- bytes in memory
 
@@ -289,6 +316,50 @@ fn has_token(v: str, t: str) -> bool {
   return false
 }
 
+# a token character of RFC 9110 (method and header names): letters, digits and !#$%&'*+-.^_`|~
+fn is_tchar(c: int) -> bool {
+  if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) { return true }
+  return c == 33 || (c >= 35 && c <= 39) || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126
+}
+
+fn mem_token(p: int, n: int) -> bool {
+  if n == 0 { return false }
+  for i := 0; i < n; i++ { if !is_tchar(__load8(p + i)) { return false } }
+  return true
+}
+
+# is s a valid header (or method) name?
+fn valid_name(s: str) -> bool { return mem_token(__strp(s) + 8, len(s)) }
+
+# a header value as it may be sent: CR, LF and NUL (which would end the header or the response
+# early, letting the value add headers of its own) become spaces
+fn clean_value(v: str) -> str {
+  n := len(v)
+  p := __strp(v) + 8
+  bad := false
+  for i := 0; i < n; i++ {
+    c := __load8(p + i)
+    if c == 13 || c == 10 || c == 0 { bad = true }
+  }
+  if !bad { return v }
+  m := __newstr(n)
+  for i := 0; i < n; i++ {
+    c := __load8(p + i)
+    if c == 13 || c == 10 || c == 0 { c = 32 }
+    __store8(m + 8 + i, c)
+  }
+  return __pstr(m)
+}
+
+# the path with "//", "." and ".." segments resolved (the trailing "/" kept); "" when it needs no change
+fn cleaned_path(p: str) -> str {
+  if !strings.contains(p, "//") && !strings.contains(p, "/.") { return "" }
+  c := urlpath.clean(p)
+  if strings.has_suffix(p, "/") && c != "/" { c = c + "/" }
+  if c == p { return "" }
+  return c
+}
+
 # ---------------------------------------------------------------- connections
 
 # one client connection: what arrived and is not handled yet, and what is still to be sent
@@ -309,6 +380,7 @@ struct Peer {
   dead: bool
   waiting_out: bool
   stream: *Stream # after an upgrade: the bytes go to its handler
+  began: int      # when the first byte of the request being received arrived (ms), or 0
 }
 
 # Buffers start small (they grow when needed) and closed connections give their Peer back for
@@ -331,7 +403,11 @@ fn new_peer(c: *net.Conn) -> *Peer {
 fn release(cl: *Peer) {
   cl.conn.close()
   cl.conn = nil
-  if len(free_peers) >= 1024 { return }
+  buffered -= cl.icap - BUF
+  if len(free_peers) >= 1024 {
+    cl.icap = BUF
+    return
+  }
   if cl.icap != BUF {
     cl.inb = __newstr(BUF) + 8
     cl.icap = BUF
@@ -351,11 +427,13 @@ fn release(cl: *Peer) {
   cl.dead = false
   cl.waiting_out = false
   cl.stream = nil
+  cl.began = 0
   free_peers = append(free_peers, cl)
 }
 
-# room for at least n more bytes of input (moves the unconsumed bytes to the front)
-fn (cl: *Peer) in_room(n: int) {
+# room for at least n more bytes of input (moves the unconsumed bytes to the front); false when
+# growing the buffer would go beyond max_buffered
+fn (cl: *Peer) in_room(n: int) -> bool {
   if cl.start > 0 {
     k := cl.end - cl.start
     if k > 0 { mcopy(cl.inb, cl.inb + cl.start, k) }
@@ -364,13 +442,16 @@ fn (cl: *Peer) in_room(n: int) {
     cl.end = k
     cl.start = 0
   }
-  if cl.icap - cl.end >= n { return }
+  if cl.icap - cl.end >= n { return true }
   c := cl.icap * 2
   while c - cl.end < n { c = c * 2 }
+  if buffered + c - cl.icap > max_buffered { return false }
   m := __newstr(c) + 8
   mcopy(m, cl.inb, cl.end)
+  buffered += c - cl.icap
   cl.inb = m
   cl.icap = c
+  return true
 }
 
 fn (cl: *Peer) out_room(n: int) {
@@ -427,53 +508,94 @@ fn (cl: *Peer) take_request() -> (*Request, int) {
     if cl.end - cl.start > MAX_HEADER { return nil, 431 }
     return nil, 0
   }
-  # request line: METHOD SP target SP version
+  # Parsed strictly: anything a proxy in front could read differently (request smuggling) is
+  # refused with 400 and the connection closed. Request line: METHOD SP target SP version CRLF
   s := cl.start
   le := s
-  while le < head_end && __load8(p + le) != 13 { le++ }
+  while le < head_end && __load8(p + le) != 13 {
+    if __load8(p + le) == 10 { return nil, 400 }   # a bare LF
+    le++
+  }
+  if __load8(p + le + 1) != 10 { return nil, 400 }  # a CR without LF
   sp1 := s
   while sp1 < le && __load8(p + sp1) != 32 { sp1++ }
   sp2 := sp1 + 1
   while sp2 < le && __load8(p + sp2) != 32 { sp2++ }
   if sp1 >= le || sp2 >= le || sp1 == s || sp2 == sp1 + 1 { return nil, 400 }
+  if !mem_token(p + s, sp1 - s) { return nil, 400 }
+  for i := sp1 + 1; i < sp2; i++ {
+    c := __load8(p + i)
+    if c <= 32 || c >= 127 { return nil, 400 }       # control bytes, spaces, non-ASCII
+  }
+  if !mem_is(p + sp2 + 1, le - sp2 - 1, "HTTP/1.1", false) && !mem_is(p + sp2 + 1, le - sp2 - 1, "HTTP/1.0", false) { return nil, 505 }
   req := &Request{method: mem_known(p + s, sp1 - s, KNOWN_METHODS, false), version: mem_known(p + sp2 + 1, le - sp2 - 1, KNOWN_METHODS, false), headers: map[str]str{}, remote_addr: cl.conn.remote_addr}
-  q := sp1 + 1
+  ts := sp1 + 1
+  # absolute form (http://host/path): the server uses only the path
+  if mem_is(p + ts, 7, "http://", true) && sp2 - ts > 7 {
+    a := ts + 7
+    while a < sp2 && __load8(p + a) != 47 && __load8(p + a) != 63 { a++ }
+    ts = a
+  }
+  q := ts
   while q < sp2 && __load8(p + q) != 63 { q++ }
-  req.path = mem_str(p + sp1 + 1, q - sp1 - 1)
+  req.path = mem_str(p + ts, q - ts)
   if q < sp2 { req.query = mem_str(p + q + 1, sp2 - q - 1) }
-  # headers
+  if req.path == "" { req.path = "/" }
+  if __load8(p + ts) != 47 && !(req.path == "*" && req.method == "OPTIONS") { return nil, 400 }
+  # headers: name ":" OWS value OWS CRLF; no folding, no space before ":", no control bytes
   ls := le + 2
   while ls < head_end + 2 {
+    c0 := __load8(p + ls)
+    if c0 == 32 || c0 == 9 { return nil, 400 }     # obsolete line folding
     e := ls
     while e < head_end && __load8(p + e) != 13 { e++ }
+    if __load8(p + e + 1) != 10 { return nil, 400 }
     colon := ls
     while colon < e && __load8(p + colon) != 58 { colon++ }
-    if colon >= e || colon == ls { return nil, 400 }
-    ne := colon
-    while ne > ls && (__load8(p + ne - 1) == 32 || __load8(p + ne - 1) == 9) { ne-- }
+    if colon >= e || !mem_token(p + ls, colon - ls) { return nil, 400 }
     vs := colon + 1
     while vs < e && (__load8(p + vs) == 32 || __load8(p + vs) == 9) { vs++ }
     ve := e
     while ve > vs && (__load8(p + ve - 1) == 32 || __load8(p + ve - 1) == 9) { ve-- }
-    req.headers[mem_known(p + ls, ne - ls, KNOWN_HEADERS, true)] = mem_str(p + vs, ve - vs)
+    for i := vs; i < ve; i++ {
+      c := __load8(p + i)
+      if (c < 32 && c != 9) || c == 127 { return nil, 400 }
+    }
+    name := mem_known(p + ls, colon - ls, KNOWN_HEADERS, true)
+    value := mem_str(p + vs, ve - vs)
+    if prev, seen := req.headers[name]; seen {
+      # one value only for these; the others are joined, as RFC 9110 allows
+      if name == "content-length" || name == "host" || name == "transfer-encoding" {
+        if name != "content-length" || prev != value { return nil, 400 }
+      } else if name == "cookie" {
+        req.headers[name] = prev + "; " + value
+      } else {
+        req.headers[name] = prev + ", " + value
+      }
+    } else {
+      req.headers[name] = value
+    }
     ls = e + 2
   }
   body_start := head_end + 4
   n := 0
+  _, chunked := req.headers["transfer-encoding"]
   if clen, ok := req.headers["content-length"]; ok {
-    v, err := strconv.atoi(clen)
-    if err != nil || v < 0 { return nil, 400 }
-    n = v
-  } else if _, chunked := req.headers["transfer-encoding"]; chunked {
+    if chunked { return nil, 400 }                   # both: the classic smuggling vector
+    if len(clen) == 0 || len(clen) > 18 { return nil, 400 }
+    for i := 0; i < len(clen); i++ {
+      c := int(clen[i])
+      if c < 48 || c > 57 { return nil, 400 }
+      n = n * 10 + c - 48
+    }
+  } else if chunked {
     return nil, 501
   }
-  if n > MAX_BODY { return nil, 413 }
+  if n > max_body { return nil, 413 }
   if cl.end - body_start < n {
-    # the body is still arriving: make room for it and wait
-    need := body_start + n - cl.start
-    keep := head_end - cl.start
-    cl.in_room(need - (cl.end - cl.start))
-    cl.scanned = cl.start + keep
+    # the body is still arriving: the buffer grows as its bytes come (not by what the
+    # Content-Length announces, which costs the client nothing)
+    cl.scanned = head_end
     return nil, 0
   }
   if n > 0 { req.body = mem_str(p + body_start, n) }
@@ -503,12 +625,7 @@ fn (cl: *Peer) put_response(res: *Response, head_only: bool, keep: bool, http10:
   cl.put("\r\n")
   if res.status == 101 {
     # switching protocols: only the handler's headers, no body
-    for k, v := range res.headers {
-      cl.put(k)
-      cl.put(": ")
-      cl.put(v)
-      cl.put("\r\n")
-    }
+    for k, v := range res.headers { cl.put_header(k, v) }
     cl.put("\r\n")
     return
   }
@@ -516,16 +633,59 @@ fn (cl: *Peer) put_response(res: *Response, head_only: bool, keep: bool, http10:
   for k, v := range res.headers {
     if eq_fold(k, "content-length") || eq_fold(k, "connection") { continue }
     if !typed && eq_fold(k, "content-type") { typed = true }
-    cl.put(k)
-    cl.put(": ")
-    cl.put(v)
-    cl.put("\r\n")
+    cl.put_header(k, v)
   }
   if !typed { cl.put("Content-Type: text/plain; charset=utf-8\r\n") }
   cl.put("Content-Length: ")
   cl.put_int(res.body.n)
   if !keep { cl.put("\r\nConnection: close\r\n\r\n") } else if http10 { cl.put("\r\nConnection: keep-alive\r\n\r\n") } else { cl.put("\r\n\r\n") }
   if !head_only && res.body.n > 0 { cl.put_mem(res.body.mem + 8, res.body.n) }
+}
+
+# one header line; a name that is not a token is left out, and CR/LF/NUL in the value become
+# spaces (a value from the request cannot add headers or end the response)
+fn (cl: *Peer) put_header(k: str, v: str) {
+  if !valid_name(k) { return }
+  cl.put(k)
+  cl.put(": ")
+  cl.put(clean_value(v))
+  cl.put("\r\n")
+}
+
+# runs the handler; a panic in it becomes a 500 response (and a line on the standard error)
+# instead of ending the whole server
+fn call_handler(h: fn(*Request, *Response), req: *Request, res: *Response) {
+  defer fn() {
+    r := recover()
+    if r == nil { return }
+    os.eprintln("http: panic serving " + req.method + " " + req.path + ": " + str(r))
+    res.status = 500
+    res.headers = map[str]str{}
+    res.body = strings.Builder{}
+    res.upgrade_to = nil
+    res.write("500 internal server error\n")
+  }()
+  h(req, res)
+}
+
+# the response for a request: a redirect to the cleaned path, the route's handler or 404
+fn respond(req: *Request) -> *Response {
+  res := &Response{status: 200, headers: map[str]str{}}
+  if req.path != "*" {
+    c := cleaned_path(req.path)
+    if c != "" {
+      if req.query != "" { c = c + "?" + req.query }
+      res.status = 301
+      res.set_header("Location", c)
+      return res
+    }
+  }
+  h, ok := find_route(req.path)
+  if !ok {
+    res.status = 404
+    res.write("404 page not found\n")
+  } else { call_handler(h, req, res) }
+  return res
 }
 
 fn error_response(code: int) -> *Response {
@@ -546,14 +706,10 @@ fn (cl: *Peer) handle_input() {
       return
     }
     cl.served++
+    cl.began = 0
     keep := keep_alive(req)
     if max_requests > 0 && cl.served >= max_requests { keep = false }
-    res := &Response{status: 200, headers: map[str]str{}}
-    h, ok := find_route(req.path)
-    if !ok {
-      res.status = 404
-      res.write("404 page not found\n")
-    } else { h(req, res) }
+    res := respond(req)
     if res.status == 101 && res.upgrade_to != nil {
       cl.put_response(res, false, true, false)
       next_stream_id++
@@ -613,7 +769,12 @@ fn (cl: *Peer) on_readable() {
     cl.stream.handler.stream_data(cl.stream, mem_str(cl.inb, r))
     return
   }
-  cl.in_room(4096)
+  if !cl.in_room(4096) {
+    # every connection together holds max_buffered: refuse this request instead of growing
+    cl.put_response(error_response(503), false, false, false)
+    cl.closing = true
+    return
+  }
   r := cl.conn.read_into(cl.inb + cl.end, cl.icap - cl.end)
   if r == -11 { return }
   if r <= 0 {
@@ -685,6 +846,10 @@ fn serve_loop(l: *net.Listener) -> error {
         while true {
           c, _ := l.accept_nb()
           if c == nil { break }
+          if max_connections > 0 && len(clients) >= max_connections {
+            c.close()
+            continue
+          }
           c.set_nodelay()
           nc := new_peer(c)
           nc.last = t
@@ -709,6 +874,10 @@ fn serve_loop(l: *net.Listener) -> error {
       } else {
         cl.on_readable()
       }
+      # the time the request being received began (for request_timeout)
+      if cl.stream == nil && cl.end > cl.start {
+        if cl.began == 0 { cl.began = t }
+      } else { cl.began = 0 }
       settle(p, clients, cl)
     }
     if len(timers) > 0 {
@@ -725,10 +894,17 @@ fn serve_loop(l: *net.Listener) -> error {
       pending_peers = []*Peer{}
       for _, pc := range batch { settle(p, clients, pc) }
     }
-    if idle_timeout_ms > 0 && t - last_sweep >= tick {
+    if (idle_timeout_ms > 0 || request_timeout_ms > 0) && t - last_sweep >= tick {
       last_sweep = t
       idle := []int{}
-      for fd, ic := range clients { if ic.stream == nil && t - ic.last >= idle_timeout_ms { idle = append(idle, fd) } }
+      for fd, ic := range clients {
+        if ic.stream != nil { continue }
+        if idle_timeout_ms > 0 && t - ic.last >= idle_timeout_ms {
+          idle = append(idle, fd)
+        } else if request_timeout_ms > 0 && ic.began > 0 && t - ic.began >= request_timeout_ms {
+          idle = append(idle, fd)
+        }
+      }
       for _, fd := range idle {
         ic := clients[fd]
         p.remove(fd)
@@ -749,19 +925,16 @@ export fn serve_conn(c: *net.Conn) {
       if req == nil {
         cl.put_response(error_response(code), false, false, false)
       } else {
-        res := &Response{status: 200, headers: map[str]str{}}
-        h, ok := find_route(req.path)
-        if !ok {
-          res.status = 404
-          res.write("404 page not found\n")
-        } else { h(req, res) }
-        cl.put_response(res, req.method == "HEAD", false, false)
+        cl.put_response(respond(req), req.method == "HEAD", false, false)
       }
       c.write(mem_str(cl.outb, cl.out_n))
       c.close()
       return
     }
-    cl.in_room(4096)
+    if !cl.in_room(4096) {
+      c.close()
+      return
+    }
     r := c.read_into(cl.inb + cl.end, cl.icap - cl.end)
     if r <= 0 {
       c.close()
@@ -849,6 +1022,8 @@ export fn (r: *ClientResponse) ok() -> bool { return r.status >= 200 && r.status
 
 let client_timeout_ms: int = 30000
 let user_agent: str = "caju-http/1"
+let max_response: int = 64 << 20
+const MAX_RESPONSE_HEADERS = 200
 # idle kept-alive connections by "host:port"
 let idle_conns = map[str][]*net.Conn{}
 const MAX_IDLE_PER_HOST = 8
@@ -857,6 +1032,8 @@ const MAX_IDLE_PER_HOST = 8
 export fn set_client_timeout(ms: int) { client_timeout_ms = ms }
 # the User-Agent sent when a request has none
 export fn set_user_agent(ua: str) { user_agent = ua }
+# the largest response accepted (headers and body; default 64 MiB): a larger one is an error
+export fn set_max_response_size(n: int) { max_response = n }
 # closes the idle kept-alive connections
 export fn close_idle_connections() {
   for _, conns := range idle_conns {
@@ -888,23 +1065,47 @@ export fn request(req: *ClientRequest) -> (*ClientResponse, error) {
   if method == "" { method = "GET" }
   url := req.url
   body := req.body
+  headers := req.headers
   timeout := req.timeout_ms
   if timeout <= 0 { timeout = client_timeout_ms }
   for hop := 0; hop <= 10; hop++ {
-    res, err := round_trip(method, url, req.headers, body, timeout)
+    res, err := round_trip(method, url, headers, body, timeout)
     if err != nil { return nil, err }
     loc := res.headers["location"]
     if req.no_redirects || loc == "" || (res.status != 301 && res.status != 302 && res.status != 303 && res.status != 307 && res.status != 308) {
       return res, nil
     }
-    url = resolve_url(url, loc)
+    next := resolve_url(url, loc)
+    # credentials go only to the host they were written for: a redirect to another host or
+    # port drops Authorization, Cookie, Proxy-Authorization and an explicit Host
+    if origin_of(next) != origin_of(url) { headers = without(headers, []str{"authorization", "cookie", "proxy-authorization", "host"}) }
+    url = next
     # 303, and 301/302 after a POST, become a GET without body (as browsers do)
     if res.status == 303 || ((res.status == 301 || res.status == 302) && method == "POST") {
       if method != "HEAD" { method = "GET" }
       body = ""
+      headers = without(headers, []str{"content-type", "content-length", "transfer-encoding"})
     }
   }
   return nil, errors.New("http: " + req.url + ": too many redirects")
+}
+
+# "host:port" of an http URL (lower case), or "" if it is not one
+fn origin_of(url: str) -> str {
+  host, port, _, err := split_url(url)
+  if err != nil { return "" }
+  return strings.to_lower(host) + ":" + str(port)
+}
+
+# a copy of headers without the given names (any case; names in lower case)
+fn without(headers: map[str]str, names: []str) -> map[str]str {
+  out := map[str]str{}
+  for k, v := range headers {
+    drop := false
+    for _, n := range names { if eq_fold(k, n) { drop = true } }
+    if !drop { out[k] = v }
+  }
+  return out
 }
 
 # the parts of an http URL: host, port, the request target (path and query)
@@ -941,6 +1142,11 @@ fn split_url(url: str) -> (str, int, str, error) {
     port = p
   }
   if host == "" { return "", 0, "", errors.New("http: " + url + ": no host") }
+  # no spaces or control bytes: they would end the request line and add headers of their own
+  for i := 0; i < len(rest); i++ {
+    c := int(rest[i])
+    if c <= 32 || c == 127 { return "", 0, "", errors.New("http: invalid character in URL " + strconv.quote(url)) }
+  }
   return host, port, target, nil
 }
 
@@ -970,6 +1176,11 @@ fn round_trip(method: str, url: str, headers: map[str]str, body: str, timeout: i
   host, port, target, err := split_url(url)
   if err != nil { return nil, err }
   key := host + ":" + str(port)
+  if !valid_name(method) { return nil, errors.New("http: invalid method " + strconv.quote(method)) }
+  for k, v := range headers {
+    if !valid_name(k) { return nil, errors.New("http: invalid header name " + strconv.quote(k)) }
+    if clean_value(v) != v { return nil, errors.New("http: invalid value for header " + k + " (CR, LF or NUL)") }
+  }
   msg := request_text(method, host, port, target, headers, body)
   for attempt := 0; attempt < 2; attempt++ {
     c, reused := take_idle(key)
@@ -1077,6 +1288,13 @@ struct Reader {
   pos: int
   got: bool       # something arrived
   eof: bool
+  total: int      # bytes read so far (max_response)
+}
+
+fn (r: *Reader) count(n: int) -> error {
+  r.total += n
+  if max_response > 0 && r.total > max_response { return errors.New("the response is larger than " + str(max_response) + " bytes (set_max_response_size)") }
+  return nil
 }
 
 fn (r: *Reader) fill() -> error {
@@ -1088,6 +1306,8 @@ fn (r: *Reader) fill() -> error {
     return errors.New("the connection was closed before the response")
   }
   r.got = true
+  cerr := r.count(len(chunk))
+  if cerr != nil { return cerr }
   if r.pos > 0 {
     r.buf = r.buf[r.pos:len(r.buf)]
     r.pos = 0
@@ -1112,15 +1332,36 @@ fn (r: *Reader) line() -> (str, error) {
   return "", nil
 }
 
-# exactly n bytes
+# exactly n bytes (gathered in a builder: no copy of everything so far for each read)
 fn (r: *Reader) take(n: int) -> (str, error) {
-  while len(r.buf) - r.pos < n {
-    err := r.fill()
-    if err != nil { return "", err }
+  if max_response > 0 && n > max_response { return "", errors.New("the response is larger than " + str(max_response) + " bytes (set_max_response_size)") }
+  if len(r.buf) - r.pos >= n {
+    s := r.buf[r.pos:r.pos + n]
+    r.pos += n
+    return s, nil
   }
-  s := r.buf[r.pos:r.pos + n]
-  r.pos += n
-  return s, nil
+  b := strings.Builder{}
+  b.write(r.buf[r.pos:len(r.buf)])
+  r.buf = ""
+  r.pos = 0
+  while b.n < n {
+    if r.eof { return "", errors.New("unexpected end of the response") }
+    chunk, err := r.conn.read(65536)
+    if err != nil { return "", err }
+    if chunk == "" {
+      r.eof = true
+      return "", errors.New("unexpected end of the response")
+    }
+    r.got = true
+    cerr := r.count(len(chunk))
+    if cerr != nil { return "", cerr }
+    need := n - b.n
+    if len(chunk) <= need { b.write(chunk) } else {
+      b.write(chunk[0:need])
+      r.buf = chunk[need:len(chunk)]
+    }
+  }
+  return b.string(), nil
 }
 
 # everything until the server closes
@@ -1133,6 +1374,8 @@ fn (r: *Reader) rest() -> (str, error) {
     chunk, err := r.conn.read(65536)
     if err != nil { return "", err }
     if chunk == "" { break }
+    cerr := r.count(len(chunk))
+    if cerr != nil { return "", cerr }
     b.write(chunk)
   }
   r.eof = true
@@ -1142,6 +1385,7 @@ fn (r: *Reader) rest() -> (str, error) {
 # reads one response: it, whether any byte arrived, whether the connection can be kept
 fn read_reply(c: *net.Conn, method: str) -> (*ClientResponse, bool, bool, error) {
   r := &Reader{conn: c}
+  informational := 0
   while true {
     status_line, err := r.line()
     if err != nil { return nil, r.got, false, err }
@@ -1152,10 +1396,13 @@ fn read_reply(c: *net.Conn, method: str) -> (*ClientResponse, bool, bool, error)
     if serr != nil { return nil, true, false, errors.New("malformed status line \"" + status_line + "\"") }
     res := &ClientResponse{status: status, headers: map[str]str{}}
     if len(parts) > 2 { res.status_text = strings.join(parts[2:len(parts)], " ") }
+    lines := 0
     while true {
       hl, herr := r.line()
       if herr != nil { return nil, true, false, herr }
       if hl == "" { break }
+      lines++
+      if lines > MAX_RESPONSE_HEADERS { return nil, true, false, errors.New("too many header lines in the response") }
       colon := strings.index_byte(hl, 58)
       if colon <= 0 { continue }
       name := strings.to_lower(strings.trim_space(hl[0:colon]))
@@ -1163,7 +1410,11 @@ fn read_reply(c: *net.Conn, method: str) -> (*ClientResponse, bool, bool, error)
       prev, seen := res.headers[name]
       if seen { res.headers[name] = prev + ", " + value } else { res.headers[name] = value }
     }
-    if status >= 100 && status < 200 { continue }    # 100 Continue and friends: the real one follows
+    if status >= 100 && status < 200 {               # 100 Continue and friends: the real one follows
+      informational++
+      if informational > 10 { return nil, true, false, errors.New("too many informational (1xx) responses") }
+      continue
+    }
     keep := parts[0] == "HTTP/1.1" && !has_token(strings.to_lower(res.headers["connection"]), "close")
     if parts[0] == "HTTP/1.0" && has_token(strings.to_lower(res.headers["connection"]), "keep-alive") { keep = true }
     if method == "HEAD" || status == 204 || status == 304 { return res, true, keep && r.pos == len(r.buf), nil }
