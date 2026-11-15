@@ -1,5 +1,6 @@
 import "std/net"
 import "std/http"
+import "std/strings"
 import { describe, it, expect } from "std/testing"
 
 describe("net", fn() {
@@ -34,5 +35,81 @@ describe("http.serve_conn", fn() {
     }
     c.close()
     expect(reply).to_equal("HTTP/1.1 200 OK\r\nX-Caju: yes\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 20\r\nConnection: close\r\n\r\nhi name=caju hello x")
+  })
+})
+
+# DNS replies built by hand: a header, the question, and answer records
+fn dns_name(n: str) -> str {
+  b := strings.Builder{}
+  for _, l := range strings.split(n, ".") {
+    b.write_byte(len(l))
+    b.write(l)
+  }
+  b.write_byte(0)
+  return b.string()
+}
+fn u16(x: int) -> str {
+  b := strings.Builder{}
+  b.write_byte(x >> 8)
+  b.write_byte(x & 255)
+  return b.string()
+}
+fn rr(owner: str, ty: int, class: int, ttl: int, data: str) -> str {
+  return owner + u16(ty) + u16(class) + u16(ttl >> 16) + u16(ttl & 65535) + u16(len(data)) + data
+}
+fn a_data(a: int, b: int, c: int, d: int) -> str {
+  s := strings.Builder{}
+  s.write_byte(a)
+  s.write_byte(b)
+  s.write_byte(c)
+  s.write_byte(d)
+  return s.string()
+}
+fn dns_reply(flags: int, question: str, answers: []str) -> str {
+  return u16(0x1234) + u16(flags) + u16(1) + u16(len(answers)) + u16(0) + u16(0) + question + strings.join(answers, "")
+}
+fn dns_question(n: str) -> str { return dns_name(n) + u16(1) + u16(1) }
+
+describe("net.dns_answer", fn() {
+  it("takes the A record of the name asked for, with its TTL", fn() {
+    ip, ttl, err := net.dns_answer(dns_reply(0x8180, dns_question("caju.dev"), []str{rr(dns_name("caju.dev"), 1, 1, 600, a_data(10, 0, 0, 7))}), "caju.dev")
+    expect(err).to_be_nil()
+    expect(ip).to_equal("10.0.0.7")
+    expect(ttl).to_equal(600)
+  })
+  it("ignores A records for other names (a poisoned reply)", fn() {
+    ip, _, err := net.dns_answer(dns_reply(0x8180, dns_question("caju.dev"), []str{rr(dns_name("evil.example"), 1, 1, 600, a_data(6, 6, 6, 6))}), "caju.dev")
+    expect(err).to_be_nil()
+    expect(ip).to_equal("")
+  })
+  it("follows a CNAME chain from the name asked for", fn() {
+    answers := []str{
+      rr(dns_name("other.example"), 1, 1, 60, a_data(6, 6, 6, 6)),
+      rr(dns_name("www.caju.dev"), 5, 1, 60, dns_name("edge.cdn.example")),
+      rr(dns_name("edge.cdn.example"), 1, 1, 60, a_data(1, 2, 3, 4)),
+    }
+    ip, _, _ := net.dns_answer(dns_reply(0x8180, dns_question("www.caju.dev"), answers), "WWW.caju.dev.")
+    expect(ip).to_equal("1.2.3.4")
+  })
+  it("ignores records of another class", fn() {
+    ip, _, _ := net.dns_answer(dns_reply(0x8180, dns_question("caju.dev"), []str{rr(dns_name("caju.dev"), 1, 3, 60, a_data(6, 6, 6, 6))}), "caju.dev")
+    expect(ip).to_equal("")
+  })
+  it("refuses a reply to another question, a truncated one and malformed names", fn() {
+    _, _, e1 := net.dns_answer(dns_reply(0x8180, dns_question("evil.example"), []str{rr(dns_name("evil.example"), 1, 1, 60, a_data(6, 6, 6, 6))}), "caju.dev")
+    expect(e1.Error()).to_equal("the reply is for another question")
+    _, _, e2 := net.dns_answer(dns_reply(0x8380, dns_question("caju.dev"), []str{}), "caju.dev")
+    expect(e2.Error()).to_start_with("truncated reply (TC)")
+    loop := u16(0x1234) + u16(0x8180) + u16(1) + u16(0) + u16(0) + u16(0) + u16(0xC00C) + u16(1) + u16(1)
+    _, _, e3 := net.dns_answer(loop, "caju.dev")
+    expect(e3).not_().to_be_nil()
+    _, _, e4 := net.dns_answer("short", "caju.dev")
+    expect(e4.Error()).to_equal("truncated reply")
+  })
+  it("gives an empty address for a name that does not exist", fn() {
+    ip, ttl, err := net.dns_answer(dns_reply(0x8183, dns_question("nope.caju.dev"), []str{}), "nope.caju.dev")
+    expect(err).to_be_nil()
+    expect(ip).to_equal("")
+    expect(ttl).to_equal(300)
   })
 })

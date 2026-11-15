@@ -341,6 +341,7 @@ export fn resolve(host: str) -> (str, error) {
       if err == nil {
         if addr == "" { return "", errors.New("no address for " + name) }
         if ttl < 5 { ttl = 5 }
+        if ttl > 86400 { ttl = 86400 }                # a day at most, whatever the reply says
         dns_cache[name] = addr
         dns_expires[name] = os.nanotime() + ttl * 1000000000
         return addr, nil
@@ -380,7 +381,11 @@ fn load_dns_config() {
 # asks server (UDP, port 53) for the A record of name: the address ("" when the name exists but
 # has none), the TTL in seconds, or an error
 fn query_a(server: str, name: str) -> (str, int, error) {
-  id := (os.nanotime() / 1000) & 65535
+  # the query id comes from the kernel's secure generator: a predictable one lets a forged reply
+  # (sent before the real one) be taken as the answer
+  idb := __newstr(2)
+  if __syscall(318, idb + 8, 2, 0, 0, 0, 0) != 2 { return "", 0, errors.New("getrandom failed") }
+  id := (__load8(idb + 8) << 8) | __load8(idb + 9)
   q := strings.Builder{}
   q.write_byte(id >> 8)
   q.write_byte(id & 255)
@@ -423,42 +428,106 @@ fn query_a(server: str, name: str) -> (str, int, error) {
     }
     if len(reply) < 12 || ((int(reply[0]) << 8) | int(reply[1])) != id { continue }   # not ours
     c.close()
-    return parse_a(reply)
+    return dns_answer(reply, name)
   }
   return "", 0, nil
 }
 
-# the first A record of a DNS reply (after the CNAMEs that lead to it)
-fn parse_a(m: str) -> (str, int, error) {
+# The address for name in a DNS reply to an A query: (address, TTL in seconds, error); the
+# address is "" when the name exists without one (or does not exist: TTL 300). The reply must
+# repeat the question (name, type A, class IN) and only an A record whose owner is name, or the
+# target of a CNAME chain starting at name, counts: a record for some other name, which a forged
+# or poisoned reply could carry, is ignored. Exported for tests.
+export fn dns_answer(m: str, name: str) -> (str, int, error) {
+  if len(m) < 12 { return "", 0, errors.New("truncated reply") }
   if (int(m[2]) & 128) == 0 { return "", 0, errors.New("not a reply") }
+  if (int(m[2]) & 2) != 0 { return "", 0, errors.New("truncated reply (TC): the answer does not fit in UDP") }
   rcode := int(m[3]) & 15
-  if rcode == 3 { return "", 300, nil }                       # no such name
-  if rcode != 0 { return "", 0, errors.New("server failure (rcode " + str(rcode) + ")") }
   qd := int(m[4]) << 8 | int(m[5])
   an := int(m[6]) << 8 | int(m[7])
-  p := 12
-  for i := 0; i < qd; i++ { p = skip_name(m, p) + 4 }
+  if qd != 1 { return "", 0, errors.New("the reply does not repeat the question") }
+  qname, p := read_name(m, 12)
+  if p < 0 || p + 4 > len(m) { return "", 0, errors.New("truncated reply") }
+  qtype := int(m[p]) << 8 | int(m[p + 1])
+  qclass := int(m[p + 2]) << 8 | int(m[p + 3])
+  want := strings.to_lower(strings.trim_suffix(name, "."))
+  if qname != want || qtype != 1 || qclass != 1 { return "", 0, errors.New("the reply is for another question") }
+  p += 4
+  if rcode == 3 { return "", 300, nil }                       # no such name
+  if rcode != 0 { return "", 0, errors.New("server failure (rcode " + str(rcode) + ")") }
+  owners := []str{}
+  types := []int{}
+  ttls := []int{}
+  datas := []str{}
   for i := 0; i < an; i++ {
-    p = skip_name(m, p)
-    if p < 0 || p + 10 > len(m) { return "", 0, errors.New("truncated reply") }
-    ty := int(m[p]) << 8 | int(m[p + 1])
-    ttl := int(m[p + 4]) << 24 | int(m[p + 5]) << 16 | int(m[p + 6]) << 8 | int(m[p + 7])
-    n := int(m[p + 8]) << 8 | int(m[p + 9])
-    p += 10
-    if p + n > len(m) { return "", 0, errors.New("truncated reply") }
-    if ty == 1 && n == 4 { return str(int(m[p])) + "." + str(int(m[p + 1])) + "." + str(int(m[p + 2])) + "." + str(int(m[p + 3])), ttl, nil }
-    p += n
+    owner, q := read_name(m, p)
+    if q < 0 || q + 10 > len(m) { return "", 0, errors.New("truncated reply") }
+    ty := int(m[q]) << 8 | int(m[q + 1])
+    class := int(m[q + 2]) << 8 | int(m[q + 3])
+    ttl := int(m[q + 4]) << 24 | int(m[q + 5]) << 16 | int(m[q + 6]) << 8 | int(m[q + 7])
+    n := int(m[q + 8]) << 8 | int(m[q + 9])
+    q += 10
+    if q + n > len(m) { return "", 0, errors.New("truncated reply") }
+    if class == 1 {
+      data := ""
+      if ty == 1 && n == 4 { data = str(int(m[q])) + "." + str(int(m[q + 1])) + "." + str(int(m[q + 2])) + "." + str(int(m[q + 3])) }
+      if ty == 5 {
+        target, e := read_name(m, q)
+        if e < 0 { return "", 0, errors.New("malformed CNAME") }
+        data = target
+      }
+      if data != "" {
+        owners = append(owners, owner)
+        types = append(types, ty)
+        ttls = append(ttls, ttl)
+        datas = append(datas, data)
+      }
+    }
+    p = q + n
+  }
+  # follow the CNAMEs from the name asked for (at most 8), then take its A record
+  cur := want
+  for hop := 0; hop < 9; hop++ {
+    for i := 0; i < len(owners); i++ {
+      if owners[i] == cur && types[i] == 1 { return datas[i], ttls[i], nil }
+    }
+    next := ""
+    for i := 0; i < len(owners); i++ {
+      if owners[i] == cur && types[i] == 5 { next = datas[i] }
+    }
+    if next == "" { break }
+    cur = next
   }
   return "", 300, nil
 }
 
-# the position after the name at p (labels, ending in 0 or in a compression pointer), -1 if bad
-fn skip_name(m: str, p: int) -> int {
+# the name at p (labels, with compression pointers) in lower case, and the position after it
+# (-1 if malformed); pointers must go backwards, so a loop cannot make it run forever
+fn read_name(m: str, p: int) -> (str, int) {
+  b := strings.Builder{}
+  end := -1
+  jumps := 0
   while p >= 0 && p < len(m) {
     n := int(m[p])
-    if n == 0 { return p + 1 }
-    if (n & 192) == 192 { return p + 2 }
+    if n == 0 {
+      if end < 0 { end = p + 1 }
+      return strings.to_lower(b.string()), end
+    }
+    if (n & 192) == 192 {
+      if p + 1 >= len(m) { return "", -1 }
+      target := ((n & 63) << 8) | int(m[p + 1])
+      if target >= p { return "", -1 }
+      if end < 0 { end = p + 2 }
+      jumps++
+      if jumps > 32 { return "", -1 }
+      p = target
+      continue
+    }
+    if (n & 192) != 0 || p + 1 + n > len(m) { return "", -1 }
+    if b.len() > 0 { b.write(".") }
+    b.write(m[p + 1:p + 1 + n])
     p += n + 1
+    if b.len() > 255 { return "", -1 }
   }
-  return -1
+  return "", -1
 }
