@@ -1,0 +1,346 @@
+import "std/bytes"
+import "std/cipher"
+import "std/crypto"
+import "std/hex"
+import "std/os"
+import "std/strings"
+import { describe, it, skip, expect } from "std/testing"
+
+fn unhex(s: str) -> str {
+  b, err := hex.decode(s)
+  if err != nil { panic(err) }
+  return b
+}
+
+fn gcm_hex(key: str, nonce: str, pt: str, aad: str) -> str {
+  s, err := cipher.aes_gcm_seal(unhex(key), unhex(nonce), unhex(pt), unhex(aad))
+  if err != nil { panic(err) }
+  return hex.encode(s)
+}
+
+fn gcm_open_hex(key: str, nonce: str, sealed: str, aad: str) -> str {
+  p, err := cipher.aes_gcm_open(unhex(key), unhex(nonce), unhex(sealed), unhex(aad))
+  if err != nil { return "error: " + err.Error() }
+  return hex.encode(p)
+}
+
+fn flip(s: str, i: int) -> str {
+  b := bytes.new_buffer(len(s))
+  b.write(s)
+  b.set(i, b.get(i) ^ 1)
+  return b.string()
+}
+
+fn counter_nonce(n: int) -> str {
+  b := bytes.new_buffer(12)
+  b.zeros(11)
+  b.byte(n)
+  return b.string()
+}
+
+# the test vectors of "The Galois/Counter Mode of Operation (GCM)" (McGrew and Viega), used by
+# NIST: key, nonce, plaintext, aad, ciphertext || tag
+let K1 = "feffe9928665731c6d6a8f9467308308"
+let IV = "cafebabefacedbaddecaf888"
+let P64 = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255"
+let P60 = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"
+let AAD20 = "feedfacedeadbeeffeedfacedeadbeefabaddad2"
+let GCM_VECTORS = [][]str{
+  []str{"aes-128, empty plaintext (case 1)", "00000000000000000000000000000000", "000000000000000000000000", "", "", "58e2fccefa7e3061367f1d57a4e7455a"},
+  []str{"aes-128, one zero block (case 2)", "00000000000000000000000000000000", "000000000000000000000000", "00000000000000000000000000000000", "", "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"},
+  []str{"aes-128, four blocks (case 3)", K1, IV, P64, "", "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f59854d5c2af327cd64a62cf35abd2ba6fab4"},
+  []str{"aes-128, 60 bytes and 20 bytes of aad (case 4)", K1, IV, P60, AAD20, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47"},
+  []str{"aes-128, aad only (NIST gcmEncryptExtIV128)", "77be63708971c4e240d1cb79e8d77feb", "e0e00f19fed7ba0136a797f3", "", "7a43ec1d9c0a5a78a0b16533a6213cab", "209fcc8d3675ed938e9c7166709dd946"},
+  []str{"aes-256, empty plaintext (case 13)", "0000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000", "", "", "530f8afbc74536b9a963b4f1c4cb738b"},
+  []str{"aes-256, one zero block (case 14)", "0000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000", "00000000000000000000000000000000", "", "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919"},
+  []str{"aes-256, four blocks (case 15)", K1 + K1, IV, P64, "", "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015adb094dac5d93471bdec1a502270e3cc6c"},
+  []str{"aes-256, 60 bytes and 20 bytes of aad (case 16)", K1 + K1, IV, P60, AAD20, "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f66276fc6ece0f4e1768cddf8853bb2d551b"},
+}
+
+describe("cipher.aes_gcm_seal", fn() {
+  for _, v := range GCM_VECTORS {
+    it("matches the test vector: " + v[0], fn() {
+      expect(gcm_hex(v[1], v[2], v[3], v[4])).to_equal(v[5])
+    })
+  }
+  it("gives ciphertext and a 16-byte tag", fn() {
+    s, _ := cipher.aes_gcm_seal(strings.repeat("k", 16), strings.repeat("n", 12), "hello", "")
+    expect(len(s)).to_equal(5 + 16)
+  })
+  it("refuses a key of the wrong size", fn() {
+    _, err := cipher.aes_gcm_seal("short", strings.repeat("n", 12), "x", "")
+    expect(err).to_be_error("cipher: an AES key has 16, 24 or 32 bytes, not 5")
+  })
+  it("refuses a nonce of the wrong size", fn() {
+    _, err := cipher.aes_gcm_seal(strings.repeat("k", 16), "nonce", "x", "")
+    expect(err).to_be_error("cipher: the nonce must have 12 bytes, not 5")
+  })
+})
+
+describe("cipher.aes_gcm_open", fn() {
+  for _, v := range GCM_VECTORS {
+    it("decrypts the test vector: " + v[0], fn() {
+      expect(gcm_open_hex(v[1], v[2], v[5], v[4])).to_equal(v[3])
+    })
+  }
+  v := GCM_VECTORS[3]
+  it("refuses a changed tag", fn() {
+    s := unhex(v[5])
+    _, err := cipher.aes_gcm_open(unhex(v[1]), unhex(v[2]), flip(s, len(s) - 1), unhex(v[4]))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a changed ciphertext", fn() {
+    _, err := cipher.aes_gcm_open(unhex(v[1]), unhex(v[2]), flip(unhex(v[5]), 7), unhex(v[4]))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a changed aad", fn() {
+    _, err := cipher.aes_gcm_open(unhex(v[1]), unhex(v[2]), unhex(v[5]), flip(unhex(v[4]), 19))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a missing aad", fn() {
+    _, err := cipher.aes_gcm_open(unhex(v[1]), unhex(v[2]), unhex(v[5]), "")
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses another nonce", fn() {
+    _, err := cipher.aes_gcm_open(unhex(v[1]), flip(unhex(v[2]), 0), unhex(v[5]), unhex(v[4]))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses another key", fn() {
+    _, err := cipher.aes_gcm_open(flip(unhex(v[1]), 3), unhex(v[2]), unhex(v[5]), unhex(v[4]))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a message shorter than the tag", fn() {
+    _, err := cipher.aes_gcm_open(unhex(v[1]), unhex(v[2]), "short", "")
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+})
+
+let RFC_KEY = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+let RFC_NONCE = "070000004041424344454647"
+let RFC_AAD = "50515253c0c1c2c3c4c5c6c7"
+let RFC_TEXT = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+let RFC_SEALED = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116" + "1ae10b594f09e26a7e902ecbd0600691"
+
+let A5_KEY = "1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0"
+let A5_NONCE = "000000000102030405060708"
+let A5_AAD = "f33388860000000000004e91"
+let A5_TAG = "eead9d67890cbb22392336fea1851f38"
+let A5_CIPHERTEXT = "64a0861575861af460f062c79be643bd5e805cfd345cf389f108670ac76c8cb24c6cfc18755d43eea09ee94e382d26b0bdb7b73c321b0100d4f03b7f355894cf332f830e710b97ce98c8a84abd0b948114ad176e008d33bd60f982b1ff37c8559797a06ef4f0ef61c186324e2b3506383606907b6a7c02b0f9f6157b53c867e4b9166c767b804d46a59b5216cde7a4e99040c5a40433225ee282a1b0a06c523eaf4534d7f83fa1155b0047718cbc546a0d072b04b3564eea1b422273f548271a0bb2316053fa76991955ebd63159434ecebb4e466dae5a1073a6727627097a1049e617d91d361094fa68f0ff77987130305beaba2eda04df997b714d6c6f2c29a6ad5cb4022b02709b"
+let A5_PLAINTEXT = "496e7465726e65742d4472616674732061726520647261667420646f63756d656e74732076616c696420666f722061206d6178696d756d206f6620736978206d6f6e74687320616e64206d617920626520757064617465642c207265706c616365642c206f72206f62736f6c65746564206279206f7468657220646f63756d656e747320617420616e792074696d652e20497420697320696e617070726f70726961746520746f2075736520496e7465726e65742d447261667473206173207265666572656e6365206d6174657269616c206f7220746f2063697465207468656d206f74686572207468616e206173202fe2809c776f726b20696e2070726f67726573732e2fe2809d"
+
+describe("cipher.chacha20_poly1305_seal", fn() {
+  it("matches RFC 8439 section 2.8.2", fn() {
+    s, err := cipher.chacha20_poly1305_seal(unhex(RFC_KEY), unhex(RFC_NONCE), RFC_TEXT, unhex(RFC_AAD))
+    expect(err).to_be_nil()
+    expect(hex.encode(s)).to_equal(RFC_SEALED)
+  })
+  it("matches RFC 8439 appendix A.5", fn() {
+    s, _ := cipher.chacha20_poly1305_seal(unhex(A5_KEY), unhex(A5_NONCE), unhex(A5_PLAINTEXT), unhex(A5_AAD))
+    expect(hex.encode(s)).to_equal(A5_CIPHERTEXT + A5_TAG)
+  })
+  it("seals an empty plaintext to a tag only", fn() {
+    s, _ := cipher.chacha20_poly1305_seal(unhex(RFC_KEY), unhex(RFC_NONCE), "", unhex(RFC_AAD))
+    expect(len(s)).to_equal(16)
+    p, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), unhex(RFC_NONCE), s, unhex(RFC_AAD))
+    expect(err).to_be_nil()
+    expect(p).to_equal("")
+  })
+  it("refuses a key of the wrong size", fn() {
+    _, err := cipher.chacha20_poly1305_seal(strings.repeat("k", 16), unhex(RFC_NONCE), "x", "")
+    expect(err).to_be_error("cipher: a ChaCha20-Poly1305 key has 32 bytes, not 16")
+  })
+})
+
+describe("cipher.chacha20_poly1305_open", fn() {
+  it("decrypts RFC 8439 section 2.8.2", fn() {
+    p, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), unhex(RFC_NONCE), unhex(RFC_SEALED), unhex(RFC_AAD))
+    expect(err).to_be_nil()
+    expect(p).to_equal(RFC_TEXT)
+  })
+  it("decrypts RFC 8439 appendix A.5", fn() {
+    p, err := cipher.chacha20_poly1305_open(unhex(A5_KEY), unhex(A5_NONCE), unhex(A5_CIPHERTEXT + A5_TAG), unhex(A5_AAD))
+    expect(err).to_be_nil()
+    expect(hex.encode(p)).to_equal(A5_PLAINTEXT)
+    expect(p).to_start_with("Internet-Drafts are draft documents")
+  })
+  it("refuses a changed tag", fn() {
+    s := unhex(RFC_SEALED)
+    _, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), unhex(RFC_NONCE), flip(s, len(s) - 16), unhex(RFC_AAD))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a changed ciphertext", fn() {
+    _, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), unhex(RFC_NONCE), flip(unhex(RFC_SEALED), 100), unhex(RFC_AAD))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a changed aad", fn() {
+    _, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), unhex(RFC_NONCE), unhex(RFC_SEALED), flip(unhex(RFC_AAD), 0))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses another nonce", fn() {
+    _, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), flip(unhex(RFC_NONCE), 11), unhex(RFC_SEALED), unhex(RFC_AAD))
+    expect(err).to_be_error("cipher: message authentication failed")
+  })
+  it("refuses a nonce of the wrong size", fn() {
+    _, err := cipher.chacha20_poly1305_open(unhex(RFC_KEY), "nonce", unhex(RFC_SEALED), unhex(RFC_AAD))
+    expect(err).to_be_error("cipher: the nonce must have 12 bytes, not 5")
+  })
+})
+
+let ZERO32 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+describe("cipher.chacha20", fn() {
+  it("gives the keystream of RFC 8439 appendix A.1, test vector 1", fn() {
+    s, _ := cipher.chacha20(unhex(ZERO32), unhex("000000000000000000000000"), 0, unhex(strings.repeat("00", 64)))
+    expect(hex.encode(s)).to_equal("76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586")
+  })
+  it("gives the keystream of RFC 8439 appendix A.1, test vector 2 (counter 1)", fn() {
+    s, _ := cipher.chacha20(unhex(ZERO32), unhex("000000000000000000000000"), 1, unhex(strings.repeat("00", 64)))
+    expect(hex.encode(s)).to_equal("9f07e7be5551387a98ba977c732d080dcb0f29a048e3656912c6533e32ee7aed29b721769ce64e43d57133b074d839d531ed1f28510afb45ace10a1f4b794d6f")
+  })
+  it("encrypts RFC 8439 appendix A.2, test vector 3 (counter 42, a partial block)", fn() {
+    s, _ := cipher.chacha20(unhex(A5_KEY), unhex("000000000000000000000002"), 42, unhex("2754776173206272696c6c69672c20616e642074686520736c6974687920746f7665730a446964206779726520616e642067696d626c6520696e2074686520776162653a0a416c6c206d696d737920776572652074686520626f726f676f7665732c0a416e6420746865206d6f6d65207261746873206f757467726162652e"))
+    expect(hex.encode(s)).to_equal("62e6347f95ed87a45ffae7426f27a1df5fb69110044c0d73118effa95b01e5cf166d3df2d721caf9b21e5fb14c616871fd84c54f9d65b283196c7fe4f60553ebf39c6402c42234e32a356b3e764312a61a5532055716ead6962568f87d3f3f7704c6a8d1bcd1bf4d50d6154b6da731b187b58dfd728afa36757a797ac188d1")
+  })
+  it("decrypts with the same call", fn() {
+    s, _ := cipher.chacha20(unhex(A5_KEY), unhex("000000000000000000000002"), 42, unhex("62e6347f95ed87a45ffae7426f27a1df5fb69110044c0d73118effa95b01e5cf166d3df2d721caf9b21e5fb14c616871fd84c54f9d65b283196c7fe4f60553ebf39c6402c42234e32a356b3e764312a61a5532055716ead6962568f87d3f3f7704c6a8d1bcd1bf4d50d6154b6da731b187b58dfd728afa36757a797ac188d1"))
+    expect(s).to_start_with("'Twas brillig")
+  })
+})
+
+fn poly_hex(key: str, msg: str) -> str {
+  t, err := cipher.poly1305(unhex(key), unhex(msg))
+  if err != nil { panic(err) }
+  return hex.encode(t)
+}
+
+let FF16 = "ffffffffffffffffffffffffffffffff"
+let Z16 = "00000000000000000000000000000000"
+
+describe("cipher.poly1305", fn() {
+  it("gives a zero tag for a zero key (RFC 8439 A.3 #1)", fn() {
+    expect(poly_hex(ZERO32, strings.repeat("00", 64))).to_equal(Z16)
+  })
+  it("gives s when r is zero (RFC 8439 A.3 #2)", fn() {
+    expect(poly_hex(Z16 + "36e5f6b5c5e06070f0efca96227a863e", "416e79207375626d697373696f6e20746f20746865204945544620696e74656e6465642062792074686520436f6e7472696275746f7220666f72207075626c69636174696f6e20617320616c6c206f722070617274206f6620616e204945544620496e7465726e65742d4472616674206f722052464320616e6420616e792073746174656d656e74206d6164652077697468696e2074686520636f6e74657874206f6620616e204945544620616374697669747920697320636f6e7369646572656420616e20224945544620436f6e747269627574696f6e222e20537563682073746174656d656e747320696e636c756465206f72616c2073746174656d656e747320696e20494554462073657373696f6e732c2061732077656c6c206173207772697474656e20616e6420656c656374726f6e696320636f6d6d756e69636174696f6e73206d61646520617420616e792074696d65206f7220706c6163652c207768696368206172652061646472657373656420746f")).to_equal("36e5f6b5c5e06070f0efca96227a863e")
+  })
+  it("matches RFC 8439 A.3 #3", fn() {
+    expect(poly_hex("36e5f6b5c5e06070f0efca96227a863e" + Z16, "416e79207375626d697373696f6e20746f20746865204945544620696e74656e6465642062792074686520436f6e7472696275746f7220666f72207075626c69636174696f6e20617320616c6c206f722070617274206f6620616e204945544620496e7465726e65742d4472616674206f722052464320616e6420616e792073746174656d656e74206d6164652077697468696e2074686520636f6e74657874206f6620616e204945544620616374697669747920697320636f6e7369646572656420616e20224945544620436f6e747269627574696f6e222e20537563682073746174656d656e747320696e636c756465206f72616c2073746174656d656e747320696e20494554462073657373696f6e732c2061732077656c6c206173207772697474656e20616e6420656c656374726f6e696320636f6d6d756e69636174696f6e73206d61646520617420616e792074696d65206f7220706c6163652c207768696368206172652061646472657373656420746f")).to_equal("f3477e7cd95417af89a6b8794c310cf0")
+  })
+  it("matches RFC 8439 A.3 #4 (a partial last block)", fn() {
+    expect(poly_hex(A5_KEY, "2754776173206272696c6c69672c20616e642074686520736c6974687920746f7665730a446964206779726520616e642067696d626c6520696e2074686520776162653a0a416c6c206d696d737920776572652074686520626f726f676f7665732c0a416e6420746865206d6f6d65207261746873206f757467726162652e")).to_equal("4541669a7eaaee61e708dc7cbcc5eb62")
+  })
+  it("reduces a final result that is only partially reduced (A.3 #5)", fn() {
+    expect(poly_hex("02" + strings.repeat("00", 15) + Z16, FF16)).to_equal("03" + strings.repeat("00", 15))
+  })
+  it("wraps the addition of s modulo 2^128 (A.3 #6)", fn() {
+    expect(poly_hex("02" + strings.repeat("00", 15) + FF16, "02" + strings.repeat("00", 15))).to_equal("03" + strings.repeat("00", 15))
+  })
+  it("carries into an all-ones limb (A.3 #7)", fn() {
+    expect(poly_hex("01" + strings.repeat("00", 31), FF16 + "f0ffffffffffffffffffffffffffffff" + "11000000000000000000000000000000")).to_equal("05" + strings.repeat("00", 15))
+  })
+  it("handles a result of exactly 2^130 - 5 (A.3 #8)", fn() {
+    expect(poly_hex("01" + strings.repeat("00", 31), FF16 + "fbfefefefefefefefefefefefefefefe" + "01010101010101010101010101010101")).to_equal(Z16)
+  })
+  it("handles a result of exactly 2^130 - 6 (A.3 #9)", fn() {
+    expect(poly_hex("02" + strings.repeat("00", 31), "fdffffffffffffffffffffffffffffff")).to_equal("faffffffffffffffffffffffffffffff")
+  })
+  it("handles a 131-bit intermediate result (A.3 #10)", fn() {
+    expect(poly_hex("0100000000000000040000000000000000000000000000000000000000000000", "e33594d7505e43b900000000000000003394d7505e4379cd01000000000000000000000000000000000000000000000001000000000000000000000000000000")).to_equal("14000000000000005500000000000000")
+  })
+  it("handles a 131-bit final result (A.3 #11)", fn() {
+    expect(poly_hex("0100000000000000040000000000000000000000000000000000000000000000", "e33594d7505e43b900000000000000003394d7505e4379cd010000000000000000000000000000000000000000000000")).to_equal("13000000000000000000000000000000")
+  })
+})
+
+describe("cipher.Aead", fn() {
+  it("gives the same result as the one-shot functions, message after message", fn() {
+    key := unhex(K1)
+    a, err := cipher.new_aes_gcm(key)
+    expect(err).to_be_nil()
+    c, _ := cipher.new_chacha20_poly1305(unhex(RFC_KEY))
+    ok := true
+    n := 0
+    while n < 70 {
+      nonce := counter_nonce(n)
+      pt := strings.repeat("p", n)
+      aad := strings.repeat("a", n % 21)
+      want, _ := cipher.aes_gcm_seal(key, nonce, pt, aad)
+      if a.seal(nonce, pt, aad) != want { ok = false }
+      back, err := a.open(nonce, want, aad)
+      if err != nil || back != pt { ok = false }
+      want, _ = cipher.chacha20_poly1305_seal(unhex(RFC_KEY), nonce, pt, aad)
+      if c.seal(nonce, pt, aad) != want { ok = false }
+      back, err = c.open(nonce, want, aad)
+      if err != nil || back != pt { ok = false }
+      n++
+    }
+    expect(ok).to_be_true()
+  })
+  it("adds 16 bytes", fn() {
+    a, _ := cipher.new_aes_gcm(unhex(K1 + K1))
+    expect(a.overhead()).to_equal(16)
+    c, _ := cipher.new_chacha20_poly1305(unhex(RFC_KEY))
+    expect(c.overhead()).to_equal(16)
+  })
+  it("panics on a nonce of the wrong size in seal", fn() {
+    a, _ := cipher.new_aes_gcm(unhex(K1))
+    expect(fn() { a.seal("short", "x", "") }).to_panic()
+  })
+  it("round-trips a large message (several MB worth of blocks)", fn() {
+    big := strings.repeat("0123456789abcdef!", 20000)
+    a, _ := cipher.new_aes_gcm(unhex(K1))
+    s := a.seal(unhex(IV), big, "hdr")
+    p, err := a.open(unhex(IV), s, "hdr")
+    expect(err).to_be_nil()
+    expect(p == big).to_be_true()
+    c, _ := cipher.new_chacha20_poly1305(unhex(RFC_KEY))
+    s = c.seal(unhex(RFC_NONCE), big, "hdr")
+    p, err = c.open(unhex(RFC_NONCE), s, "hdr")
+    expect(err).to_be_nil()
+    expect(p == big).to_be_true()
+  })
+})
+
+# cross-check against Python's cryptography module (OpenSSL underneath), when it is installed
+let PY_SCRIPT = "import sys\ntry:\n  from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305\nexcept Exception:\n  print('NO')\n  sys.exit(0)\nfor a in sys.argv[1:]:\n  alg, k, n, p, d = a.split(':')\n  c = AESGCM if alg == 'aes' else ChaCha20Poly1305\n  print(c(bytes.fromhex(k)).encrypt(bytes.fromhex(n), bytes.fromhex(p), bytes.fromhex(d)).hex())\n"
+
+fn rnd(n: int) -> str {
+  b, err := crypto.random_bytes(n)
+  if err != nil { panic(err) }
+  return b
+}
+
+fn python_has_cryptography() -> bool {
+  p, err := os.run([]str{"python3", "-I", "-c", PY_SCRIPT}, nil, true)
+  return err == nil && p.code == 0 && strings.trim_space(p.output) == ""
+}
+
+if python_has_cryptography() {
+  describe("cipher against Python's cryptography", fn() {
+    it("agrees on random keys, nonces, plaintexts and aad of many lengths", fn() {
+      args := []str{"python3", "-I", "-c", PY_SCRIPT}
+      want := []str{}
+      for _, n := range []int{0, 1, 15, 16, 17, 31, 63, 64, 65, 100, 1000, 4099} {
+        for _, alg := range []str{"aes", "aes256", "chacha"} {
+          klen := 32
+          if alg == "aes" { klen = 16 }
+          key := rnd(klen)
+          nonce := rnd(12)
+          pt := rnd(n)
+          aad := rnd(n % 37)
+          name := alg
+          if alg == "aes256" { name = "aes" }
+          args = append(args, name + ":" + hex.encode(key) + ":" + hex.encode(nonce) + ":" + hex.encode(pt) + ":" + hex.encode(aad))
+          s := ""
+          if alg == "chacha" { s, _ = cipher.chacha20_poly1305_seal(key, nonce, pt, aad) } else { s, _ = cipher.aes_gcm_seal(key, nonce, pt, aad) }
+          want = append(want, hex.encode(s))
+        }
+      }
+      p, err := os.run(args, nil, true)
+      expect(err).to_be_nil()
+      expect(strings.split(strings.trim_space(p.output), "\n")).to_equal(want)
+    })
+  })
+} else {
+  skip("cipher against Python's cryptography (python3 with the cryptography module not found)", fn() {})
+}
