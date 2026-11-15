@@ -1025,3 +1025,81 @@ export fn ed25519_verify(public_key: str, msg: str, sig: str) -> bool {
   ed_add(p, b)
   return constant_time_eq(ed_str(ed_pack(p)), sig[0:32])
 }
+
+# ---------------------------------------------------------------- X25519 (RFC 7748)
+#
+# Diffie-Hellman on Curve25519: each side picks a random 32-byte scalar (random_bytes(32)), sends
+# x25519_base(scalar), and x25519(scalar, other's value) gives both the same shared secret. The
+# Montgomery ladder swaps with masks (TweetNaCl's crypto_scalarmult).
+
+let X_A24 = []int{0xDB41, 1}    # 121665
+
+fn fe_from(a: []int) -> []int {
+  o := fe()
+  i := 0
+  while i < len(a) {
+    o[i] = a[i]
+    i++
+  }
+  return o
+}
+
+# scalar * point (both 32 bytes); an error when the result is zero (a point of small order: TLS
+# and others must refuse it)
+export fn x25519(scalar: str, point: str) -> (str, error) {
+  if len(scalar) != 32 || len(point) != 32 { return "", errors.New("crypto: X25519 takes a 32-byte scalar and a 32-byte point") }
+  z := ed_bytes(scalar)
+  z[31] = (z[31] & 127) | 64
+  z[0] = z[0] & 248
+  x := fe()
+  fe_unpack(x, ed_bytes(point))
+  a := fe_one()
+  b := fe()
+  fe_copy(b, x)
+  c := fe()
+  d := fe_one()
+  e := fe()
+  f := fe()
+  a24 := fe_from(X_A24)
+  i := 254
+  while i >= 0 {
+    r := (z[i >> 3] >> (i & 7)) & 1
+    fe_select(a, b, r)
+    fe_select(c, d, r)
+    fe_add(e, a, c)
+    fe_sub(a, a, c)
+    fe_add(c, b, d)
+    fe_sub(b, b, d)
+    fe_mul(d, e, e)
+    fe_mul(f, a, a)
+    fe_mul(a, c, a)
+    fe_mul(c, b, e)
+    fe_add(e, a, c)
+    fe_sub(a, a, c)
+    fe_mul(b, a, a)
+    fe_sub(c, d, f)
+    fe_mul(a, c, a24)
+    fe_add(a, a, d)
+    fe_mul(c, c, a)
+    fe_mul(a, d, f)
+    fe_mul(d, b, x)
+    fe_mul(b, e, e)
+    fe_select(a, b, r)
+    fe_select(c, d, r)
+    i--
+  }
+  fe_inv(c, c)
+  fe_mul(a, a, c)
+  out := ed_str(fe_pack(a))
+  zero := 0
+  for k := 0; k < 32; k++ { zero = zero | int(out[k]) }
+  if zero == 0 { return "", errors.New("crypto: X25519 result is zero (a point of small order)") }
+  return out, nil
+}
+
+# the public value of a scalar: scalar * 9
+export fn x25519_base(scalar: str) -> (str, error) {
+  nine := __newstr(32)
+  __store8(nine + 8, 9)
+  return x25519(scalar, __pstr(nine))
+}
