@@ -72,6 +72,24 @@ notes from the section of its version here (`tools/changelog.sh`).
   need a valid code (1002 otherwise), the client checks `Connection: Upgrade` in the answer and
   refuses headers and URLs with CR or LF, and masking keys come from the kernel's secure generator.
 - `std/strings`: `valid_utf8`.
+- Runtime: a string of negative or absurd length (from a bad argument, such as
+  `crypto.pbkdf2_sha256` with a negative key length or `net.Conn.read` with a negative maximum)
+  is a runtime error; before, it made a small block whose header claimed a huge length.
+  `bytes.Buffer` checks offsets without overflowing and refuses `slice(hi < lo)` and negative
+  lengths (reads and writes outside the buffer were possible).
+- `std/net`: DNS replies are checked against cache poisoning: random query ids (getrandom), the
+  reply must repeat the question, only the A record of the name asked for (or of its CNAME chain)
+  counts, other classes are ignored, truncated replies are errors and TTLs are capped at a day.
+  `net.dns_answer` parses a reply.
+- `std/toml`: nesting deeper than 500 levels is an error instead of a stack overflow (a package's
+  caju.toml is untrusted input).
+- `caju pkg`: pre-release versions accept only `[0-9A-Za-z-]` identifiers (`1.0.0-../../x` was a
+  path outside the cache); caju.lock entries need a valid name, version, `sha256:<64 hex>` hash
+  and 40-hex commit; a package's `entry` must stay inside it; `caju pkg hash` refuses file names
+  with control characters.
+- `caju bench` writes its programs to a private temporary directory instead of a fixed name in
+  /tmp. The CI workflows pin their actions by commit and CI runs with read-only permissions.
+- docs/mcp.md: the risk of running `caju mcp` with assistants that read untrusted text.
 
 ## [0.6.0] - 2026-11-14
 

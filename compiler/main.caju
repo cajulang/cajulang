@@ -280,7 +280,10 @@ fn cmd_bench(runs: int, note: str, history: bool, filter: str) {
   dir := root() + "/bench/programs/"
   p, err := os.run([]str{"ls", "-1", dir}, nil, false)
   if err != nil { die(err.Error()) }
-  tmp := "/tmp/caju-bench-" + str(os.getpid())
+  # a private directory (mode 0700): a fixed name in /tmp could be a link planted by another user
+  tmp_dir, terr := fs.temp_dir("", "caju-bench-")
+  if terr != nil { die(terr.Error()) }
+  tmp := tmp_dir + "/program"
   entries := []str{}
   bad := 0
   print("benchmark          compile ms   size KB    run ms   memory MB")
@@ -319,8 +322,7 @@ fn cmd_bench(runs: int, note: str, history: bool, filter: str) {
     print(pad_right(name, 18) + " " + pad_left(str(ms(compile_ns)), 10) + " " + pad_left(str(image.len() / 1024), 9) + " " + pad_left(str(ms(best)), 9) + " " + pad_left(strconv.format_float(num(rss * 10 / 1024) / 10.0), 11) + "   " + flag)
     entries = append(entries, strconv.quote(name) + ":{\"compile_ms\":" + str(ms(compile_ns)) + ",\"size\":" + str(image.len()) + ",\"run_ms\":" + str(ms(best)) + ",\"rss_kb\":" + str(rss) + "}")
   }
-  os.remove(tmp)
-  os.remove(tmp + ".mem")
+  fs.remove_all(tmp_dir)
   if filter == "" {
     append_line(root() + "/bench/history.jsonl", "{\"date\":" + strconv.quote(now_iso()) + ",\"commit\":" + strconv.quote(git_commit()) + ",\"compiler\":\"self\",\"note\":" + strconv.quote(note) + ",\"results\":{" + strings.join(entries, ",") + "}}")
     print("\nsaved to bench/history.jsonl")

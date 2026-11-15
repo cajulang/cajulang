@@ -99,6 +99,12 @@ the library, and gets exact positions for each error after every edit.
 stops a program that does not end, but it is not a sandbox. For an isolated run, the compiler in
 WebAssembly (`docs/wasm.md`) runs programs in a browser or in Node without access to your files.
 
+This matters with assistants that read text you did not write (web pages, issues, files of a
+package): instructions planted there can lead the assistant to write a program that reads your
+files or keys and sends them out, and to run it with `caju_run`. Keep your client asking before
+each tool call, or run `caju mcp` inside a container or a sandbox (`bwrap`, a VM) without your
+home directory and secrets.
+
 ## Also on the command line
 
 ```sh
