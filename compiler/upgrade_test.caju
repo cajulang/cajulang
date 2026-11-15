@@ -1,0 +1,334 @@
+# `caju upgrade` and `caju release` (upgrade.caju): signed manifests, and the whole workflow
+# against a directory of fake releases (CAJU_UPGRADE_SOURCE) signed with a test key that
+# CAJU_UPGRADE_KEY makes trusted. A fake release's bin/caju is a shell script that answers
+# `version`, which is all the upgrade runs.
+import "std/os"
+import "std/fs"
+import "std/strings"
+import "std/crypto"
+import "std/hex"
+import "pkg"
+import "upgrade"
+import { describe, it, expect } from "std/testing"
+
+fn unhex(s: str) -> str {
+  b, err := hex.decode(s)
+  if err != nil { panic(err) }
+  return b
+}
+
+let SEED = unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+let OTHER_SEED = unhex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7")
+
+fn pub_hex(seed: str) -> str {
+  p, _ := crypto.ed25519_public_key(seed)
+  return hex.encode(p)
+}
+
+describe("signed manifests", fn() {
+  data := "the bytes of a package"
+  keys := []str{pub_hex(SEED)}
+  it("accept the package, version and file they were signed for", fn() {
+    m, err := upgrade.sign_manifest("0.7.0", "caju-linux-x86_64.tar.gz", data, SEED)
+    expect(err).to_be_nil()
+    expect(m).to_start_with("caju-release 1\nversion 0.7.0\nfile caju-linux-x86_64.tar.gz\nsha256 " + crypto.sha256_hex(data) + "\nkey " + pub_hex(SEED) + "\nsignature ")
+    expect(upgrade.check_manifest(m, "0.7.0", "caju-linux-x86_64.tar.gz", data, keys)).to_be_nil()
+  })
+  it("refuse other bytes, another version or another file", fn() {
+    m, _ := upgrade.sign_manifest("0.7.0", "caju-linux-x86_64.tar.gz", data, SEED)
+    expect(upgrade.check_manifest(m, "0.7.0", "caju-linux-x86_64.tar.gz", data + "!", keys)).to_be_error("the downloaded package does not match its signature (SHA-256 differs)")
+    expect(upgrade.check_manifest(m, "0.8.0", "caju-linux-x86_64.tar.gz", data, keys)).to_be_error("the signature is for version 0.7.0, not 0.8.0")
+    expect(upgrade.check_manifest(m, "0.7.0", "caju-wasm.tar.gz", data, keys)).to_be_error("the signature is for caju-linux-x86_64.tar.gz, not caju-wasm.tar.gz")
+  })
+  it("refuse a manifest edited after signing", fn() {
+    m, _ := upgrade.sign_manifest("0.7.0", "caju-linux-x86_64.tar.gz", data, SEED)
+    edited := strings.replace_all(m, "version 0.7.0", "version 0.9.0")
+    expect(upgrade.check_manifest(edited, "0.9.0", "caju-linux-x86_64.tar.gz", data, keys)).to_be_error("invalid signature: the release files were changed after signing")
+  })
+  it("refuse a key that is not trusted, and no keys at all", fn() {
+    m, _ := upgrade.sign_manifest("0.7.0", "caju-linux-x86_64.tar.gz", data, OTHER_SEED)
+    expect(upgrade.check_manifest(m, "0.7.0", "caju-linux-x86_64.tar.gz", data, keys)).to_be_error("the release is signed by a key this caju does not trust (" + pub_hex(OTHER_SEED) + ")")
+    expect(upgrade.check_manifest(m, "0.7.0", "caju-linux-x86_64.tar.gz", data, []str{})).not_().to_be_nil()
+  })
+  it("refuse malformed files", fn() {
+    expect(upgrade.check_manifest("", "0.7.0", "f", data, keys)).to_be_error("the signature file has no signature line")
+    expect(upgrade.check_manifest("caju-release 1\nsignature zz\n", "0.7.0", "f", data, keys)).to_be_error("the signature file has a malformed signature")
+    m, _ := upgrade.sign_manifest("0.7.0", "f", data, SEED)
+    expect(upgrade.check_manifest(strings.replace_all(m, "caju-release 1", "caju-release 2"), "0.7.0", "f", data, keys)).to_be_error("not a caju release signature (or a newer format: upgrade by hand with install.sh)")
+  })
+})
+
+# ---------------------------------------------------------------- the whole workflow
+
+let W: str = ""        # src/ (good releases), bad/ (broken ones), home/ (CAJU_HOME), bin/, proj/
+let env: []str = nil
+
+fn env_with(base: []str, vars: []str) -> []str {
+  out := []str{}
+  for _, kv := range base {
+    keep := true
+    for _, v := range vars { if strings.has_prefix(kv, v[0:strings.index(v, "=") + 1]) { keep = false } }
+    if keep { out = append(out, kv) }
+  }
+  for _, v := range vars { out = append(out, v) }
+  return out
+}
+
+fn sh(script: str) {
+  p, err := os.run([]str{"sh", "-c", script}, nil, true)
+  expect(err).to_be_nil()
+  if p.code != 0 { expect(p.output).to_equal("(sh succeeding)") }
+}
+
+# builds the package of a fake release in dir/v<v>/: says it is caju <says>; extra is a shell
+# command run inside the package directory before packing
+fn pack(dir: str, v: str, says: str, extra: str) -> str {
+  work := W + "/work/" + v
+  top := work + "/caju-" + v
+  fs.remove_all(work)
+  fs.mkdir_all(top + "/bin", 0o755)
+  fs.mkdir_all(top + "/lib", 0o755)
+  os.write_file(top + "/bin/caju", "#!/bin/sh\necho \"caju " + says + "\"\n", 0o755)
+  os.write_file(top + "/lib/strings.caju", "# " + v + "\n", 0o644)
+  if extra != "" { sh("cd '" + top + "' && " + extra) }
+  out := dir + "/v" + v
+  fs.mkdir_all(out, 0o755)
+  sh("tar -C '" + work + "' -czf '" + out + "/" + upgrade.ASSET + "' caju-" + v)
+  data, _ := os.read_file(out + "/" + upgrade.ASSET)
+  return data
+}
+
+fn publish(dir: str, v: str, seed: str) {
+  data := pack(dir, v, v, "")
+  m, _ := upgrade.sign_manifest(v, upgrade.ASSET, data, seed)
+  os.write_file(dir + "/v" + v + "/" + upgrade.ASSET + ".sig", m, 0o644)
+}
+
+fn setup() {
+  if W != "" { return }
+  d, err := fs.temp_dir("", "caju-upgrade-test-")
+  expect(err).to_be_nil()
+  W = d
+  env = env_with(os.environ(), []str{"CAJU_HOME=" + W + "/home", "CAJU_BIN_DIR=" + W + "/bin",
+    "CAJU_UPGRADE_SOURCE=" + W + "/src", "CAJU_UPGRADE_KEY=" + pub_hex(SEED), "CAJU_NO_UPDATE_CHECK=1"})
+  fs.mkdir_all(W + "/proj", 0o755)
+  publish(W + "/src", "0.7.0", SEED)
+  publish(W + "/src", "0.8.0", SEED)
+  # before signing: only a .sha256
+  data := pack(W + "/src", "0.5.0", "0.5.0", "")
+  os.write_file(W + "/src/v0.5.0/" + upgrade.ASSET + ".sha256", crypto.sha256_hex(data) + "  " + upgrade.ASSET + "\n", 0o644)
+  # a pre-release is never the latest
+  publish(W + "/src", "0.9.0-beta.1", SEED)
+
+  # broken releases
+  b := W + "/bad"
+  publish(b, "0.9.0", SEED)                     # its package replaced after signing
+  pack(b, "0.9.0", "0.9.0", "echo evil > lib/evil.caju")
+  publish(b, "0.9.1", OTHER_SEED)               # signed by an untrusted key
+  publish(b, "0.9.2", SEED)                     # the signature of another version
+  fs.copy_file(W + "/src/v0.7.0/" + upgrade.ASSET + ".sig", b + "/v0.9.2/" + upgrade.ASSET + ".sig")
+  d3 := pack(b, "0.9.3", "0.9.3", "ln -s /etc/passwd lib/passwd.caju")   # a symbolic link inside
+  m3, _ := upgrade.sign_manifest("0.9.3", upgrade.ASSET, d3, SEED)
+  os.write_file(b + "/v0.9.3/" + upgrade.ASSET + ".sig", m3, 0o644)
+  d4 := pack(b, "0.9.4", "0.1.0", "")            # says it is another version
+  m4, _ := upgrade.sign_manifest("0.9.4", upgrade.ASSET, d4, SEED)
+  os.write_file(b + "/v0.9.4/" + upgrade.ASSET + ".sig", m4, 0o644)
+}
+
+# runs caju in proj/ with the test environment (and vars on top); output with W as $W, exit code
+fn caju_env(vars: []str, args: []str) -> (str, int) {
+  setup()
+  argv := []str{"sh", "-c", "cd \"$1\" && shift && exec \"$@\" </dev/null", "sh", W + "/proj", os.getenv("CAJU_BIN")}
+  for _, a := range args { argv = append(argv, a) }
+  p, err := os.run(argv, env_with(env, vars), true)
+  expect(err).to_be_nil()
+  return strings.replace_all(strings.trim_suffix(p.output, "\n"), W, "$W"), p.code
+}
+
+fn caju(args: []str) -> (str, int) {
+  o, c := caju_env([]str{}, args)
+  return o, c
+}
+
+fn active() -> str {
+  t, _ := fs.readlink(W + "/home/current")
+  return t
+}
+
+fn run_bin() -> str {
+  p, _ := os.run([]str{W + "/bin/caju", "version"}, nil, true)
+  return strings.trim_space(p.output)
+}
+
+let NOTE = "\nnote: the caju you ran is " + os.getenv("CAJU_BIN") + ", outside $W/home; the new one is $W/bin/caju"
+
+# the steps run in order: each one starts from what the previous ones left
+describe("caju upgrade", fn() {
+  it("--check tells that a newer release exists (pre-releases do not count)", fn() {
+    out, code := caju([]str{"upgrade", "--check"})
+    expect(out).to_equal("caju 0.8.0 is available (this is " + pkg.VERSION + "): caju upgrade")
+    expect(code).to_equal(0)
+  })
+  it("installs the latest signed release, activates it and links $CAJU_BIN_DIR/caju", fn() {
+    out, code := caju([]str{"upgrade"})
+    expect(out).to_equal("downloading caju 0.8.0...\ncaju " + pkg.VERSION + " -> 0.8.0 ($W/home/versions/0.8.0)" + NOTE)
+    expect(code).to_equal(0)
+    expect(active()).to_equal("versions/0.8.0")
+    t, _ := fs.readlink(W + "/bin/caju")
+    expect(t).to_equal(W + "/home/current/bin/caju")
+    expect(run_bin()).to_equal("caju 0.8.0")
+    expect(fs.is_dir(W + "/home/versions/0.8.0/lib")).to_be_true()
+  })
+  it("says so when the latest release is already active", fn() {
+    out, code := caju([]str{"upgrade"})
+    expect(out).to_equal("caju 0.8.0 is already the latest release")
+    expect(code).to_equal(0)
+  })
+  it("installs a given version, and remembers the previous one", fn() {
+    out, _ := caju([]str{"upgrade", "v0.7.0"})
+    expect(out).to_equal("downloading caju 0.7.0...\ncaju 0.8.0 -> 0.7.0 ($W/home/versions/0.7.0)\n`caju upgrade --rollback` goes back to 0.8.0" + NOTE)
+    expect(run_bin()).to_equal("caju 0.7.0")
+  })
+  it("--rollback goes back and forth without downloading", fn() {
+    out, _ := caju([]str{"upgrade", "--rollback"})
+    expect(out).to_equal("caju 0.7.0 -> 0.8.0")
+    expect(run_bin()).to_equal("caju 0.8.0")
+    out2, _ := caju([]str{"upgrade", "--rollback"})
+    expect(out2).to_equal("caju 0.8.0 -> 0.7.0")
+    expect(active()).to_equal("versions/0.7.0")
+  })
+  it("switches to an installed version without downloading it", fn() {
+    fs.remove_all(W + "/src/v0.8.0")
+    out, code := caju([]str{"upgrade", "0.8.0"})
+    expect(out).to_start_with("caju 0.7.0 -> 0.8.0 ($W/home/versions/0.8.0)")
+    expect(code).to_equal(0)
+    publish(W + "/src", "0.8.0", SEED)
+  })
+  it("refuses a release without a signature unless --allow-unsigned", fn() {
+    out, code := caju([]str{"upgrade", "0.5.0"})
+    expect(out).to_equal("downloading caju 0.5.0...\ncaju upgrade: caju 0.5.0 has no signature (releases before signing): refusing it; --allow-unsigned accepts it with only its SHA-256 check")
+    expect(code).to_equal(1)
+    expect(active()).to_equal("versions/0.8.0")
+    out2, code2 := caju([]str{"upgrade", "0.5.0", "--allow-unsigned"})
+    expect(out2).to_start_with("downloading caju 0.5.0...\nwarning: caju 0.5.0 is not signed; only its SHA-256 (from the same release) was checked\ncaju 0.8.0 -> 0.5.0")
+    expect(code2).to_equal(0)
+  })
+  it("--list shows the installed versions, the active and the previous one", fn() {
+    out, _ := caju([]str{"upgrade", "--list"})
+    expect(out).to_equal("* 0.5.0\n  0.7.0\n  0.8.0  (previous: --rollback)")
+  })
+  it("refuses a package changed after signing", fn() {
+    out, code := caju_env([]str{"CAJU_UPGRADE_SOURCE=" + W + "/bad"}, []str{"upgrade", "0.9.0"})
+    expect(out).to_equal("downloading caju 0.9.0...\ncaju upgrade: refusing caju 0.9.0: the downloaded package does not match its signature (SHA-256 differs)")
+    expect(code).to_equal(1)
+  })
+  it("refuses a release signed by a key it does not trust", fn() {
+    out, code := caju_env([]str{"CAJU_UPGRADE_SOURCE=" + W + "/bad"}, []str{"upgrade", "0.9.1"})
+    expect(out).to_equal("downloading caju 0.9.1...\ncaju upgrade: refusing caju 0.9.1: the release is signed by a key this caju does not trust (" + pub_hex(OTHER_SEED) + ")")
+    expect(code).to_equal(1)
+  })
+  it("refuses the valid signature of another version", fn() {
+    out, _ := caju_env([]str{"CAJU_UPGRADE_SOURCE=" + W + "/bad"}, []str{"upgrade", "0.9.2"})
+    expect(out).to_end_with("refusing caju 0.9.2: the signature is for version 0.7.0, not 0.9.2")
+  })
+  it("refuses a package with a symbolic link inside", fn() {
+    out, _ := caju_env([]str{"CAJU_UPGRADE_SOURCE=" + W + "/bad"}, []str{"upgrade", "0.9.3"})
+    expect(out).to_end_with("caju upgrade: the package has an entry that is not a file or directory: lib/passwd.caju")
+  })
+  it("refuses a package whose caju is another version", fn() {
+    out, _ := caju_env([]str{"CAJU_UPGRADE_SOURCE=" + W + "/bad"}, []str{"upgrade", "0.9.4"})
+    expect(out).to_end_with("caju upgrade: the package says it is caju 0.1.0, not caju 0.9.4")
+  })
+  it("leaves the active version and versions/ alone after a refusal", fn() {
+    expect(active()).to_equal("versions/0.5.0")
+    names, _ := fs.list_dir(W + "/home/versions")
+    expect(strings.join(names, " ")).to_equal("0.5.0 0.7.0 0.8.0")
+    leftovers, _ := fs.glob(W + "/home", ".upgrade-*")
+    expect(len(leftovers)).to_equal(0)
+  })
+  it("ignores a trusted key from CAJU_UPGRADE_KEY without CAJU_UPGRADE_SOURCE", fn() {
+    out, code := caju_env([]str{"CAJU_UPGRADE_SOURCE=", "CAJU_RELEASE_KEY=" + hex.encode(SEED)}, []str{"release", "verify", "--version", "0.7.0", W + "/src/v0.7.0/" + upgrade.ASSET})
+    expect(out).to_start_with("caju upgrade: the release is signed by a key this caju does not trust")
+    expect(code).to_equal(1)
+  })
+  it("asks before leaving the versions a project asks for, and --yes does not ask", fn() {
+    os.write_file(W + "/proj/caju.toml", "[package]\nname = \"github.com/me/proj\"\ncaju = \">=0.5.0, <0.8.0\"\n", 0o644)
+    out, code := caju([]str{"upgrade", "0.8.0"})
+    expect(out).to_equal("$W/proj/caju.toml needs caju >=0.5.0, <0.8.0, and caju 0.8.0 does not satisfy that.\ncaju upgrade: cancelled (--yes switches without asking)")
+    expect(code).to_equal(1)
+    expect(active()).to_equal("versions/0.5.0")
+    out2, code2 := caju([]str{"upgrade", "0.7.0"})
+    expect(out2).to_start_with("caju 0.5.0 -> 0.7.0")
+    expect(code2).to_equal(0)
+    out3, code3 := caju([]str{"upgrade", "0.8.0", "--yes"})
+    expect(out3).to_start_with("caju 0.7.0 -> 0.8.0")
+    expect(code3).to_equal(0)
+    fs.remove(W + "/proj/caju.toml")
+  })
+  it("--clean keeps only the active and the previous version", fn() {
+    out, _ := caju([]str{"upgrade", "--clean"})
+    expect(out).to_equal("removed 1 versions")
+    names, _ := fs.list_dir(W + "/home/versions")
+    expect(strings.join(names, " ")).to_equal("0.7.0 0.8.0")
+  })
+  it("--rollback without a previous version explains it", fn() {
+    out, code := caju_env([]str{"CAJU_HOME=" + W + "/empty"}, []str{"upgrade", "--rollback"})
+    expect(out).to_equal("caju upgrade: there is no previous version to go back to")
+    expect(code).to_equal(1)
+  })
+  it("moves an installation of the old install.sh to versions/ first", fn() {
+    h := W + "/flat"
+    fs.mkdir_all(h + "/bin", 0o755)
+    fs.mkdir_all(h + "/lib", 0o755)
+    fs.mkdir_all(h + "/pkg/github.com/a", 0o755)
+    os.write_file(h + "/bin/caju", "#!/bin/sh\necho \"caju 0.4.0\"\n", 0o755)
+    os.write_file(h + "/lib/os.caju", "# old\n", 0o644)
+    out, code := caju_env([]str{"CAJU_HOME=" + h}, []str{"upgrade", "0.7.0"})
+    expect(out).to_start_with("downloading caju 0.7.0...\ncaju 0.4.0 -> 0.7.0 ($W/flat/versions/0.7.0)\n`caju upgrade --rollback` goes back to 0.4.0")
+    expect(code).to_equal(0)
+    expect(fs.is_file(h + "/versions/0.4.0/bin/caju")).to_be_true()
+    expect(fs.is_file(h + "/versions/0.4.0/lib/os.caju")).to_be_true()
+    expect(fs.exists(h + "/bin")).to_be_false()
+    expect(fs.is_dir(h + "/pkg/github.com/a")).to_be_true()
+    out2, _ := caju_env([]str{"CAJU_HOME=" + h}, []str{"upgrade", "--rollback"})
+    expect(out2).to_equal("caju 0.7.0 -> 0.4.0")
+  })
+  it("does not check for releases when the output is not a terminal", fn() {
+    caju_env([]str{"CAJU_NO_UPDATE_CHECK=", "CAJU_HOME=" + W + "/quiet"}, []str{"version"})
+    expect(fs.exists(W + "/quiet/update-check")).to_be_false()
+  })
+})
+
+describe("caju release", fn() {
+  it("sign writes a .sig that verify and upgrade accept", fn() {
+    setup()
+    d := W + "/rel"
+    fs.mkdir_all(d, 0o755)
+    os.write_file(d + "/" + upgrade.ASSET, "package bytes", 0o644)
+    out, code := caju_env([]str{"CAJU_RELEASE_KEY=" + hex.encode(SEED)}, []str{"release", "sign", "--version", "v1.2.3", d + "/" + upgrade.ASSET})
+    expect(out).to_equal("signed $W/rel/" + upgrade.ASSET + ".sig")
+    expect(code).to_equal(0)
+    sig, _ := os.read_file(d + "/" + upgrade.ASSET + ".sig")
+    expect(upgrade.check_manifest(sig, "1.2.3", upgrade.ASSET, "package bytes", []str{pub_hex(SEED)})).to_be_nil()
+    out2, code2 := caju([]str{"release", "verify", "--version", "1.2.3", d + "/" + upgrade.ASSET})
+    expect(out2).to_equal("ok: $W/rel/" + upgrade.ASSET + " is signed by a release key")
+    expect(code2).to_equal(0)
+  })
+  it("sign refuses to run without a valid CAJU_RELEASE_KEY", fn() {
+    out, code := caju_env([]str{"CAJU_RELEASE_KEY="}, []str{"release", "sign", "--version", "1.0.0", W + "/rel/" + upgrade.ASSET})
+    expect(out).to_equal("caju upgrade: CAJU_RELEASE_KEY (the hex seed of the release key) is not set")
+    expect(code).to_equal(1)
+    out2, _ := caju_env([]str{"CAJU_RELEASE_KEY=abcd"}, []str{"release", "sign", "--version", "1.0.0", W + "/rel/" + upgrade.ASSET})
+    expect(out2).to_equal("caju upgrade: CAJU_RELEASE_KEY must be 64 hex digits")
+  })
+  it("keygen prints a seed and its public key", fn() {
+    out, _ := caju([]str{"release", "keygen"})
+    lines := strings.split(out, "\n")
+    expect(len(lines)).to_equal(2)
+    seed := unhex(lines[0][5:])
+    expect(lines[1]).to_equal("public " + pub_hex(seed))
+  })
+  it("cleans up", fn() {
+    fs.remove_all(W)
+  })
+})

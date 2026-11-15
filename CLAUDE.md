@@ -27,8 +27,9 @@ of the language are in English (a decision from the reorganization); keep it tha
 
 ```
 compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module table)
-  main.caju            the `caju` command (build, run, test, bench, check, pkg, mcp, version), declared with std/cli
+  main.caju            the `caju` command (build, run, test, bench, check, pkg, upgrade, mcp, version), declared with std/cli
   pkg.caju             the package manager (docs/packages.md)
+  upgrade.caju         `caju upgrade` (versions side by side, signed releases, daily check) and `caju release` (docs/upgrade.md)
   build_main.caju      only `build` (small driver)
   dump_main.caju       prints a stage's tree (parse, link, check) to compare with the JS
   *_test.caju          tests for the native compiler, the runtime, pkg and the Windows target

@@ -92,7 +92,7 @@ describe("compiler requirements", fn() {
     expect(meets("0.6.0", ">=0.6.0,")).to_start_with("error: invalid requirement")
   })
   it("explain which version is needed and which one is running", fn() {
-    expect(pkg.check_compiler_version("github.com/a/b@1.0.0", ">=0.7.0", "0.6.0")).to_be_error("github.com/a/b@1.0.0 needs caju >=0.7.0, but this is caju 0.6.0 (install another version: curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh)")
+    expect(pkg.check_compiler_version("github.com/a/b@1.0.0", ">=0.7.0", "0.6.0")).to_be_error("github.com/a/b@1.0.0 needs caju >=0.7.0, but this is caju 0.6.0 (switch with: caju upgrade <version>)")
     expect(pkg.check_compiler_version("x", "", "0.6.0")).to_be_nil()
     expect(pkg.check_compiler_version("x", "^0.6.0", "0.6.3")).to_be_nil()
   })

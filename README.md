@@ -21,11 +21,13 @@ Linux x86-64 (on Windows, use WSL; the Linux `caju` can also build `.exe` files 
 curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh
 ```
 
-The installer downloads the latest release, checks its SHA-256, installs it in `~/.caju` and creates
-the `~/.local/bin/caju` command. Variables: `CAJU_VERSION=0.1.0` (a specific version), `CAJU_HOME`,
-`CAJU_BIN_DIR`. To install by hand, download `caju-linux-x86_64.tar.gz` from
-[Releases](https://github.com/cajulang/cajulang/releases), extract it and put `caju-<version>/bin`
-on your `PATH`. To uninstall: `rm -rf ~/.caju ~/.local/bin/caju`.
+The installer downloads the latest release, checks its signature and SHA-256, installs it in
+`~/.caju/versions/<version>` and creates the `~/.local/bin/caju` command. Variables:
+`CAJU_VERSION=0.6.0` (a specific version), `CAJU_HOME`, `CAJU_BIN_DIR`. Afterwards, `caju upgrade`
+moves to the latest release (`caju upgrade 0.6.0` to a given one, `caju upgrade --rollback` back
+to the previous; see [docs/upgrade.md](docs/upgrade.md)). To install by hand, download
+`caju-linux-x86_64.tar.gz` from [Releases](https://github.com/cajulang/cajulang/releases), extract
+it and put `caju-<version>/bin` on your `PATH`. To uninstall: `rm -rf ~/.caju ~/.local/bin/caju`.
 
 ```sh
 caju run programa.caju              # compiles in memory and runs

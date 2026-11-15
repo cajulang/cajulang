@@ -5,8 +5,10 @@ The distribution is a Linux x86-64 package published in GitHub Releases:
 ```
 caju-linux-x86_64.tar.gz          caju-<version>/bin/caju, lib/, rt/, examples/, README.md
 caju-linux-x86_64.tar.gz.sha256
+caju-linux-x86_64.tar.gz.sig      the signed manifest (below)
 caju-wasm.tar.gz                  the compiler in WebAssembly (tools/wasm/package.sh, docs/wasm.md)
 caju-wasm.tar.gz.sha256
+caju-wasm.tar.gz.sig
 ```
 
 `caju` finds `lib/` and `rt/` in the directory above the binary (or in `CAJU_ROOT`). The symbolic
@@ -40,6 +42,33 @@ To test the installer without downloading anything:
 ```sh
 CAJU_PACKAGE=dist/caju-linux-x86_64.tar.gz CAJU_HOME=/tmp/c/.caju CAJU_BIN_DIR=/tmp/c/bin sh install.sh
 ```
+
+With a local package, `CAJU_RELEASE_PUBKEY=<hex>` trusts another key (sign a test package with a
+key from `caju release keygen` and `CAJU_RELEASE_KEY=<seed> build/caju release sign --version X
+dist/caju-linux-x86_64.tar.gz`).
+
+## The release key
+
+Every package is signed (`<package>.sig`, format in `compiler/upgrade.caju`): an Ed25519 signature
+over its version, file name and SHA-256. `caju upgrade` and `install.sh` accept only signatures by
+a key they carry: `RELEASE_KEYS` in `compiler/upgrade.caju` and `release_keys` in `install.sh`.
+The private key (a 32-byte seed, in hex) exists only in the repository secret `CAJU_RELEASE_KEY`;
+the workflow signs with `caju release sign` and checks with `caju release verify`, which fails if
+the compiler being released does not carry the public key.
+
+Creating the key (once):
+
+```sh
+build/caju release keygen > /dev/shm/caju-key      # "seed <hex>" and "public <hex>"
+sed -n 's/^seed //p' /dev/shm/caju-key | gh secret set CAJU_RELEASE_KEY -R cajulang/cajulang
+sed -n 's/^public //p' /dev/shm/caju-key           # goes into RELEASE_KEYS and release_keys
+shred -u /dev/shm/caju-key
+```
+
+Rotating it: add the new public key next to the old one, release, and only then sign with the new
+seed; remove the old public key a few releases later. A leaked seed: replace the secret, release a
+version whose `RELEASE_KEYS` has only the new key, and announce that releases signed with the old
+key after the leak must not be trusted.
 
 ## Current limitations
 

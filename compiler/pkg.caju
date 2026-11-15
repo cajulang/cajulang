@@ -161,7 +161,7 @@ export fn check_compiler_version(who: str, requirement: str, version: str) -> er
   clauses, err := parse_requirement(requirement)
   if err != nil { return errors.New(who + ": " + err.Error()) }
   if satisfies(version, clauses) { return nil }
-  return errors.New(who + " needs caju " + requirement + ", but this is caju " + version + " (install another version: curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh)")
+  return errors.New(who + " needs caju " + requirement + ", but this is caju " + version + " (switch with: caju upgrade <version>)")
 }
 
 # ---------------------------------------------------------------- names

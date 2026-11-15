@@ -17,6 +17,29 @@ notes from the section of its version here (`tools/changelog.sh`).
   `http.StreamHandler` (`stream_open`, `stream_data`, `stream_closed`; `Stream.write`,
   `Stream.close`), served by the event loop and never closed for being idle. `http.every(ms, f)`
   runs `f` periodically inside the loop.
+- `caju upgrade`: installs releases side by side in `~/.caju/versions/<version>` and switches
+  `~/.caju/current` atomically. `caju upgrade [version]`, `--rollback` (back to the previous
+  version, without downloading), `--list`, `--clean`, `--check`. Inside a project whose
+  `caju.toml` asks for other compiler versions it asks first (`--yes` does not). Interactive
+  commands check for a new release at most once a day, in the background
+  (`CAJU_NO_UPDATE_CHECK=1` turns it off; never in CI or without a terminal). `docs/upgrade.md`.
+- Signed releases: each package has a `.sig` (an Ed25519 signature over its version, file name
+  and SHA-256). `caju upgrade` refuses packages without a valid signature from the release key
+  (`--allow-unsigned` accepts older releases with only their SHA-256); `install.sh` checks it
+  with `openssl`. `caju release keygen|sign|verify` (hidden) is what the release workflow uses.
+- `std/crypto`: Ed25519 signatures (`ed25519_public_key`, `ed25519_sign`, `ed25519_verify`, RFC
+  8032; non-canonical signatures are refused).
+- `std/os`: `unix_time()` (the wall clock) and `is_terminal(fd)`.
+
+### Changed
+- `install.sh` installs into `~/.caju/versions/<version>` with `~/.caju/current` (an installation
+  made by the previous installer moves there, keeping `pkg/`), checks the release signature, uses
+  `curl --proto =https` and fails when it cannot compute the SHA-256 instead of skipping it.
+- A package that needs another compiler version suggests `caju upgrade <version>`.
+
+### Fixed
+- The release workflow no longer expands the tag name inside its shell scripts (a crafted tag
+  name could run commands).
 
 ## [0.6.0] - 2026-11-14
 

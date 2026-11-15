@@ -1,0 +1,614 @@
+# upgrade: `caju upgrade` installs releases of the compiler side by side and switches between
+# them; it also holds the daily check for a new release and `caju release` (the signing of the
+# release packages, used by .github/workflows/release.yml). See docs/upgrade.md.
+#
+# $CAJU_HOME (default ~/.caju):
+#   versions/<version>/              an installed release (bin/caju, lib/, rt/, examples/, docs/)
+#   current -> versions/<version>    the active one, switched atomically (rename of a symlink)
+#   previous                         the version active before the last switch (--rollback)
+#   pkg/                             the package cache (never touched here)
+#   update-check                     when the last check for a new release ran, and its result
+# $CAJU_BIN_DIR/caju (default ~/.local/bin/caju) -> $CAJU_HOME/current/bin/caju
+#
+# Every release is signed: next to caju-linux-x86_64.tar.gz it has caju-linux-x86_64.tar.gz.sig,
+#   caju-release 1
+#   version 0.7.0
+#   file caju-linux-x86_64.tar.gz
+#   sha256 <hex of the package>
+#   key <hex of the public key>
+#   signature <hex>                  Ed25519 over all the lines above (each with its "\n")
+# An upgrade installs a package only if its manifest is signed by one of RELEASE_KEYS, names
+# the version and file asked for, and has the SHA-256 of the downloaded bytes.
+
+import "std/os"
+import "std/fs"
+import "std/path"
+import "std/strings"
+import "std/crypto"
+import "std/hex"
+import "std/cli"
+import "pkg"
+
+export const ASSET = "caju-linux-x86_64.tar.gz"
+const REPO = "https://github.com/cajulang/cajulang"
+const DAY = 86400
+
+# the public keys (hex) whose signatures releases may carry; the private key of each lives only in
+# the secret CAJU_RELEASE_KEY of github.com/cajulang/cajulang (docs/releasing.md)
+let RELEASE_KEYS = []str{}
+
+# ---------------------------------------------------------------- where releases come from
+
+# CAJU_UPGRADE_SOURCE: a directory with v<version>/<files> in place of the GitHub releases (a
+# mirror, or the tests). With it, CAJU_UPGRADE_KEY adds a trusted public key (hex).
+fn source() -> str { return os.getenv("CAJU_UPGRADE_SOURCE") }
+
+fn trusted_keys() -> []str {
+  out := []str{}
+  for _, k := range RELEASE_KEYS { out = append(out, k) }
+  extra := os.getenv("CAJU_UPGRADE_KEY")
+  if source() != "" && extra != "" { out = append(out, strings.to_lower(extra)) }
+  return out
+}
+
+fn sort_versions(vs: []str) {
+  i := 1
+  while i < len(vs) {
+    j := i
+    while j > 0 && version_less(vs[j], vs[j - 1]) {
+      t := vs[j]
+      vs[j] = vs[j - 1]
+      vs[j - 1] = t
+      j--
+    }
+    i++
+  }
+}
+
+fn version_less(a: str, b: str) -> bool {
+  va, e1 := pkg.parse_version(a)
+  vb, e2 := pkg.parse_version(b)
+  if e1 != nil || e2 != nil { return a < b }
+  return pkg.compare_versions(va, vb) < 0
+}
+
+fn is_release(v: str) -> bool {
+  x, err := pkg.parse_version(v)
+  return err == nil && x.pre == ""
+}
+
+# the published versions (without pre-releases), oldest first
+export fn remote_versions() -> ([]str, error) {
+  out := []str{}
+  if source() != "" {
+    names, err := fs.list_dir(source())
+    if err != nil { return out, err }
+    for _, n := range names {
+      if strings.has_prefix(n, "v") && is_release(n[1:]) { out = append(out, n[1:]) }
+    }
+  } else {
+    r, err := os.run([]str{"git", "ls-remote", "--tags", "--refs", REPO}, nil, false)
+    if err != nil { return out, errors.New("git is needed to look for releases: " + err.Error()) }
+    if r.code != 0 { return out, errors.New("cannot list the releases of " + REPO + " (git ls-remote failed)") }
+    for _, line := range strings.split(r.output, "\n") {
+      i := strings.index(line, "refs/tags/v")
+      if i < 0 { continue }
+      v := strings.trim_space(line[i + 11:])
+      if is_release(v) { out = append(out, v) }
+    }
+  }
+  sort_versions(out)
+  return out, nil
+}
+
+export fn latest_version() -> (str, error) {
+  vs, err := remote_versions()
+  if err != nil { return "", err }
+  if len(vs) == 0 { return "", errors.New("no releases found") }
+  return vs[len(vs) - 1], nil
+}
+
+# downloads a file of a release to dest
+fn download(version: str, file: str, dest: str) -> error {
+  if source() != "" {
+    src := path.join_all([]str{source(), "v" + version, file})
+    if !fs.is_file(src) { return errors.New("not found: " + src) }
+    return fs.copy_file(src, dest)
+  }
+  url := REPO + "/releases/download/v" + version + "/" + file
+  r, err := os.run([]str{"curl", "-fsSL", "--proto", "=https", "--tlsv1.2", "--retry", "2", "-o", dest, url}, nil, true)
+  if err != nil {
+    r, err = os.run([]str{"wget", "-q", "--https-only", "-O", dest, url}, nil, true)
+    if err != nil { return errors.New("curl or wget is needed to download releases") }
+  }
+  if r.code != 0 { return errors.New("download failed: " + url) }
+  return nil
+}
+
+# ---------------------------------------------------------------- signed manifests
+
+# the .sig file of a package: the manifest lines, signed with seed (32 bytes)
+export fn sign_manifest(version: str, file: str, data: str, seed: str) -> (str, error) {
+  pub, err := crypto.ed25519_public_key(seed)
+  if err != nil { return "", err }
+  body := "caju-release 1\nversion " + version + "\nfile " + file + "\nsha256 " + crypto.sha256_hex(data) + "\nkey " + hex.encode(pub) + "\n"
+  sig, err2 := crypto.ed25519_sign(seed, body)
+  if err2 != nil { return "", err2 }
+  return body + "signature " + hex.encode(sig) + "\n", nil
+}
+
+# checks a .sig file against the package bytes: signed by one of keys, for this version and file
+export fn check_manifest(text: str, version: str, file: str, data: str, keys: []str) -> error {
+  i := strings.index(text, "signature ")
+  if i < 0 || (i > 0 && text[i - 1] != 10) { return errors.New("the signature file has no signature line") }
+  body := text[0:i]
+  sig, err := hex.decode(strings.trim_space(text[i + 10:]))
+  if err != nil || len(sig) != 64 { return errors.New("the signature file has a malformed signature") }
+  fields := map[str]str{}
+  lines := strings.split(strings.trim_suffix(body, "\n"), "\n")
+  if len(lines) == 0 || lines[0] != "caju-release 1" { return errors.New("not a caju release signature (or a newer format: upgrade by hand with install.sh)") }
+  for _, l := range lines[1:] {
+    sp := strings.index(l, " ")
+    if sp <= 0 { return errors.New("malformed line in the signature file: " + l) }
+    fields[l[0:sp]] = l[sp + 1:]
+  }
+  key := strings.to_lower(fields["key"])
+  trusted := false
+  for _, k := range keys {
+    if k == key { trusted = true }
+  }
+  if !trusted { return errors.New("the release is signed by a key this caju does not trust (" + key + ")") }
+  pub, err2 := hex.decode(key)
+  if err2 != nil { return errors.New("malformed key in the signature file") }
+  if !crypto.ed25519_verify(pub, body, sig) { return errors.New("invalid signature: the release files were changed after signing") }
+  if fields["version"] != version { return errors.New("the signature is for version " + fields["version"] + ", not " + version) }
+  if fields["file"] != file { return errors.New("the signature is for " + fields["file"] + ", not " + file) }
+  if !crypto.constant_time_eq(fields["sha256"], crypto.sha256_hex(data)) { return errors.New("the downloaded package does not match its signature (SHA-256 differs)") }
+  return nil
+}
+
+# ---------------------------------------------------------------- the installations
+
+fn versions_dir() -> str { return path.join(pkg.home(), "versions") }
+fn version_dir(v: str) -> str { return path.join(versions_dir(), v) }
+fn current_link() -> str { return path.join(pkg.home(), "current") }
+
+fn bin_dir() -> str {
+  d := os.getenv("CAJU_BIN_DIR")
+  if d != "" { return d }
+  return path.join_all([]str{os.getenv("HOME"), ".local", "bin"})
+}
+
+# the versions in versions/, oldest first
+export fn installed() -> []str {
+  out := []str{}
+  names, err := fs.list_dir(versions_dir())
+  if err != nil { return out }
+  for _, n := range names {
+    if fs.is_file(path.join_all([]str{versions_dir(), n, "bin", "caju"})) { out = append(out, n) }
+  }
+  sort_versions(out)
+  return out
+}
+
+# the active version (current -> versions/<v>), or ""
+export fn current() -> str {
+  t, err := fs.readlink(current_link())
+  if err != nil { return "" }
+  return path.base(t)
+}
+
+fn previous() -> str {
+  s, err := os.read_file(path.join(pkg.home(), "previous"))
+  if err != nil { return "" }
+  return strings.trim_space(s)
+}
+
+# moves an installation made by an older install.sh (the release spread over $CAJU_HOME: bin/,
+# lib/, rt/...) to versions/<its version>/ and points current at it
+fn migrate_flat() -> error {
+  home := pkg.home()
+  old_bin := path.join_all([]str{home, "bin", "caju"})
+  fi, err := fs.lstat(old_bin)
+  if err != nil || !fi.is_file { return nil }
+  r, err2 := os.run([]str{old_bin, "version"}, without_root(), false)
+  if err2 != nil || r.code != 0 { return errors.New("cannot run the installed " + old_bin) }
+  v := strings.trim_prefix(strings.trim_space(r.output), "caju ")
+  dest := version_dir(v)
+  err = fs.mkdir_all(dest, 0o755)
+  if err != nil { return err }
+  for _, n := range []str{"bin", "lib", "rt", "examples", "docs", "README.md", "CHANGELOG.md", "LICENSE"} {
+    src := path.join(home, n)
+    if !os.exists(src) || os.exists(path.join(dest, n)) { continue }
+    err = fs.rename(src, path.join(dest, n))
+    if err != nil { return err }
+  }
+  if current() == "" { return switch_to(v, false) }
+  return nil
+}
+
+fn without_root() -> []str {
+  out := []str{}
+  for _, e := range os.environ() {
+    if !strings.has_prefix(e, "CAJU_ROOT=") { out = append(out, e) }
+  }
+  return out
+}
+
+# makes v the active version (atomically) and $CAJU_BIN_DIR/caju point to it
+fn switch_to(v: str, remember: bool) -> error {
+  home := pkg.home()
+  old := current()
+  if remember && old != "" && old != v {
+    err := os.write_file(path.join(home, "previous"), old + "\n", 0o644)
+    if err != nil { return err }
+  }
+  tmp := current_link() + ".new"
+  fs.remove(tmp)
+  err := fs.symlink(path.join("versions", v), tmp)
+  if err != nil { return err }
+  err = fs.rename(tmp, current_link())
+  if err != nil { return err }
+  return link_bin()
+}
+
+# $CAJU_BIN_DIR/caju -> $CAJU_HOME/current/bin/caju (a regular file there is left alone)
+fn link_bin() -> error {
+  want := path.join_all([]str{pkg.home(), "current", "bin", "caju"})
+  link := path.join(bin_dir(), "caju")
+  fi, err := fs.lstat(link)
+  if err == nil {
+    if !fi.is_symlink { return nil }
+    t, _ := fs.readlink(link)
+    if t == want { return nil }
+  }
+  err = fs.mkdir_all(bin_dir(), 0o755)
+  if err != nil { return err }
+  tmp := link + ".new"
+  fs.remove(tmp)
+  err = fs.symlink(want, tmp)
+  if err != nil { return err }
+  return fs.rename(tmp, link)
+}
+
+# every path under dir must be a directory or a regular file (no links, devices, fifos)
+fn check_tree(dir: str) -> error {
+  entries, err := fs.walk(dir)
+  if err != nil { return err }
+  for _, rel := range entries {
+    fi, err2 := fs.lstat(path.join(dir, rel))
+    if err2 != nil { return err2 }
+    if !fi.is_dir && !fi.is_file { return errors.New("the package has an entry that is not a file or directory: " + rel) }
+  }
+  return nil
+}
+
+# downloads, verifies and unpacks a release into versions/<v>
+fn fetch_release(v: str, allow_unsigned: bool) -> error {
+  home := pkg.home()
+  err := fs.mkdir_all(versions_dir(), 0o755)
+  if err != nil { return err }
+  tmp, err2 := fs.temp_dir(home, ".upgrade-")
+  if err2 != nil { return err2 }
+  defer fn() { fs.remove_all(tmp) }()
+  tarball := path.join(tmp, ASSET)
+  os.eprintln("downloading caju " + v + "...")
+  err = download(v, ASSET, tarball)
+  if err != nil { return err }
+  data, err3 := os.read_file(tarball)
+  if err3 != nil { return err3 }
+  sig_file := path.join(tmp, ASSET + ".sig")
+  err = download(v, ASSET + ".sig", sig_file)
+  if err == nil {
+    text, _ := os.read_file(sig_file)
+    err = check_manifest(text, v, ASSET, data, trusted_keys())
+    if err != nil { return errors.New("refusing caju " + v + ": " + err.Error()) }
+  } else {
+    if !allow_unsigned { return errors.New("caju " + v + " has no signature (releases before signing): refusing it; --allow-unsigned accepts it with only its SHA-256 check") }
+    sum_file := path.join(tmp, ASSET + ".sha256")
+    err = download(v, ASSET + ".sha256", sum_file)
+    if err != nil { return errors.New("caju " + v + " has neither a signature nor a checksum") }
+    sums, _ := os.read_file(sum_file)
+    if !strings.has_prefix(strings.trim_space(sums), crypto.sha256_hex(data)) { return errors.New("the downloaded package does not match its SHA-256") }
+    os.eprintln("warning: caju " + v + " is not signed; only its SHA-256 (from the same release) was checked")
+  }
+  out := path.join(tmp, "x")
+  err = fs.mkdir_all(out, 0o755)
+  if err != nil { return err }
+  r, err4 := os.run([]str{"tar", "-C", out, "--no-same-owner", "-xzf", tarball}, nil, true)
+  if err4 != nil { return errors.New("tar is needed to unpack the release") }
+  if r.code != 0 { return errors.New("cannot unpack the release: " + strings.trim_space(r.output)) }
+  top := path.join(out, "caju-" + v)
+  names, _ := fs.list_dir(out)
+  if len(names) != 1 || !fs.is_dir(top) { return errors.New("unexpected package layout (expected only caju-" + v + "/)") }
+  err = check_tree(top)
+  if err != nil { return err }
+  exe := path.join_all([]str{top, "bin", "caju"})
+  rv, err5 := os.run([]str{exe, "version"}, without_root(), false)
+  if err5 != nil || rv.code != 0 { return errors.New("the new caju does not run on this machine") }
+  if strings.trim_space(rv.output) != "caju " + v { return errors.New("the package says it is " + strings.trim_space(rv.output) + ", not caju " + v) }
+  dest := version_dir(v)
+  if os.exists(dest) {
+    err = fs.remove_all(dest)
+    if err != nil { return err }
+  }
+  return fs.rename(top, dest)
+}
+
+# the version that a project (the caju.toml of the current directory or a parent) asks for, if v
+# does not satisfy it: "" when there is no project, no requirement, or v satisfies it
+fn project_conflict(v: str) -> str {
+  root := pkg.find_root(".")
+  if root == "" { return "" }
+  m, err := pkg.read_manifest(root)
+  if err != nil || m.caju == "" { return "" }
+  clauses, err2 := pkg.parse_requirement(m.caju)
+  if err2 != nil || pkg.satisfies(v, clauses) { return "" }
+  return path.join(root, "caju.toml") + " needs caju " + m.caju
+}
+
+fn confirm(question: str) -> bool {
+  if !os.is_terminal(0) { return false }
+  os.stderr(question + " [y/N] ")
+  line, ok := os.read_line()
+  if !ok { return false }
+  a := strings.to_lower(strings.trim_space(line))
+  return a == "y" || a == "yes" || a == "s" || a == "sim"
+}
+
+export struct Options {
+  version: str           # "" for the latest release
+  yes: bool              # no questions
+  allow_unsigned: bool   # accept releases without a signature (only their SHA-256)
+}
+
+# `caju upgrade [version]`: installs (if needed) and activates a version; returns a report
+export fn upgrade(o: *Options) -> (str, error) {
+  err := migrate_flat()
+  if err != nil { return "", err }
+  before := current()
+  if before == "" { before = pkg.VERSION }
+  v := strings.trim_prefix(o.version, "v")
+  if v == "" {
+    latest, err2 := latest_version()
+    if err2 != nil { return "", err2 }
+    v = latest
+    if !version_less(before, v) && os.exists(version_dir(before)) { return "caju " + before + " is already the latest release", nil }
+  } else {
+    _, err3 := pkg.parse_version(v)
+    if err3 != nil { return "", err3 }
+  }
+  if v == current() { return "caju " + v + " is already active", nil }
+  conflict := project_conflict(v)
+  if conflict != "" && !o.yes {
+    os.eprintln(conflict + ", and caju " + v + " does not satisfy that.")
+    if !confirm("Switch to caju " + v + " anyway?") { return "", errors.New("cancelled (--yes switches without asking)") }
+  }
+  if !fs.is_file(path.join_all([]str{version_dir(v), "bin", "caju"})) {
+    err = fetch_release(v, o.allow_unsigned)
+    if err != nil { return "", err }
+  }
+  err = switch_to(v, true)
+  if err != nil { return "", err }
+  write_state(state_checked(), v, 0)
+  out := "caju " + before + " -> " + v + " (" + version_dir(v) + ")"
+  if before != v && os.exists(version_dir(before)) { out = out + "\n`caju upgrade --rollback` goes back to " + before }
+  exe := os.executable()
+  if !strings.has_prefix(exe, pkg.home() + "/") {
+    out = out + "\nnote: the caju you ran is " + exe + ", outside " + pkg.home() + "; the new one is " + path.join(bin_dir(), "caju")
+  }
+  return out, nil
+}
+
+# `caju upgrade --rollback`: back to the version that was active before the last switch
+export fn rollback() -> (str, error) {
+  p := previous()
+  if p == "" { return "", errors.New("there is no previous version to go back to") }
+  if !fs.is_file(path.join_all([]str{version_dir(p), "bin", "caju"})) { return "", errors.New("caju " + p + " is no longer installed (caju upgrade " + p + " installs it again)") }
+  cur := current()
+  err := switch_to(p, true)
+  if err != nil { return "", err }
+  return "caju " + cur + " -> " + p, nil
+}
+
+# `caju upgrade --list`
+export fn list_report() -> str {
+  vs := installed()
+  if len(vs) == 0 { return "no versions installed in " + versions_dir() + " (this caju is " + pkg.VERSION + ", at " + os.executable() + ")" }
+  cur := current()
+  prev := previous()
+  lines := []str{}
+  for _, v := range vs {
+    mark := "  "
+    note := ""
+    if v == cur { mark = "* " }
+    if v == prev { note = "  (previous: --rollback)" }
+    lines = append(lines, mark + v + note)
+  }
+  return strings.join(lines, "\n")
+}
+
+# `caju upgrade --clean`: removes the versions other than the active and the previous one
+export fn clean() -> (str, error) {
+  cur := current()
+  prev := previous()
+  n := 0
+  for _, v := range installed() {
+    if v == cur || v == prev { continue }
+    err := fs.remove_all(version_dir(v))
+    if err != nil { return "", err }
+    n++
+  }
+  return "removed " + str(n) + " versions", nil
+}
+
+# ---------------------------------------------------------------- the daily check
+
+fn state_file() -> str { return path.join(pkg.home(), "update-check") }
+
+fn read_state() -> map[str]str {
+  out := map[str]str{}
+  s, err := os.read_file(state_file())
+  if err != nil { return out }
+  for _, l := range strings.split(s, "\n") {
+    sp := strings.index(l, " ")
+    if sp > 0 { out[l[0:sp]] = l[sp + 1:] }
+  }
+  return out
+}
+
+fn state_int(m: map[str]str, k: str) -> int {
+  s := m[k]
+  n := 0
+  i := 0
+  while i < len(s) {
+    c := int(s[i])
+    if c < 48 || c > 57 { return 0 }
+    n = n * 10 + c - 48
+    i++
+  }
+  return n
+}
+
+fn state_checked() -> int { return state_int(read_state(), "checked") }
+
+fn write_state(checked: int, latest: str, notified: int) {
+  fs.mkdir_all(pkg.home(), 0o755)
+  os.write_file(state_file(), "checked " + str(checked) + "\nlatest " + latest + "\nnotified " + str(notified) + "\n", 0o644)
+}
+
+# `caju upgrade --check`: asks for the latest release now; returns a line for the user
+export fn check(quiet: bool) -> (str, error) {
+  latest, err := latest_version()
+  st := read_state()
+  if err != nil {
+    write_state(os.unix_time(), st["latest"], state_int(st, "notified"))
+    return "", err
+  }
+  write_state(os.unix_time(), latest, state_int(st, "notified"))
+  if version_less(pkg.VERSION, latest) { return "caju " + latest + " is available (this is " + pkg.VERSION + "): caju upgrade", nil }
+  return "caju " + pkg.VERSION + " is the latest release", nil
+}
+
+fn check_enabled() -> bool {
+  if os.getenv("CAJU_NO_UPDATE_CHECK") != "" || os.getenv("CI") != "" { return false }
+  return os.is_terminal(2)
+}
+
+# before an interactive command: at most once a day, tells about a newer release found by the
+# last check, and starts the next check in the background (its result shows on a later run)
+export fn notice() {
+  if !check_enabled() { return }
+  now := os.unix_time()
+  st := read_state()
+  latest := st["latest"]
+  notified := state_int(st, "notified")
+  checked := state_int(st, "checked")
+  if latest != "" && is_release(latest) && version_less(pkg.VERSION, latest) && now - notified >= DAY {
+    os.eprintln("caju " + latest + " is available (this is " + pkg.VERSION + "): caju upgrade")
+    notified = now
+    write_state(checked, latest, notified)
+  }
+  if now - checked < DAY { return }
+  # recorded first, so that commands run meanwhile do not start more checks
+  write_state(now, latest, notified)
+  os.run([]str{"sh", "-c", "\"$0\" upgrade --check --background </dev/null >/dev/null 2>&1 &", os.executable()}, nil, false)
+}
+
+# ---------------------------------------------------------------- the command line
+
+fn die(msg: str) {
+  os.eprintln("caju upgrade: " + msg)
+  os.exit(1)
+}
+
+fn print_or_die(out: str, err: error) {
+  if err != nil { die(err.Error()) }
+  if out != "" { print(out) }
+}
+
+fn release_seed() -> str {
+  k := strings.trim_space(os.getenv("CAJU_RELEASE_KEY"))
+  if k == "" { die("CAJU_RELEASE_KEY (the hex seed of the release key) is not set") }
+  seed, err := hex.decode(k)
+  if err != nil || len(seed) != 32 { die("CAJU_RELEASE_KEY must be 64 hex digits") }
+  return seed
+}
+
+export fn register(app: *cli.Command) {
+  u := app.sub("upgrade", "Install another version of caju and switch to it (default: the latest)")
+  u.describe("Versions are installed side by side in $CAJU_HOME/versions (default ~/.caju) and\n$CAJU_HOME/current points to the active one. Releases must be signed with the Caju\nrelease key. Once a day, interactive commands check for a new release in the background\n(CAJU_NO_UPDATE_CHECK=1 turns it off; never in CI). See docs/upgrade.md.")
+  u.arg_opt("version", "a version to install or switch to, like 0.7.0")
+  u.flag_bool("check", "", "only say whether a newer release exists")
+  u.flag_bool("rollback", "", "go back to the version active before the last switch")
+  u.flag_bool("list", "", "list the installed versions")
+  u.flag_bool("clean", "", "remove the installed versions except the active and the previous one")
+  u.flag_bool("yes", "y", "do not ask (a project whose caju.toml asks for another version)")
+  u.flag_bool("allow-unsigned", "", "accept a release without a signature (older than signing), checking only its SHA-256")
+  u.flag_bool("background", "", "the daily check, run by caju itself").hidden()
+  u.example("caju upgrade", "the latest release")
+  u.example("caju upgrade 0.6.0", "a given version (installed if needed)")
+  u.example("caju upgrade --rollback", "back to the previous version, without downloading")
+  u.action(fn(m: *cli.Match) {
+    if m.bool("background") {
+      check(true)
+      return
+    }
+    if m.bool("check") {
+      out, err := check(false)
+      print_or_die(out, err)
+      return
+    }
+    if m.bool("list") {
+      print(list_report())
+      return
+    }
+    if m.bool("rollback") {
+      out, err := rollback()
+      print_or_die(out, err)
+      return
+    }
+    if m.bool("clean") {
+      out, err := clean()
+      print_or_die(out, err)
+      return
+    }
+    out, err := upgrade(&Options{version: m.arg("version"), yes: m.bool("yes"), allow_unsigned: m.bool("allow-unsigned")})
+    print_or_die(out, err)
+  })
+
+  r := app.sub("release", "Sign and verify release packages (the release workflow)").hidden()
+  r.sub("keygen", "Print a new release key: the seed (secret) and the public key").action(fn(m: *cli.Match) {
+    seed, err := crypto.random_bytes(32)
+    if err != nil { die(err.Error()) }
+    pub, _ := crypto.ed25519_public_key(seed)
+    print("seed " + hex.encode(seed))
+    print("public " + hex.encode(pub))
+  })
+  s := r.sub("sign", "Write <file>.sig for a package, with the key in CAJU_RELEASE_KEY")
+  s.flag_str("version", "", "version", "", "the version of the package").required()
+  s.arg("file", "the package, like dist/caju-linux-x86_64.tar.gz")
+  s.action(fn(m: *cli.Match) {
+    file := m.arg("file")
+    data, err := os.read_file(file)
+    if err != nil { die(err.Error()) }
+    text, err2 := sign_manifest(strings.trim_prefix(m.str("version"), "v"), path.base(file), data, release_seed())
+    if err2 != nil { die(err2.Error()) }
+    err = os.write_file(file + ".sig", text, 0o644)
+    if err != nil { die(err.Error()) }
+    print("signed " + file + ".sig")
+  })
+  vf := r.sub("verify", "Check <file>.sig against the release keys built into this caju")
+  vf.flag_str("version", "", "version", "", "the version of the package").required()
+  vf.arg("file", "the package")
+  vf.action(fn(m: *cli.Match) {
+    file := m.arg("file")
+    data, err := os.read_file(file)
+    if err != nil { die(err.Error()) }
+    text, err2 := os.read_file(file + ".sig")
+    if err2 != nil { die(err2.Error()) }
+    err = check_manifest(text, strings.trim_prefix(m.str("version"), "v"), path.base(file), data, trusted_keys())
+    if err != nil { die(err.Error()) }
+    print("ok: " + file + " is signed by a release key")
+  })
+}

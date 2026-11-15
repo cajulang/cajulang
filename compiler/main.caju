@@ -14,6 +14,7 @@ import "project"
 import "native"
 import "wasm"
 import "pkg"
+import "upgrade"
 import "mcp"
 import "std/fs"
 import filepath "std/path"
@@ -365,8 +366,16 @@ c_check.arg("file", "the entry .caju file")
 c_check.action(fn(m: *cli.Match) { mcp.command_check(m.arg("file"), m.bool("json"), root() + "/lib") })
 
 pkg.register(app)
+upgrade.register(app)
 
 app.sub("mcp", "Serve the Model Context Protocol on stdin/stdout, for AI assistants").action(fn(m: *cli.Match) { mcp.serve(root(), os.executable()) })
 app.sub("version", "Show the version").action(fn(m: *cli.Match) { print("caju " + pkg.VERSION) })
 
-app.run(os.args()[1:])
+# the commands a person runs by hand tell, at most once a day, about a newer release
+args := os.args()[1:]
+if len(args) > 0 {
+  switch args[0] {
+  case "build", "run", "test", "check", "pkg", "version": upgrade.notice()
+  }
+}
+app.run(args)
