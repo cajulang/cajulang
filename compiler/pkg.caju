@@ -21,7 +21,7 @@ import "std/cli"
 import "std/strconv"
 import "project"
 
-export const VERSION = "0.6.0"     # the version of the compiler (caju version)
+export const VERSION = "0.7.0"     # the version of the compiler (caju version)
 const LOCK_VERSION = 1
 
 # ---------------------------------------------------------------- versions (semver)

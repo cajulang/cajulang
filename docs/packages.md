@@ -54,7 +54,7 @@ It is checked for the project and for every package it depends on, directly or n
   clear error with an older compiler instead of a compile error in some package.
 
 ```
-caju pkg: github.com/acme/greet@1.0.0 needs caju >=0.7.0, but this is caju 0.6.0 (install another version: curl -fsSL https://raw.githubusercontent.com/cajulang/cajulang/main/install.sh | sh)
+caju pkg: github.com/acme/greet@1.0.0 needs caju >=0.7.0, but this is caju 0.6.0 (switch with: caju upgrade <version>)
 ```
 
 Version selection does not look for an older release of a package that would suit the compiler:
