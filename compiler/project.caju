@@ -25,7 +25,11 @@ export struct Package {
   name: str
   dir: str
   entry: str      # the file imported by `import "<name>"`, relative to dir
+  platforms: []str  # the targets its caju.toml allows (empty: any)
 }
+
+# the platforms of the packages of the project loaded last (name -> targets), for compiler/platform
+export let package_platforms = map[str][]str{}
 
 # the package that a file (by its import name) belongs to, or ""
 fn package_of(pkgs: map[str]*Package, name: str) -> str {
@@ -127,6 +131,8 @@ export fn load_project(entry: str, lib_dir: str) -> []*ast.SourceFile { return l
 export fn load_project_with(entry: str, lib_dir: str, pkgs: map[str]*Package) -> []*ast.SourceFile {
   abs := absolute(entry)
   ld := &Loader{base: dir_name(abs), lib_dir: lib_dir, files: []*ast.SourceFile{}, seen: map[str]bool{}, pkgs: pkgs}
+  package_platforms = map[str][]str{}
+  if pkgs != nil { for n, pk := range pkgs { if len(pk.platforms) > 0 { package_platforms[n] = pk.platforms } } }
   ld.add(base_name(entry), abs)
   return ld.files
 }

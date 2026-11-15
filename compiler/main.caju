@@ -214,7 +214,7 @@ fn cmd_test(record: bool, verbose: bool, filter: str, target: str, paths: []str)
   for _, f := range files {
     image, msg := compile_as(f, target, true)
     if image == nil {
-      if strings.contains(msg, "not supported yet") {
+      if strings.contains(msg, "not supported yet") || strings.has_prefix(msg, "Platform error") {
         print("skip " + f + ": " + msg)
         continue
       }

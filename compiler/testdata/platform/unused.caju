@@ -1,0 +1,2 @@
+import "./linux_only"
+print("imported, never called")

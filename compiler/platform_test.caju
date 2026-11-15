@@ -1,0 +1,54 @@
+# Platforms (platform.caju): code that declares where it runs (# caju:platforms, caju.toml's
+# platforms, system calls on Windows) is refused at compile time when the program can reach it
+# on another target; imported but unreachable code is fine.
+import "std/os"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+# builds testdata/platform/<name>.caju for target: "ok", or the first line of the error
+fn build(name: str, target: str) -> str {
+  out := os.getenv("TMPDIR")
+  if out == "" { out = "/tmp" }
+  out = out + "/caju-platform-test-" + str(os.getpid())
+  p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "--target", target, "-o", out, "testdata/platform/" + name + ".caju"}, nil, true)
+  os.remove(out)
+  if err != nil { return err.Error() }
+  if p.code == 0 { return "ok" }
+  return strings.split(strings.trim_space(p.output), "\n")[0]
+}
+
+describe("platforms", fn() {
+  it("let a module be imported anywhere when nothing reachable calls it", fn() {
+    expect(build("unused", "wasm")).to_equal("ok")
+    expect(build("unused", "windows")).to_equal("ok")
+  })
+  it("refuse a call that reaches a module declared for other targets, with the chain", fn() {
+    expect(build("called", "linux")).to_equal("ok")
+    expect(build("called", "wasm")).to_equal("Platform error in called.caju, line 2: linux_only.also_native (./linux_only) is not available when compiling for wasm: it runs on linux (declared in its header). Called through go_native → linux_only.also_native.")
+  })
+  it("take a function's own declaration over its file's", fn() {
+    expect(build("func_level", "wasm")).to_equal("ok")
+    expect(build("func_level", "windows")).to_start_with("Platform error in func_level.caju, line 3: mixed.not_windows (./mixed) is not available when compiling for windows: it runs on linux, wasm (declared above it).")
+  })
+  it("follow interface calls only to the types the program constructs", fn() {
+    expect(build("iface", "wasm")).to_equal("ok")
+    expect(build("iface_native", "wasm")).to_start_with("Platform error in iface_native.caju, line 2: mixed.Native.speak (./mixed) is not available when compiling for wasm")
+  })
+  it("follow function values", fn() {
+    expect(build("fnvalue", "wasm")).to_start_with("Platform error in fnvalue.caju, line 2: linux_only.native_only")
+  })
+  it("refuse Linux system calls on Windows, but not functions that make none", fn() {
+    expect(build("syscalls", "windows")).to_start_with("Platform error in syscalls.caju, line 3: os.read_file (std/os) is not available when compiling for windows: it runs on linux, wasm (it makes Linux system calls).")
+    expect(build("syscalls", "wasm")).to_equal("ok")
+    expect(build("pure", "windows")).to_equal("ok")
+  })
+  it("refuse std/net (sockets) in WebAssembly, while std/http's helpers stay usable", fn() {
+    expect(build("http_client", "wasm")).to_start_with("Platform error in http_client.caju, line 3: net.dial_timeout (std/net) is not available when compiling for wasm: it runs on linux (declared in its header). Called through get → http.get")
+    expect(build("pure", "wasm")).to_equal("ok")
+  })
+  it("make caju test skip a test file that needs another platform", fn() {
+    p, _ := os.run([]str{os.getenv("CAJU_BIN"), "test", "testdata/platform/wasm_only_test.caju"}, nil, true)
+    expect(p.output).to_start_with("skip testdata/platform/wasm_only_test.caju: Platform error")
+    expect(p.code).to_equal(0)
+  })
+})

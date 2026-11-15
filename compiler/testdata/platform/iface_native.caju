@@ -1,0 +1,4 @@
+import "./mixed"
+fn say(s: mixed.Speaker) -> str { return s.speak() }
+print(say(&mixed.Plain{}))
+print(say(&mixed.Native{}))

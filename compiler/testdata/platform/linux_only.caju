@@ -1,0 +1,5 @@
+# caju:platforms linux
+# a module that only runs on Linux
+
+export fn native_only() -> str { return "native" }
+export fn also_native() -> str { return native_only() }

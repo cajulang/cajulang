@@ -1,0 +1,3 @@
+import "./linux_only"
+let f = linux_only.native_only
+print(f())

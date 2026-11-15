@@ -1,0 +1,7 @@
+import "std/http"
+import "std/path"
+import "std/crypto"
+import "std/json"
+print(http.query_escape("a b") + path.join("a", "b") + crypto.sha256_hex("x"))
+s, _ := json.marshal([]int{1})
+print(s)

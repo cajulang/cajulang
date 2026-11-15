@@ -1,5 +1,7 @@
 # std/net: TCP sockets over IPv4 (Linux x86-64), and host names resolved to IPv4 addresses
 # (/etc/hosts, then the DNS servers of /etc/resolv.conf).
+#
+# caju:platforms linux       (sockets and epoll: not in the WebAssembly host, not on Windows yet)
 
 import "std/strings"
 import "std/strconv"

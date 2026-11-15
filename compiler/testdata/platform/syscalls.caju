@@ -1,0 +1,6 @@
+import "std/os"
+fn load() -> str {
+  s, _ := os.read_file("x")
+  return s
+}
+print(load())

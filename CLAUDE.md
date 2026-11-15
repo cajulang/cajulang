@@ -29,6 +29,7 @@ of the language are in English (a decision from the reorganization); keep it tha
 compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module table)
   main.caju            the `caju` command (build, run, test, bench, check, pkg, upgrade, mcp, version), declared with std/cli
   pkg.caju             the package manager (docs/packages.md)
+  platform.caju        refuses code the target cannot run (# caju:platforms, docs/platforms.md)
   upgrade.caju         `caju upgrade` (versions side by side, signed releases, daily check) and `caju release` (docs/upgrade.md)
   build_main.caju      only `build` (small driver)
   dump_main.caju       prints a stage's tree (parse, link, check) to compare with the JS
@@ -77,8 +78,8 @@ expect(v).to_equal(w) }) })`. There are no `.out` files. Compile/run errors of a
 `run_file("testdata/x.caju")` → `r.output`, `r.code`. Known bug not fixed yet: write the correct
 test with `skip("... (known bug)", ...)`.
 
-In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`, `http`, `http_client`,
-`websocket` and `tls` (no sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
+In wasm (`--target wasm tests/lang lib examples`) the tests that need sockets (`net`, `http`, `http_client`,
+`websocket`, `tls`) are skipped (docs/platforms.md) or fail only where they test sockets. Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
 Expected result today: **888 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows

@@ -1,0 +1,3 @@
+import "./linux_only"
+fn go_native() -> str { return linux_only.also_native() }
+print(go_native())

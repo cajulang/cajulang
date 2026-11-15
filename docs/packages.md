@@ -175,3 +175,10 @@ code that differs from what was published:
   if a package file uses a relative path.
 - The standard library is imported as usual (`import "std/strings"`).
 - A package should only import the packages listed in its `[dependencies]`.
+
+
+## Platforms
+
+`platforms = ["linux"]` in `[package]` says the package runs only on those targets (`linux`,
+`windows`, `wasm`); a program that calls it when compiling for another target gets a Platform
+error. See `docs/platforms.md`.

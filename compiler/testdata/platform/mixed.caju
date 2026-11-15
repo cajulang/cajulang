@@ -1,0 +1,19 @@
+# a module with one function limited to Linux and WebAssembly
+
+export fn anywhere() -> str { return "anywhere" }
+
+# caju:platforms linux wasm
+export fn not_windows() -> str { return "not windows" }
+
+export interface Speaker {
+  speak() -> str
+}
+export struct Native {
+  x: int
+}
+# caju:platforms linux
+export fn (n: *Native) speak() -> str { return "native" }
+export struct Plain {
+  x: int
+}
+export fn (p: *Plain) speak() -> str { return "plain" }

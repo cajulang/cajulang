@@ -27,6 +27,7 @@ import "ast"
 import "types"
 import "linker"
 import "check"
+import "platform"
 import W "wasmenc"
 
 const ARGV = 1024
@@ -481,6 +482,7 @@ export fn compile_wasm(files: []*ast.SourceFile, rt_sources: []str) -> *bytes.Bu
   for _, sf := range files { g.file_names = append(g.file_names, sf.name) }
   tree := linker.link(files)
   g.ut = check.check(tree)
+  platform.check(tree, files, "wasm")
   rt_src := strings.join(rt_sources, "\n")
   rt_tree := linker.link([]*ast.SourceFile{&ast.SourceFile{name: "rt.caju", src: rt_src}})
   g.rtt = types.typecheck(rt_tree, true)

@@ -1,0 +1,327 @@
+# platform: refuses, at compile time, a program that would call code its target cannot run.
+#
+# Code declares where it runs with a comment line
+#
+#   # caju:platforms linux wasm
+#
+# in the header of a file (before its first declaration: the whole file) or in the comment just
+# above a function (that function). A package may declare `platforms = ["linux"]` in its caju.toml
+# (every file of the package). Targets: linux, windows, wasm. Besides, a function that makes a
+# system call (__syscall: Linux numbers, which the WebAssembly host emulates in part) runs only on
+# linux and wasm.
+#
+# After type checking, the functions the program can reach are followed from the top-level code
+# of every module, through calls, method calls (an interface call reaches the methods of the
+# types that implement it) and function values. The first reachable function its target does not
+# allow is a "Platform error", with the chain of calls from the program's own code to it. Code
+# that is imported but never called costs nothing: std/http's query_escape in a WebAssembly
+# program is fine, its client (sockets) is not.
+
+import "std/strings"
+import "ast"
+import "project"
+
+const DIRECTIVE = "caju:platforms"
+
+# what a module or function declares: the targets allowed, and where the restriction comes from
+struct Rule {
+  targets: []str
+  why: str
+}
+
+struct Fn {
+  node: *ast.Node
+  module: str
+  rule: *Rule
+}
+
+struct Reach {
+  parent: str      # the function that called it ("" for a module's top-level code)
+  site: int        # where (encoded line of the call)
+  module: str      # the module of the top-level code, when parent is ""
+}
+
+# an interface call waiting for a type that implements it to be constructed
+struct Pending {
+  method: str
+  need: []str
+  from_: str
+  module: str
+  site: int
+}
+
+struct Pass {
+  target: str
+  built: map[str]bool                  # struct types constructed by reachable code
+  pending: []*Pending
+  funcs: map[str]*Fn
+  srcs: map[str]str
+  mod_rules: map[str]*Rule
+  methods_of: map[str]map[str]str     # receiver type -> method name -> function
+  iface_methods: map[str][]str         # interface type -> its methods
+  reached: map[str]*Reach
+  queue: []str
+}
+
+# the targets of a "# caju:platforms a b" line, or nil
+fn directive(line: str) -> []str {
+  t := strings.trim_space(line)
+  if !strings.has_prefix(t, "#") { return nil }
+  t = strings.trim_space(t[1:])
+  if !strings.has_prefix(t, DIRECTIVE) { return nil }
+  # the targets, up to the first other word (a note may follow: "linux  (no sockets elsewhere)")
+  out := []str{}
+  for _, w := range strings.fields(strings.replace_all(t[len(DIRECTIVE):], ",", " ")) {
+    if w != "linux" && w != "windows" && w != "wasm" { break }
+    out = append(out, w)
+  }
+  return out
+}
+
+# the rule of a file: a directive among the comment lines before its first code line
+fn file_rule(src: str) -> *Rule {
+  for _, line := range strings.split(src, "\n") {
+    t := strings.trim_space(line)
+    if t == "" { continue }
+    if !strings.has_prefix(t, "#") { return nil }
+    d := directive(t)
+    if d != nil { return &Rule{targets: d, why: "declared in its header"} }
+  }
+  return nil
+}
+
+# the rule in the comment block right above line (1-based)
+fn func_rule(lines: []str, line: int) -> *Rule {
+  i := line - 2
+  while i >= 0 {
+    t := strings.trim_space(lines[i])
+    if !strings.has_prefix(t, "#") { return nil }
+    d := directive(t)
+    if d != nil { return &Rule{targets: d, why: "declared above it"} }
+    i--
+  }
+  return nil
+}
+
+fn allows(r: *Rule, target: str) -> bool {
+  if r == nil { return true }
+  for _, t := range r.targets { if t == target { return true } }
+  return false
+}
+
+# the module of a mangled name: "dial@std/net.caju" -> "std/net.caju"; names without "@" are the
+# entry's
+fn module_of(name: str, entry: str) -> str {
+  i := strings.index(name, "@")
+  if i < 0 { return entry }
+  rest := name[i + 1:]
+  j := strings.index(rest, ".caju")
+  if j < 0 { return rest }
+  return rest[0:j + 5]
+}
+
+# "dial_timeout@std/net.caju" -> "net.dial_timeout"; "*Conn@std/net.caju.read" -> "net.Conn.read"
+export fn display(name: str) -> str {
+  n := strings.trim_prefix(name, "*")
+  i := strings.index(n, "@")
+  if i < 0 { return n }
+  local := n[0:i]
+  rest := n[i + 1:]
+  j := strings.index(rest, ".caju")
+  mod := rest
+  tail := ""
+  if j >= 0 {
+    mod = rest[0:j]
+    tail = rest[j + 5:]
+  }
+  short := mod[strings.last_index(mod, "/") + 1:]
+  return short + "." + local + tail
+}
+
+fn strip_ptr(t: str) -> str { return strings.trim_prefix(strings.trim_prefix(t, "*"), "&") }
+
+# the rule of a package module from its caju.toml, if any
+fn package_rule(module: str) -> *Rule {
+  for name, ts := range project.package_platforms {
+    if strings.has_prefix(module, name + "/") || module == name + ".caju" { return &Rule{targets: ts, why: "the platforms of the package " + name} }
+  }
+  return nil
+}
+
+# does the body of a function call __syscall?
+fn uses_syscall(n: *ast.Node) -> bool {
+  if n == nil { return false }
+  if n.kind == "Call" && n.name == "__syscall" { return true }
+  for _, k := range []*ast.Node{n.value, n.left, n.right, n.arg, n.expr, n.obj, n.index, n.lo, n.hi, n.key, n.call, n.fn_,
+      n.cond, n.init, n.post, n.then, n.otherwise, n.tag, n.subject, n.from_, n.to_, n.body, n.target} {
+    if uses_syscall(k) { return true }
+  }
+  for _, xs := range [][]*ast.Node{n.stmts, n.args, n.values, n.targets, n.exprs, n.cases, n.elems, n.sfields} {
+    for _, x := range xs { if uses_syscall(x) { return true } }
+  }
+  if n.kind == "FuncLit" && n.fn_ != nil { return uses_syscall(n.fn_.body) }
+  return false
+}
+
+# checks the linked, type-checked program prog for target ("linux", "windows", "wasm")
+export fn check(prog: *ast.Node, files: []*ast.SourceFile, target: str) {
+  if len(files) == 0 { return }
+  p := &Pass{target: target, funcs: map[str]*Fn{}, srcs: map[str]str{}, mod_rules: map[str]*Rule{},
+    methods_of: map[str]map[str]str{}, iface_methods: map[str][]str{}, reached: map[str]*Reach{}, queue: []str{},
+    built: map[str]bool{}, pending: []*Pending{}}
+  entry := files[0].name
+  for _, sf := range files {
+    p.srcs[sf.name] = sf.src
+    r := file_rule(sf.src)
+    if r == nil { r = package_rule(sf.name) }
+    if r != nil { p.mod_rules[sf.name] = r }
+  }
+  # the program (or test) itself may say where it runs
+  if er := p.mod_rules[entry]; er != nil && !allows(er, target) {
+    ast.fail("platform", entry + " runs on " + strings.join(er.targets, ", ") + " (declared in its header), not on " + target, 1, 0)
+  }
+  lines_of := map[str][]str{}
+  for _, st := range prog.stmts {
+    if st.kind != "Module" { continue }
+    for _, d := range st.stmts {
+      if d.kind == "Interface" {
+        ms := []str{}
+        for _, m := range d.methods { ms = append(ms, m.name) }
+        p.iface_methods[strip_ptr(d.name)] = ms
+        continue
+      }
+      if d.kind != "Func" { continue }
+      mod := st.name
+      fr := p.mod_rules[mod]
+      if lines_of[mod] == nil { lines_of[mod] = strings.split(p.srcs[mod], "\n") }
+      if d.line > 0 {
+        own := func_rule(lines_of[mod], ast.loc_line(d.line))
+        if own != nil { fr = own }
+      }
+      if fr == nil && target == "windows" && uses_syscall(d.body) { fr = &Rule{targets: []str{"linux", "wasm"}, why: "it makes Linux system calls"} }
+      p.funcs[d.name] = &Fn{node: d, module: mod, rule: fr}
+      if d.recv != nil {
+        rt := strip_ptr(d.recv.type)
+        if p.methods_of[rt] == nil { p.methods_of[rt] = map[str]str{} }
+        p.methods_of[rt][d.method] = d.name
+      }
+    }
+  }
+  # roots: the top-level code of every module
+  for _, st := range prog.stmts {
+    if st.kind != "Module" { continue }
+    for _, d := range st.stmts {
+      if d.kind == "Func" || d.kind == "Struct" || d.kind == "Interface" || d.kind == "Extern" { continue }
+      p.walk("", st.name, d)
+    }
+  }
+  # breadth first: the chain reported is a shortest one
+  i := 0
+  while i < len(p.queue) {
+    name := p.queue[i]
+    i++
+    f := p.funcs[name]
+    if f == nil { continue }
+    if !allows(f.rule, target) { p.report(name, f, entry) }
+    p.walk(name, f.module, f.node.body)
+  }
+}
+
+# a type is constructed: the interface calls seen so far may now reach its methods
+fn (p: *Pass) construct(t: str) {
+  if p.built[t] { return }
+  p.built[t] = true
+  for _, pd := range p.pending { p.dispatch(pd, t) }
+}
+
+fn (p: *Pass) dispatch(pd: *Pending, t: str) {
+  ms := p.methods_of[t]
+  if ms == nil { return }
+  for _, m := range pd.need {
+    if _, has := ms[m]; !has { return }
+  }
+  if fname, has := ms[pd.method]; has { p.reach(fname, pd.from_, pd.module, pd.site) }
+}
+
+fn (p: *Pass) reach(name: str, from_: str, module: str, site: int) {
+  if _, ok := p.funcs[name]; !ok { return }
+  if _, seen := p.reached[name]; seen { return }
+  p.reached[name] = &Reach{parent: from_, site: site, module: module}
+  p.queue = append(p.queue, name)
+}
+
+fn (p: *Pass) walk(from_: str, module: str, n: *ast.Node) {
+  if n == nil { return }
+  switch n.kind {
+  case "Call":
+    if n.call_kind == "func" { p.reach(n.name, from_, module, n.line) }
+  case "MethodCall":
+    if n.target_name != "" {
+      p.reach(n.target_name, from_, module, n.line)
+    } else if n.obj != nil && n.obj.ty != "" {
+      # through an interface: the method of that name of each type that implements it and that
+      # reachable code constructs (now, or later: the call waits for the type)
+      it := strip_ptr(n.obj.ty)
+      need, isif := p.iface_methods[it]
+      if isif {
+        pd := &Pending{method: n.name, need: need, from_: from_, module: module, site: n.line}
+        p.pending = append(p.pending, pd)
+        for t, _ := range p.built { p.dispatch(pd, t) }
+      }
+    }
+  case "StructLit", "CompositeLit":
+    if n.stype != "" { p.construct(strip_ptr(n.stype)) }
+  case "Var":
+    if n.fn_ref { p.reach(n.name, from_, module, n.line) }
+  case "FuncLit":
+    if n.fn_ != nil { p.walk(from_, module, n.fn_.body) }
+    return
+  }
+  for _, k := range []*ast.Node{n.value, n.left, n.right, n.arg, n.expr, n.obj, n.index, n.lo, n.hi, n.key, n.call, n.fn_,
+      n.cond, n.init, n.post, n.then, n.otherwise, n.tag, n.subject, n.from_, n.to_, n.body, n.target} { p.walk(from_, module, k) }
+  for _, xs := range [][]*ast.Node{n.stmts, n.args, n.values, n.targets, n.exprs, n.cases, n.elems, n.sfields} {
+    for _, x := range xs { p.walk(from_, module, x) }
+  }
+}
+
+fn (p: *Pass) report(name: str, f: *Fn, entry: str) {
+  # the chain from the program's code to name
+  chain := []str{}
+  cur := name
+  site := 0
+  guard := 0
+  while cur != "" && guard < 64 {
+    chain = append(chain, display(cur))
+    r := p.reached[cur]
+    if r == nil { break }
+    site = r.site
+    if r.parent == "" { break }
+    cur = r.parent
+    guard++
+  }
+  # the call site in the program's own code (outside std/ and packages), if the chain has one
+  cur = name
+  user_site := site
+  guard = 0
+  while cur != "" && guard < 64 {
+    r := p.reached[cur]
+    if r == nil { break }
+    m := r.module
+    if r.parent != "" { m = p.funcs[r.parent].module }
+    if !strings.has_prefix(m, "std/") && package_rule(m) == nil && !strings.contains(m, "github.com/") {
+      user_site = r.site
+      break
+    }
+    cur = r.parent
+    guard++
+  }
+  path := []str{}
+  k := len(chain) - 1
+  while k >= 0 {
+    path = append(path, chain[k])
+    k--
+  }
+  where := strings.trim_suffix(f.module, ".caju")
+  msg := display(name) + " (" + where + ") is not available when compiling for " + p.target + ": it runs on " + strings.join(f.rule.targets, ", ") + " (" + f.rule.why + "). Called through " + strings.join(path, " → ")
+  ast.fail("platform", msg, user_site, 0)
+}

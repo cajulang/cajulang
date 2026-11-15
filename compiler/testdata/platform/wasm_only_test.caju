@@ -1,0 +1,4 @@
+# caju:platforms wasm
+# a test file that only makes sense in WebAssembly
+import { describe, it, expect } from "std/testing"
+describe("x", fn() { it("y", fn() { expect(1).to_equal(1) }) })

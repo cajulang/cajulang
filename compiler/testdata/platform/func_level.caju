@@ -1,0 +1,3 @@
+import "./mixed"
+print(mixed.anywhere())
+print(mixed.not_windows())

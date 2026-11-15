@@ -17,6 +17,7 @@ import "image"
 import "types"
 import "linker"
 import "check"
+import "platform"
 
 const RAX = 0
 const RCX = 1
@@ -705,6 +706,7 @@ export fn compile_native(files: []*ast.SourceFile, rt_sources: []str, target: st
   # the user's program first goes through all the checks of the bytecode compiler
   tree := linker.link(files)
   g.ut = check.check(tree)
+  platform.check(tree, files, target)
   rt_src := strings.join(rt_sources, "\n")
   rt_tree := linker.link([]*ast.SourceFile{&ast.SourceFile{name: "rt.caju", src: rt_src}})
   g.rtt = types.typecheck(rt_tree, true)

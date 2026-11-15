@@ -208,6 +208,7 @@ export struct Manifest {
   authors: []str
   entry: str       # the file imported by `import "<name>"` (default: <repo>.caju)
   caju: str        # the versions of the compiler it works with (">=0.6.0"...), or ""
+  platforms: []str # the targets it runs on (linux, windows, wasm), or empty for any (docs/platforms.md)
   deps: []*Dep     # in the order of caju.toml
 }
 
@@ -254,6 +255,15 @@ export fn read_manifest(dir: str) -> (*Manifest, error) {
   if m.caju != "" {
     _, err = parse_requirement(m.caju)
     if err != nil { return nil, errors.New(file + ": caju: " + err.Error()) }
+  }
+  pl := pkg.get("platforms")
+  m.platforms = []str{}
+  if pl != nil {
+    if pl.kind != "array" { return nil, errors.New(file + ": platforms must be a list, like [\"linux\", \"wasm\"]") }
+    for _, x := range pl.items {
+      if x.kind != "string" || (x.s != "linux" && x.s != "windows" && x.s != "wasm") { return nil, errors.New(file + ": platforms: each one is \"linux\", \"windows\" or \"wasm\"") }
+      m.platforms = append(m.platforms, x.s)
+    }
   }
   au := pkg.get("authors")
   if au != nil {
@@ -877,7 +887,7 @@ export fn packages_for(entry: str) -> (map[str]*project.Package, error) {
     if err4 != nil { return nil, err4 }
     err = check_compiler(l.name + "@" + l.version, pm.caju)
     if err != nil { return nil, err }
-    pkgs[l.name] = &project.Package{name: l.name, dir: dir, entry: pm.entry}
+    pkgs[l.name] = &project.Package{name: l.name, dir: dir, entry: pm.entry, platforms: pm.platforms}
   }
   return pkgs, nil
 }

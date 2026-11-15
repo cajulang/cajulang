@@ -6,6 +6,15 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Added
+- Platforms: a program that can reach code its target cannot run is refused at compile time with a
+  "Platform error" and the chain of calls (instead of building and failing when it runs). Code
+  declares its targets with `# caju:platforms linux wasm` in a file's header or above a function,
+  and packages with `platforms = [...]` in caju.toml; on Windows, functions that make Linux system
+  calls are refused. Only reachable code counts (calls, function values, interface calls to the
+  types that are constructed). `std/net` declares `linux`. `caju test --target X` skips the test
+  files that need another platform. `docs/platforms.md`.
+
 ## [0.8.0] - 2026-11-15
 
 ### Added
