@@ -6,6 +6,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-15
+
 ### Added
 - Platforms: a program that can reach code its target cannot run is refused at compile time with a
   "Platform error" and the chain of calls (instead of building and failing when it runs). Code
@@ -14,10 +16,6 @@ notes from the section of its version here (`tools/changelog.sh`).
   calls are refused. Only reachable code counts (calls, function values, interface calls to the
   types that are constructed). `std/net` declares `linux`. `caju test --target X` skips the test
   files that need another platform. `docs/platforms.md`.
-
-## [0.8.0] - 2026-11-15
-
-### Added
 - `std/tls`: TLS 1.3 and 1.2 clients: `tls.dial(host, port, config)` and `tls.client(sock, name,
   config)` give a `*tls.Conn` with `read`, `write`, `close`. TLS 1.3 with X25519 and
   TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; TLS 1.2 with
