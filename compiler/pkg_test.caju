@@ -34,6 +34,12 @@ describe("versions", fn() {
     expect(version("1.x.3")).to_equal("error: invalid version \"1.x.3\"")
     expect(version("1.2.3-")).to_equal("error: invalid version \"1.2.3-\"")
   })
+  it("refuse pre-releases with anything but letters, digits, hyphens and dots", fn() {
+    expect(version("1.0.0-rc.1")).to_equal("1.0.0-rc.1")
+    expect(version("1.0.0-../../x")).to_equal("error: invalid version \"1.0.0-../../x\"")
+    expect(version("1.0.0-a/b")).to_equal("error: invalid version \"1.0.0-a/b\"")
+    expect(version("1.0.0-a..b")).to_equal("error: invalid version \"1.0.0-a..b\"")
+  })
   it("compare by number, not by text", fn() {
     expect(cmp("1.10.0", "1.9.0")).to_equal(1)
     expect(cmp("2.0.0", "10.0.0")).to_equal(-1)
@@ -138,8 +144,8 @@ describe("editing caju.toml", fn() {
 describe("caju.lock", fn() {
   it("is written as TOML and read back the same", fn() {
     lk := &pkg.Lock{requires: []str{"github.com/acme/greet@0.2.0"}, pkgs: []*pkg.Locked{
-      &pkg.Locked{name: "github.com/acme/greet", version: "0.2.0", source: "https://github.com/acme/greet", commit: "95a2d4ac", hash: "sha256:bd77", deps: []str{"github.com/acme/strutil@1.0.0"}},
-      &pkg.Locked{name: "github.com/acme/strutil", version: "1.0.0", source: "https://github.com/acme/strutil", commit: "e02a4475", hash: "sha256:66f1", deps: []str{}}}}
+      &pkg.Locked{name: "github.com/acme/greet", version: "0.2.0", source: "https://github.com/acme/greet", commit: "95a2d4ac" + strings.repeat("0", 32), hash: "sha256:bd77" + strings.repeat("1", 60), deps: []str{"github.com/acme/strutil@1.0.0"}},
+      &pkg.Locked{name: "github.com/acme/strutil", version: "1.0.0", source: "https://github.com/acme/strutil", commit: "e02a4475" + strings.repeat("0", 32), hash: "sha256:66f1" + strings.repeat("2", 60), deps: []str{}}}}
     text := pkg.encode_lock(lk)
     expect(text).to_start_with("# Written by `caju pkg`; do not edit.")
     expect(text).to_contain("version = 1\nrequires = [\"github.com/acme/greet@0.2.0\"]\n")
@@ -488,5 +494,53 @@ describe("caju pkg and the compiler version", fn() {
     out, code := in_dir("app3", []str{os.getenv("CAJU_BIN"), "run", "main.caju"})
     expect(out).to_contain("caju.toml: caju: invalid requirement \"latest\"")
     expect(code).to_equal(1)
+  })
+})
+
+fn lock_error(pkg_lines: str) -> str {
+  d, _ := fs.temp_dir("", "caju-lock-test-")
+  os.write_file(d + "/caju.lock", "version = 1\nrequires = []\n\n[[package]]\n" + pkg_lines, 0o644)
+  _, err := pkg.read_lock(d + "/caju.lock")
+  fs.remove_all(d)
+  if err == nil { return "ok" }
+  return strings.replace_all(err.Error(), d, "$D")
+}
+
+let GOOD_HASH = "sha256:" + strings.repeat("ab", 32)
+
+describe("caju.lock", fn() {
+  it("accepts well-formed entries", fn() {
+    expect(lock_error("name = \"github.com/a/b\"\nversion = \"1.0.0\"\ncommit = \"" + strings.repeat("a", 40) + "\"\nhash = \"" + GOOD_HASH + "\"\n")).to_equal("ok")
+  })
+  it("refuses names, versions, hashes and commits that could leave the cache", fn() {
+    expect(lock_error("name = \"github.com/../../etc\"\nversion = \"1.0.0\"\nhash = \"" + GOOD_HASH + "\"\n")).to_start_with("$D/caju.lock: ")
+    expect(lock_error("name = \"github.com/a/b\"\nversion = \"1.0.0-../../x\"\nhash = \"" + GOOD_HASH + "\"\n")).to_equal("$D/caju.lock: github.com/a/b: invalid version \"1.0.0-../../x\"")
+    expect(lock_error("name = \"github.com/a/b\"\nversion = \"1.0.0\"\nhash = \"sha256:zz\"\n")).to_equal("$D/caju.lock: github.com/a/b: malformed hash \"sha256:zz\" (expected sha256:<64 hex digits>)")
+    expect(lock_error("name = \"github.com/a/b\"\nversion = \"1.0.0\"\ncommit = \"--upload-pack=x\"\nhash = \"" + GOOD_HASH + "\"\n")).to_equal("$D/caju.lock: github.com/a/b: malformed commit \"--upload-pack=x\"")
+  })
+})
+
+describe("package files", fn() {
+  it("refuse an entry outside the package", fn() {
+    d, _ := fs.temp_dir("", "caju-entry-test-")
+    os.write_file(d + "/caju.toml", "[package]\nname = \"github.com/a/b\"\nentry = \"../../outside.caju\"\n", 0o644)
+    _, err := pkg.read_manifest(d)
+    os.write_file(d + "/caju.toml", "[package]\nname = \"github.com/a/b\"\nentry = \"src/b.caju\"\n", 0o644)
+    m, err2 := pkg.read_manifest(d)
+    fs.remove_all(d)
+    expect(err.Error()).to_contain("entry must be a path inside the package")
+    expect(err2).to_be_nil()
+    expect(m.entry).to_equal("src/b.caju")
+  })
+  it("refuse to hash a file name with a control character", fn() {
+    d, _ := fs.temp_dir("", "caju-hash-test-")
+    os.write_file(d + "/a.caju", "x", 0o644)
+    h1, err1 := pkg.hash_dir(d)
+    os.write_file(d + "/b\nc.caju", "y", 0o644)
+    _, err2 := pkg.hash_dir(d)
+    fs.remove_all(d)
+    expect(err1).to_be_nil()
+    expect(h1).to_start_with("sha256:")
+    expect(err2.Error()).to_start_with("a file name has a control character")
   })
 })

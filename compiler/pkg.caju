@@ -18,6 +18,7 @@ import "std/strings"
 import "std/toml"
 import "std/crypto"
 import "std/cli"
+import "std/strconv"
 import "project"
 
 export const VERSION = "0.6.0"     # the version of the compiler (caju version)
@@ -40,7 +41,15 @@ export fn parse_version(s: str) -> (*Version, error) {
   if dash >= 0 {
     v.pre = t[dash + 1:]
     t = t[0:dash]
-    if v.pre == "" { return nil, errors.New("invalid version \"" + s + "\"") }
+    # semver: dot-separated identifiers of [0-9A-Za-z-] (the version becomes part of a path in
+    # the cache, so nothing else may get through)
+    for _, id := range strings.split(v.pre, ".") {
+      if id == "" { return nil, errors.New("invalid version \"" + s + "\"") }
+      for i := 0; i < len(id); i++ {
+        c := int(id[i])
+        if !((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45) { return nil, errors.New("invalid version \"" + s + "\"") }
+      }
+    }
   }
   parts := strings.split(t, ".")
   if len(parts) != 3 { return nil, errors.New("invalid version \"" + s + "\" (expected MAJOR.MINOR.PATCH, like 1.2.0)") }
@@ -239,6 +248,9 @@ export fn read_manifest(dir: str) -> (*Manifest, error) {
   _, err = parse_version(m.version)
   if err != nil { return nil, errors.New(file + ": " + err.Error()) }
   if m.entry == "" { m.entry = path.base(m.name) + ".caju" }
+  if path.is_abs(m.entry) || m.entry == ".." || strings.has_prefix(m.entry, "../") || strings.contains(m.entry, "/../") || strings.has_suffix(m.entry, "/..") {
+    return nil, errors.New(file + ": entry must be a path inside the package, not \"" + m.entry + "\"")
+  }
   if m.caju != "" {
     _, err = parse_requirement(m.caju)
     if err != nil { return nil, errors.New(file + ": caju: " + err.Error()) }
@@ -372,10 +384,27 @@ export fn read_lock(file: str) -> (*Lock, error) {
       ds := p.get("dependencies")
       if ds != nil { for _, d := range ds.items { l.deps = append(l.deps, d.s) } }
       if l.name == "" || l.version == "" || l.hash == "" { return nil, errors.New(file + ": a [[package]] needs name, version and hash") }
+      # the name and version become paths in the cache: check them like caju.toml's
+      nerr := check_name(l.name)
+      if nerr != nil { return nil, errors.New(file + ": " + nerr.Error()) }
+      _, verr := parse_version(l.version)
+      if verr != nil { return nil, errors.New(file + ": " + l.name + ": " + verr.Error()) }
+      if !is_hex_of(strings.trim_prefix(l.hash, "sha256:"), 64) || !strings.has_prefix(l.hash, "sha256:") { return nil, errors.New(file + ": " + l.name + ": malformed hash \"" + l.hash + "\" (expected sha256:<64 hex digits>)") }
+      if l.commit != "" && !is_hex_of(l.commit, 40) { return nil, errors.New(file + ": " + l.name + ": malformed commit \"" + l.commit + "\"") }
       lk.pkgs = append(lk.pkgs, l)
     }
   }
   return lk, nil
+}
+
+# is s exactly n lowercase hexadecimal digits?
+fn is_hex_of(s: str, n: int) -> bool {
+  if len(s) != n { return false }
+  for i := 0; i < n; i++ {
+    c := int(s[i])
+    if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) { return false }
+  }
+  return true
 }
 
 fn str_array(xs: []str) -> *toml.Value {
@@ -443,6 +472,11 @@ export fn hash_dir(dir: str) -> (str, error) {
   list := strings.Builder{}
   for _, f := range files {
     if f == ".git" || strings.has_prefix(f, ".git/") { continue }
+    # the list below is one line per file: a name with a newline could forge lines of its own
+    for i := 0; i < len(f); i++ {
+      c := int(f[i])
+      if c < 32 || c == 127 { return "", errors.New("a file name has a control character: " + strconv.quote(f)) }
+    }
     p := path.join(dir, f)
     fi, err2 := fs.lstat(p)
     if err2 != nil { return "", err2 }
