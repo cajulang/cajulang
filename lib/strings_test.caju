@@ -51,3 +51,27 @@ describe("strings", fn() {
     })
   })
 })
+
+fn raw(bs: []int) -> str {
+  b := []byte{}
+  for _, x := range bs { b = append(b, byte(x)) }
+  return string(b)
+}
+
+describe("strings.valid_utf8", fn() {
+  it("accepts ASCII, accents, emoji and the empty text", fn() {
+    expect(strings.valid_utf8("")).to_be_true()
+    expect(strings.valid_utf8("caju é 😀 ü")).to_be_true()
+    expect(strings.valid_utf8(raw([]int{0xF4, 0x8F, 0xBF, 0xBF}))).to_be_true()       # U+10FFFF
+  })
+  it("refuses stray, overlong, surrogate and cut sequences", fn() {
+    expect(strings.valid_utf8(raw([]int{0xFF}))).to_be_false()
+    expect(strings.valid_utf8(raw([]int{0x80}))).to_be_false()
+    expect(strings.valid_utf8(raw([]int{0xC0, 0x80}))).to_be_false()                 # overlong NUL
+    expect(strings.valid_utf8(raw([]int{0xE0, 0x80, 0xAF}))).to_be_false()           # overlong "/"
+    expect(strings.valid_utf8(raw([]int{0xED, 0xA0, 0x80}))).to_be_false()           # U+D800
+    expect(strings.valid_utf8(raw([]int{0xF4, 0x90, 0x80, 0x80}))).to_be_false()     # above U+10FFFF
+    expect(strings.valid_utf8(raw([]int{0x61, 0xE2, 0x82}))).to_be_false()           # cut
+    expect(strings.valid_utf8(raw([]int{0xE2, 0x28, 0xA1}))).to_be_false()
+  })
+})
