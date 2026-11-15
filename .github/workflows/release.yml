@@ -28,7 +28,7 @@ jobs:
       - name: Test the installer with the package
         run: |
           CAJU_PACKAGE=dist/caju-linux-x86_64.tar.gz CAJU_HOME=$RUNNER_TEMP/caju CAJU_BIN_DIR=$RUNNER_TEMP/bin sh install.sh
-          $RUNNER_TEMP/bin/caju run $RUNNER_TEMP/caju/examples/hello-world.caju
+          $RUNNER_TEMP/bin/caju run $RUNNER_TEMP/caju/current/examples/hello-world.caju
       - name: WebAssembly package (the compiler in wasm; self-compiles; browser test)
         run: CAJU=build/release/caju tools/wasm/package.sh
       - name: Test suite in WebAssembly

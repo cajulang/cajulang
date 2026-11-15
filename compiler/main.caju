@@ -53,6 +53,7 @@ fn compile(entry: str, target: str) -> (*bytes.Buffer, str) { return compile_as(
 # with test, the entry is a test file: it must import std/testing, and std/testing's finish()
 # runs after its top level (to print the summary and set the exit code)
 fn compile_as(entry: str, target: str, test: bool) -> (image: *bytes.Buffer, message: str) {
+  if !fs.is_file(entry) { return nil, "Cannot read " + entry + ": no such file" }
   files := []*ast.SourceFile{}
   defer fn() {
     r := recover()

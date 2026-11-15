@@ -42,6 +42,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 ### Fixed
 - The release workflow no longer expands the tag name inside its shell scripts (a crafted tag
   name could run commands).
+- `caju run`, `build`, `test` and `check` of a file that does not exist say so, instead of a
+  runtime error.
 
 ### Security
 - `std/http` server: requests are parsed strictly and refused with 400 when a proxy could read
