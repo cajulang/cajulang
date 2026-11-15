@@ -6,6 +6,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-15
+
 ### Changed
 - **Breaking:** `sleep` is no longer part of the language. Waiting is the operating system's
   business, so it lives in the standard library: `import "std/os"` and call `os.sleep(seconds)`
@@ -272,7 +274,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 - Benchmark against Go, Rust and Python (`bench/compare`).
 - Release package, installer (`install.sh`) and GitHub workflows. MIT license.
 
-[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/cajulang/cajulang/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/cajulang/cajulang/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cajulang/cajulang/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cajulang/cajulang/compare/v0.5.0...v0.6.0
