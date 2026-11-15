@@ -1,0 +1,487 @@
+import "std/pubkey"
+import "std/hex"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+# Keys (DER SubjectPublicKeyInfo) and signatures made with OpenSSL 3.0 over MSG:
+#   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 (3072, 4096, 1024), RSA-PSS,
+#     EC -pkeyopt ec_paramgen_curve:P-256 (P-384), ED25519; openssl pkey -pubout -outform DER
+#   openssl dgst -sha256 -sign key.pem [-sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:N
+#     -sigopt rsa_mgf1_md:sha256] msg.txt; Ed25519: openssl pkeyutl -sign -rawin
+
+fn unhex(s: str) -> str {
+  b, err := hex.decode(s)
+  if err != nil { panic(err) }
+  return b
+}
+
+# a DER element (tag, definite length, contents)
+fn tlv(tag: int, c: str) -> str {
+  n := len(c)
+  l := ""
+  if n < 0x80 {
+    l = chr2(n)
+  } else if n < 0x100 {
+    l = chr2(0x81) + chr2(n)
+  } else {
+    l = chr2(0x82) + chr2(n >> 8) + chr2(n & 255)
+  }
+  return chr2(tag) + l + c
+}
+
+# one byte as a binary string
+fn chr2(b: int) -> str {
+  return unhex(hexbyte(b))
+}
+
+fn hexbyte(b: int) -> str {
+  digits := "0123456789abcdef"
+  return digits[(b >> 4) & 15:((b >> 4) & 15) + 1] + digits[b & 15:(b & 15) + 1]
+}
+
+# s with bit 0 of byte i flipped
+fn flip(s: str, i: int) -> str {
+  return s[0:i] + chr2(int(s[i]) ^ 1) + s[i + 1:len(s)]
+}
+
+let MSG = "hello, caju tls"
+let RSA2048 = unhex(strings.join([]str{
+  "30820122300d06092a864886f70d01010105000382010f003082010a0282010100ae07eab3424e5c62b4c92f48638b72",
+  "56f5aee1d2abb339e8cd75737fbf61928a7b488958dcef398105ec82210ce84e6bcab21bd6772e92f6fb51cff55082e6",
+  "c4469476bb6e7e39314af2fd0693a8744c10ff70a217aac024dbec4b4dbd76a5411503b48e53d04f28dab96c8613549b",
+  "18b183778bd6163e0d0bb0bd0acc223b964b00b9c06619fc17c95ce504291e4788df80d5f2a8ddcf7e5ba5ccc531df65",
+  "b9ef7a74cb14b8985769838dc27ef5ce70af7e9e81dfa99670747538e5b8428570042811e34afd83d4caae095e7169d3",
+  "250a15cd65a8688f7c15e9c9e3dc753a61d039435a5892ee68a2b9b5dd359d0d15e3f6e9ddac77d32dbdf84f6dabcc86",
+  "3d0203010001"}, ""))
+let RSA3072 = unhex(strings.join([]str{
+  "308201a2300d06092a864886f70d01010105000382018f003082018a02820181009ea8ce867d66eb9ef2655c4582e11e",
+  "182adb54921a5302e9f3ad49a1f218b13383741b04688a0c04fbd6506543e02cd347ecfeb1363a13d72ffc17ba5d08f9",
+  "120a359ffca59856d7d4435842df075fe62f8df278ded95a36886cfd3e81cf6e3106367d45d96263577a548fd0a6e2ea",
+  "a3e9b2cbf70a839a9efec9fa913a15a3e085caf87326388ca54d443970110a97f5959721828f6a0a2304f887f96bc810",
+  "3b90ca0474e7a50d2d2ccca11c73c01d4870b0627b6f3ab809bf638ee4fce2d5e336e2798925f835e44492063c09b5bd",
+  "0e3551d46dc7eef6d5596f4931cc3652f19cb81e4862a4ede94e5ee8e2a81829434fba7dffda133d8dfd28c0d752e439",
+  "4c5a2d8edabf54e1a558e4ade70ec3f218db2285c0b5fad8457a5d90d6439ffbf7448a210549a68575e7314b19244576",
+  "bc7dbebebcc88542686e981db5e5249f395079e81cb825043a5dfd7651f9743ae08a2b4d01f66e41a5ed27b4e7b669c0",
+  "155c1035d704ce90aad4dd2879bca6b8f85af813e922501de5256a9386cdd8a3c90203010001"}, ""))
+let RSA4096 = unhex(strings.join([]str{
+  "30820222300d06092a864886f70d01010105000382020f003082020a0282020100bcb38e821db8299944bad92d1f2f31",
+  "6b1c379b428675c19a2a0ba4cfdf725fc95a0fda7cf78e006ee4523f60c1c5a8513f3bde6ee3eb00c1f973c79f01a252",
+  "ccab43a4f4b8fec951b76f8206c6ae681e1f93c872656468471a8250bd45338a370b5b3ddd56722068e30d6cc33b120f",
+  "a77427811413ab445e09178c80504a9f0f29445a951a42f86b98529f944dc9f8a031d34b1956dd9c4b7ce76817dc57c3",
+  "1f748c76c5ceb85c90435609d8a4a7a09162b63e7bffb29f5803406a39f24edb86597e50b207cdc7d7e442930cc2e22d",
+  "4d4a78e779512f736284ae78a8e8167c5badca97e30cf461884965f258b77563b4e39288a548bc08b0800649347e5a5b",
+  "280316fdd4e5112ed50bf3764639a6e95ac45e10ce87a7912d360dc64d6b0cc4db75caefd18449256e8daf033f5192b8",
+  "2860d431b10c9a3764ceaab791ddab278c8068bac4a8bcda543ca9d047847d8b0b5f740f6495985b331292f1ff20558a",
+  "0849de7e0eff6d8448e1c661489e59da38aa5fbcdf8812c1586993789d0c78fb3b95ba56e4f27e228cc3d4ff089f9753",
+  "f6db168c379c146ddae6de4d13e0cc5c7ee7d7ba7e4e717a76763a5e6a890aa73a36264801ac94f2d89372a051b6f4d6",
+  "10d88729f72fcaf4e96e0fdb5f9b28e2a98efde2bd064746b710159f2e96fa84a52b92235b701e95a70a7687e53c4ca1",
+  "7d4fec5a8dc61c7a8de6fccf3244de75ad0203010001"}, ""))
+let RSA1024 = unhex(strings.join([]str{
+  "30819f300d06092a864886f70d010101050003818d0030818902818100bff2f9a3c8d13a1b16d16aab7696f3d5f80371",
+  "fdde39533bcbe816c0a35ffa3341c3aaa27d04c4470baa188b3b9d18852a8555c7a6a0e42cd1016b475362811d743b36",
+  "5241e92b5b7150e10797c77052ce3a6a391114fc1c121d757c1268d112a64401cf6afac797168e04cceef51330a016f3",
+  "c7d25b93c4e48405712965c3bb0203010001"}, ""))
+let RSA_PSS_KEY = unhex(strings.join([]str{
+  "30820120300b06092a864886f70d01010a0382010f003082010a0282010100e567e3e7944ad89774792d93ec7a48b138",
+  "3fb7501762b054d5b052834a6c6244cd43ecac1cec0c7802547d7c6d94551aa8035779d4d46b45ddb3118288c66378a2",
+  "5d78f9abc35131a142a569540d16c7e00aaf2c0503ea5078dba4bef7044e2592af3b47342a9a0ccf48557cd2cb6cf296",
+  "d931b88d506dad83b2e13eb1374caf80b6bb55e32cd31aa8c3412a4919d0a3f31464d5d6062ef97fc622dd6d6851446e",
+  "04891be4c0acbf76754519a49263aaac39196b4dce4dad16d6da4a1504e17f524bcf8ccb89825bbf8a29f62c58713241",
+  "457e506ec9a7373e839474e4411e4a7e942e8aa6b570dcb780c3dec0f02b5de3a2ed6b56b06ba575db045005bd832302",
+  "03010001"}, ""))
+let P256 = unhex(strings.join([]str{
+  "3059301306072a8648ce3d020106082a8648ce3d030107034200042cc400ead010e779cb6c7a8915129c52ab6440abb8",
+  "fbc88725bb55b4dcdfe6ae261acc9dcbc6eae7d991505e9c367c70ae6316eb70566878bd790fa9f62eb26f"}, ""))
+let P384 = unhex(strings.join([]str{
+  "3076301006072a8648ce3d020106052b8104002203620004fef431cca1817aa77e1577dea4986251668c97e8b8f99daf",
+  "f266d7153e2cbb36728f5be59192be691ef6c7158ece4bf134d9ae0d1029c7fc9900168d4c486977c559bbec69a1be7d",
+  "1413a756b1195a33ddcbb700055f60db09313b20998a5682"}, ""))
+let ED25519 = unhex(strings.join([]str{
+  "302a300506032b6570032100601c0048c30672294efc880badd176239bf1c5c822a40e574c0c692dc4d82be2"}, ""))
+let SIG_PKCS1_SHA256 = unhex(strings.join([]str{
+  "9ae1ea82af292ca54c44563e7028b4dd3c27ca5a5761216dce5a26990913681c9ca9a6e223606e38dc9939ac4634f510",
+  "af1757e367a522d8701af06b19afe71730dc06462f74030eef36d4ff688dcfb06b9ccc1158387274039afcaa70193551",
+  "40c9ef9b6fbd8f3261f53f08cba1cc588fc5d6e2cff096e8939b846a5888a7c74fe07a6de40b450e175abbd8c933845d",
+  "88dfe691e12175a47bbc1a423e94d53db024772ca6fb5b8fb3c72332b250ff6fcb5b8dfffb99c3488fa515753d06fbd2",
+  "819d793abd751e2e409e33a7e51da8b578d68ac394b769957561edc5ae84d1f30b9c70775a9035bfe03dd900b70d898c",
+  "63780132a017243e56af138c76d6510c"}, ""))
+let SIG_PKCS1_SHA384 = unhex(strings.join([]str{
+  "49ffb18055976f63fca0b9cbb0b8744d60646b1e2ac12c2a9b27c82cabcb026bd520bb7181c446c2ae4211016e01ef91",
+  "4b70ff0f72da523e677448d67fcd09aa4873a159e500832d04c37f81eb7ba3004af325b0d18986903506072f47d1fc40",
+  "83942d2851d31fa0e58b81ef3cf0c61641b9ffa324051089145eaa6a25a2289c04b56edee4e7328dd1d0a040a41fb2f3",
+  "900c73cf409e07350d22a1c9348779db392d7b0af5b9101f941c0fec817145148b4286f3748526ecfec859e4999de335",
+  "39dee593c6518fa0c09fcedbfc17f60788587d0492a5aa0d5958e2eb814d0033ccf70a786641e4a02aa0cac74100a424",
+  "32209d9b14680a39b161b43a62bb45b9"}, ""))
+let SIG_PKCS1_SHA512 = unhex(strings.join([]str{
+  "3ba27c091427a31285e7b8b1ab5ae5500856e968f753931ccf6f8e84698301935cabf9a2957e115d1fc44e0cb6629c62",
+  "2f35806367842d77ac497790e774bab2bce63df73c38e8ce6ebff1638cf95d8bb50b43ad6f4a5aeaa4645324f6ae94ea",
+  "9d37e426f45d8ea97d674e81d603b683f3f0de3486fd1605ba3a65ca84aad0cb8b265d9bc76be3723a65cfc71476c814",
+  "d419622ee57bd31dc55008570f8f54a83bacef0440cb0a4f34bbeb6285f66844d7b75c5ab59b778b67e8943e0e5b94e6",
+  "c60399a65a0df07faa88bdd4314046fa456d50f9421207cc8e086a8393f4d0c15161662634c836ad74a9a6ea9312b374",
+  "1a84898fc03ddf8c5356123eba2783c3"}, ""))
+let SIG_PKCS1_SHA1 = unhex(strings.join([]str{
+  "40eb2551f78e06cea355cf345f0b9cb76a983116d461d4b7e7a914d6fe5a642227a8d12d573f839a9d722eafcbb263c8",
+  "43cfb53ab5ba382440b4b11e26c61419a13334c6b27214ff3416b9207a7a1e012246f5662db5995fbd9f5144662f8607",
+  "4b2328b71b79f8e2a0f4b2f17cfcd62c386f25b0e6b5ab790fe6053e774e8e57df27aac11ab9796a182afbe520496cd6",
+  "ab314f859ee2fe2165b4439ab46a6512dfa38df48076cf9cddde5b6ae9cb506cf146a126152fd230ee4d596162e25c51",
+  "2c73ab0fd78c96b9476303c054bc9809a705e31e0f2071a7b216967f0bb2f0060e82d54d0f071233ff902bc62fb4ae26",
+  "312302fd1b9d9843ccf62682fb569953"}, ""))
+let SIG_PSS_SALT32 = unhex(strings.join([]str{
+  "228514476fc5bfae48096bd51bba7d0c2e93a58b6cfce3be4b4d382f0c2995c201e51311e6ac06e6f0116fc62a26bef7",
+  "16139eeaaa27c4c8971d260fbeb579535f55e22c6e03cdc52a1c42740a6c8d8ff0aa8ce9fc736af54aa0e19723663455",
+  "208c6f09c6a3f76db6da10dfb37831fa881e118168d52d6a9fc4b6db53261f71c0a8b6ea95b6fc2fa2d06bd111485cb7",
+  "55a9df23e2b16f6b520bc660baf8804dcc76b52c5b47352702d4155099f503a7037889fbde3201cb9b9c6b461466738a",
+  "1021495c57b143051a5e03f2cf1fb03e740193473ac3750e2ac3a155d85c714994665c515b72621cfd95b8180386ab48",
+  "cb5e1e91823a4ae1bc38c57f3869e51c245c874d52fecb6259b2626efd1a171908bd69ba6c493ce9b3055cdae05653b4",
+  "d377b6753f809767cc921b6b766a145dad8bf2705a2adbc49cabb89c7464d4c24c8066aa4b12fa30bdc9491db8d63a84",
+  "402da03b2f4b6682d7149b3f6069d0242601cb1037f5390ee6f1960cf3fac9de644be63b4076d64c6f540994ae6ce39b"}, ""))
+let SIG_PSS_SALT0 = unhex(strings.join([]str{
+  "9264d920d0534b88e2e3a990f2d9cb47471df0994dd0f6e8e304d2b67da5c947c33ceba7eab8106d34b2bdc30fa1480a",
+  "8f342185d124c26256b4386e2f240198232a194a9834899d81ac0d0641ccd0156907f9534497c000e686a1c1dbd4f3fd",
+  "a7919ecd6d2810791d88ccc0efd672f079f228e24fe55c1331e8c7d2bc6150984d1086848aa5708da2cbfeb6cbf63ca9",
+  "39dc791942a8609df6ea1511c26a74a0edcc97e356ea675f5fc210f737dfb92ebd67c7f493ad6e8f1def988b37c1c94a",
+  "41f0fa4fc8bc772cbdfb03acd64f34741c2d0a890fd4e96856d51323ec5c43d593b19bbf2df244fd2bf4b85ca522880c",
+  "46a8825a238cb0941b2df5d03cbcea76a7c639f7545c2f30cbae12f48e98ff8701ea288ec34208b9e7fcbb7d89c83596",
+  "b225f04be4e771f7fa7a704f033ee7e2b74a45088a5bf669898ba445fb587f0b254081392d5b0cf2e5c11cb0cf513526",
+  "ecd9b245a9edde0488f0b001a7b4e8751fe6ba30fc0e0550fa31149d75d4880afca0aa527aad18b8fb2ed23bf57cd5d6"}, ""))
+let SIG_PSS_SALT64 = unhex(strings.join([]str{
+  "1411b20e872de4c75ffbda7f8713e9222be5738eaa94513cca5fbb0257da6bfe6a25c5c5926908f63042c2386a400901",
+  "866a0fe46528a143e1491232b2d1e8b14524fb328c8029bed643a2db4d0413e465ef0ff41d1c5f95941b738bc8c1852c",
+  "72df73a0e16f4ef7d1d2c1b82735fe9b00330a9c7f9cb66caadbd26404709a7787a4dd785a6558c5e094337543fb3efa",
+  "ea080830289e2fc7c2e7dc09d316dece39a1229d8ceb61d317e1781136ab206eba82bcca66455e001e04c7267e53b125",
+  "a8a5284609ab3157d0cef6a28e85313331bf145078c72b043051562fa15c03e4c799cc251bba2102c33b069770995a33",
+  "a283df6e2938a7c6041781cf104bd46e15eaf845db5642298457215fc06f4255a3409152b7ed38ae67c94f593c8f6eca",
+  "94c739e6c83f250b003875835b9545265eeea1c850819e836ad06039b39c3c46c95a7f7d3220bfdbbcc19774cb3a56a2",
+  "96cd2d8039a334d6aeaa69bf547695efa9faaef7921798e26021af6b9df32250785cc223222c4833e6c00aab9c8fadc0"}, ""))
+let SIG_PSS_SHA512 = unhex(strings.join([]str{
+  "2e3fd333d54b3f6081b04cf48e43be14de29b5520ccffa4e275814b9c084d43952b7b6455e969ba1b223eedd7d455439",
+  "4a7473f31a34d5c9b170ab0b28339314f7c3ddc16f6ad0c49af27d64f92fbd1d21cfc7237736f36b49414c87a877282c",
+  "a32bf610cd96b9f4905384f42a8662eb21d2b7bbaf0b204bde59878d4272cfa21ae968392814d8ffa5db82277375fe56",
+  "3e1d25793042ef798c9da1eaebfccb81cc0d8b85f7592319208910467193d6ded196ed5fc1b345e0f35b7bbf2b44581e",
+  "85f6e0b82472a00a7aa248842409a8a6fc87f19c6afc137b7e5f52b86ad44ac625ba45b382b1a6d28ca4186407d5d870",
+  "0be02c59356cdb362d4939a9ce00bd385726c5a2a4d39b1fb8a75bba651b2ae8346437eb3a8be33a698c5ff45d712fcd",
+  "1b6c59c555f8968846b910497739d62f16b017f21180482ef0aaac5493e0c9a28212b1ceb96c177a50ef0421811924f9",
+  "0c88a1c1a94f894aed3438aa312a296555de71a85b6bf6b92b0d3eac33ce3572ee94a1396dc97be6057f387d941daafa"}, ""))
+let SIG_PSS_SHA384_4096 = unhex(strings.join([]str{
+  "884c24a76739db59c78645986aaa18b8c3f05b2fcc6723c92cf5629be7fe4968caffee770eb29d0d2ebe155cd69912ee",
+  "9c140076089fbd1760487286812dcdbfd7991ec496040170c3d05dfe0c31c2a5e646fb074e83c677b67e0704f6fd9104",
+  "599031e1ae90080843044519387e6ec855f9b3859bb964d773fcc95769dacb49b6100485c45b7d6b0c76f9195a81b7f6",
+  "b91379d4af5c608e627e13aa70a357f77875ba0c65f8873dd91b4fbd12736f1bc0f1b5b4ff07160723514b712b2feb5b",
+  "4dd89f4cef21f7f33c5d569c0387a5b6bac91e6b3fe578f18c46bffebcda802104c965e24ef82d4c7bef7a9cb617514b",
+  "0c71d6339250191de375eab86ab76ec9ea1601197d5a2674d419140d5e2831f11fe04a6ded6fe208b2bb74ee7d25a870",
+  "b7db72d8cb690630ca73d8a9c28973f7f2b4e3071aacc1264fbb93300e7519c99e5f118a2dc919dd3445fd4067ddd38d",
+  "e43c8e88c4e6e91f24fa2ddccb0901cf2870106fd1db7cda92574728856def0bcc9bd30a1e5ac59f6e8ae4720eada1d6",
+  "6b446d761fd7d466f1bcdb4aa20cc853c9870717caa8b001d8341c8b2d313ace8049d94f53c0832686dcf51b962995b4",
+  "fe03877144659093083f4d1504d6276e12ff18499f511cf5aac03fb9957f07a2a3361fae40af7fdb868d09ebebfb262d",
+  "ce935620c32367e4303fb5bacf90706efa0af4f826fcc19245d4ef3d864a5a0e"}, ""))
+let SIG_PKCS1_4096 = unhex(strings.join([]str{
+  "3e674d167ba69aeb1969ea9972473dad2988f77e89598b812e426ab793081b9f5b7d159fae545d73badf1a9f7eca9625",
+  "eb7b0731477c1bbcafb049d05621a769676ab62ec584fd5911d879150edfe122b0b88c1bf2e47d0dd64d2ed0f27e7bb0",
+  "c574daf7063e97d6d479ab18e23e6d9e1c55aa4ef84789a51146b04600b1187a19045270a1d0267000ede68ff0f815c1",
+  "c9475ba79159c2b64544ff63f33e9a3cb2f38c923ec5fd4e2c4784530a72071a4ea6c21a3e92258d1953568689ce5fac",
+  "673abdf0d50c94f826b11d1ba8fb5c999c049f6a1cb60864ef725e1745abda26d2c1c5cdebd620c254aeecb1e8b1c7fa",
+  "a42ae95843962f302493fc75809c6104b2158e987425861a83d06345361094b3806abdf2a0b5f63c34577980c39a9c86",
+  "e8f75cb944aa34ab59269c692b039aca65767baac48d0fa677a8a45303e57dbffc9a6208fd3aea15bdd27ef29c54391f",
+  "6c270d9544e380d746d9cafdfdff7af167d58e6b48541655e22a190e3a3c1711bcc4427e554c872db9437a55d2176246",
+  "65f0444be16383d0815179e7b7fb6ea268d69aee55b761ea966dbdc626060f4c05e8f87ab4bc445564cd591598d1cc30",
+  "6cdadbe87b81c291d4bc3b55248d9c04b5568f2aab0deb2a1c06d408d7e56c6a2131a434e21311f26dcd54a078b97582",
+  "b137134e64862f6f0ef079476c6439844e7d99ebe50c5af8306258130a411e46"}, ""))
+let SIG_PSS_KEY = unhex(strings.join([]str{
+  "735b42499ce4053e35f9511a3fb6db9fb1711b667b8ccb70d61d4a3b86693012732dd32d261d4f8e3f573d0b6a6f4e14",
+  "ca3bbc7ee2ff3fa82f0ae166f757dc478414fe0ec0e48a8e663bea9cf22be4c455f2026b307e3a8db49a40954389b6c0",
+  "64ee86fa731233870947edf397f922d510195c230a8a07a384403c2bc6c43a94e4afbad2cbb6f90f745c5b287970ec02",
+  "9b7f575ca293c99e2d0e244ed574e1bc6e553e310a57d1e3b204246cb65acce300f365fc30f8b37f7151aa945128636a",
+  "2a055a77798ad36236dd313fac789c20587aaee35d35d8689f1d740b9349aaf58fdd24310055afcff69535c843ecb595",
+  "ab73c23f22f3afe5a0830f5446607a32"}, ""))
+let SIG_RSA1024 = unhex(strings.join([]str{
+  "2acb40f52dbbd3bbc6df01d75eca3c3f5c06e99e80e2fc8782676cc1055ab28badb500f919132ad654a078f5e8b67ace",
+  "377f7bc3a3f78ad9e2a237cb6e6dd42edd333e6a24034056946ab075c1e433ab656fba1483ac35d94dd6e58dc50a497d",
+  "940732860087eb50b03edd065f7af44dca9dccef32a1e6d05537eaf8204edec2"}, ""))
+let SIG_P256_SHA256 = unhex(strings.join([]str{
+  "3046022100c640464330d9b2db4332af37df4c625b4ea1595fe180723cc255e4e7155c2a8d022100db7d719c3ce18b6e",
+  "a30c44cc85ffe3977ae1ac2d525d5f638b01cd272b83ee47"}, ""))
+let SIG_P256_SHA384 = unhex(strings.join([]str{
+  "304402207aca9c02bcf0f9112f9b7523466270f46cd7bf11dbfddc0dc41ce3f4b48ac2270220713c28fe47b059919497",
+  "dd698a84da77d3e8f16af1cc216fc88c947eae912a09"}, ""))
+let SIG_P384_SHA384 = unhex(strings.join([]str{
+  "3066023100c4315c16648a9e3ef4139d84e83749d238fe7f67ea0d59115631a29e41aede0fe552c5e61b9136ca01b594",
+  "2963081e70023100f277c20e58bcdc2a26bcfb2be318ad04063994ed76c17ba0d3786cd6e6ea40ebf7fb42a1c9c27668",
+  "a47a2f1c3ba5fd86"}, ""))
+let SIG_P384_SHA256 = unhex(strings.join([]str{
+  "306502305fc4c022dfb35599008ae45790e65937e1071bc60f2364ab9503f2bb22e1dee609993952a1052cfe60c7b9fa",
+  "9093ba4f023100b01ec578908c252ae3012cf6be85d053f7ecd31ccb89bdff567172c6276c7049ee4ad192ec11139920",
+  "c6d5e9f59c5f91"}, ""))
+let SIG_ED25519 = unhex(strings.join([]str{
+  "3e6ce9f5ff3065c50d0782cc57689e58d93f5365e07d70d49b5c3ee8c407c9fa5714a459ee5cb6e9090bf7873d533f79",
+  "40e1e1a068f516b79d2727de41b1d205"}, ""))
+
+# every algorithm: a valid signature, and the same with one bit flipped in the message and in
+# the signature
+struct Case {
+  alg: str
+  key: str
+  sig: str
+}
+
+let CASES = []Case{
+  Case{"rsa-pkcs1-sha256", RSA2048, SIG_PKCS1_SHA256},
+  Case{"rsa-pkcs1-sha384", RSA2048, SIG_PKCS1_SHA384},
+  Case{"rsa-pkcs1-sha512", RSA2048, SIG_PKCS1_SHA512},
+  Case{"rsa-pkcs1-sha1", RSA2048, SIG_PKCS1_SHA1},
+  Case{"rsa-pkcs1-sha256", RSA4096, SIG_PKCS1_4096},
+  Case{"rsa-pss-sha256", RSA3072, SIG_PSS_SALT32},
+  Case{"rsa-pss-sha256", RSA3072, SIG_PSS_SALT0},
+  Case{"rsa-pss-sha256", RSA3072, SIG_PSS_SALT64},
+  Case{"rsa-pss-sha512", RSA3072, SIG_PSS_SHA512},
+  Case{"rsa-pss-sha384", RSA4096, SIG_PSS_SHA384_4096},
+  Case{"rsa-pss-sha256", RSA_PSS_KEY, SIG_PSS_KEY},
+  Case{"ecdsa-p256-sha256", P256, SIG_P256_SHA256},
+  Case{"ecdsa-p256-sha384", P256, SIG_P256_SHA384},
+  Case{"ecdsa-p384-sha384", P384, SIG_P384_SHA384},
+  Case{"ecdsa-p384-sha256", P384, SIG_P384_SHA256},
+  Case{"ed25519", ED25519, SIG_ED25519}}
+
+describe("pubkey.verify_signature", fn() {
+  for _, c := range CASES {
+    alg := c.alg
+    key := c.key
+    sig := c.sig
+    title := alg + " (" + str(len(sig)) + "-byte signature)"
+    it("accepts a valid " + title, fn() {
+      expect(pubkey.verify_signature(alg, key, MSG, sig)).to_be_nil()
+    })
+    it("refuses " + title + " with a flipped bit in the message", fn() {
+      expect(pubkey.verify_signature(alg, key, flip(MSG, 3), sig)).not_().to_be_nil()
+    })
+    it("refuses " + title + " with a flipped bit in the signature", fn() {
+      expect(pubkey.verify_signature(alg, key, MSG, flip(sig, len(sig) - 5))).not_().to_be_nil()
+      expect(pubkey.verify_signature(alg, key, MSG, flip(sig, len(sig) / 2))).not_().to_be_nil()
+    })
+  }
+  it("accepts PSS signatures with salt lengths 0, 32 and 64", fn() {
+    expect(pubkey.verify_signature("rsa-pss-sha256", RSA3072, MSG, SIG_PSS_SALT0)).to_be_nil()
+    expect(pubkey.verify_signature("rsa-pss-sha256", RSA3072, MSG, SIG_PSS_SALT32)).to_be_nil()
+    expect(pubkey.verify_signature("rsa-pss-sha256", RSA3072, MSG, SIG_PSS_SALT64)).to_be_nil()
+  })
+  it("refuses a PKCS #1 v1.5 signature checked as PSS and the reverse", fn() {
+    expect(pubkey.verify_signature("rsa-pss-sha256", RSA2048, MSG, SIG_PKCS1_SHA256)).not_().to_be_nil()
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA3072, MSG, SIG_PSS_SALT32)).not_().to_be_nil()
+  })
+  it("refuses a signature checked with another hash", fn() {
+    expect(pubkey.verify_signature("rsa-pkcs1-sha384", RSA2048, MSG, SIG_PKCS1_SHA256)).not_().to_be_nil()
+    expect(pubkey.verify_signature("rsa-pss-sha384", RSA3072, MSG, SIG_PSS_SALT32)).not_().to_be_nil()
+    expect(pubkey.verify_signature("ecdsa-p256-sha384", P256, MSG, SIG_P256_SHA256)).not_().to_be_nil()
+  })
+  it("refuses an RSA signature of the wrong size", fn() {
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA2048, MSG, SIG_PKCS1_SHA256[1:256])).to_be_error("pubkey: RSA signature has the wrong size")
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA2048, MSG, unhex("00") + SIG_PKCS1_SHA256)).to_be_error("pubkey: RSA signature has the wrong size")
+  })
+  it("refuses an RSA signature not below the modulus", fn() {
+    sig := unhex(strings.repeat("ff", 256))
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA2048, MSG, sig)).to_be_error("pubkey: RSA signature out of range")
+  })
+  it("refuses an empty or garbage signature", fn() {
+    for _, c := range CASES {
+      expect(pubkey.verify_signature(c.alg, c.key, MSG, "")).not_().to_be_nil()
+      expect(pubkey.verify_signature(c.alg, c.key, MSG, "garbage")).not_().to_be_nil()
+    }
+  })
+})
+
+describe("pubkey.verify_signature key checks", fn() {
+  it("refuses a key of another type than the algorithm", fn() {
+    msg := "pubkey: key does not match the signature algorithm "
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", RSA2048, MSG, SIG_PKCS1_SHA256)).to_be_error(msg + "ecdsa-p256-sha256")
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", P256, MSG, SIG_P256_SHA256)).to_be_error(msg + "rsa-pkcs1-sha256")
+    expect(pubkey.verify_signature("ecdsa-p384-sha256", P256, MSG, SIG_P256_SHA256)).to_be_error(msg + "ecdsa-p384-sha256")
+    expect(pubkey.verify_signature("ecdsa-p256-sha384", P384, MSG, SIG_P384_SHA384)).to_be_error(msg + "ecdsa-p256-sha384")
+    expect(pubkey.verify_signature("ed25519", RSA2048, MSG, SIG_ED25519)).to_be_error(msg + "ed25519")
+    expect(pubkey.verify_signature("rsa-pss-sha256", ED25519, MSG, SIG_ED25519)).to_be_error(msg + "rsa-pss-sha256")
+  })
+  it("refuses an id-RSASSA-PSS key for PKCS #1 v1.5", fn() {
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA_PSS_KEY, MSG, SIG_PSS_KEY)).to_be_error("pubkey: key does not match the signature algorithm rsa-pkcs1-sha256")
+  })
+  it("refuses an unknown algorithm", fn() {
+    expect(pubkey.verify_signature("rsa-pkcs1-md5", RSA2048, MSG, SIG_PKCS1_SHA256)).to_be_error("pubkey: unsupported signature algorithm rsa-pkcs1-md5")
+    expect(pubkey.verify_signature("", RSA2048, MSG, SIG_PKCS1_SHA256)).not_().to_be_nil()
+  })
+  it("refuses a 1024-bit RSA key, even with a valid signature", fn() {
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA1024, MSG, SIG_RSA1024)).to_be_error("pubkey: RSA key of 1024 bits is too small")
+    expect(pubkey.verify_signature("rsa-pkcs1-sha1", RSA1024, MSG, SIG_RSA1024)).to_be_error("pubkey: RSA key of 1024 bits is too small")
+  })
+  it("refuses an RSA key above 16384 bits", fn() {
+    n := unhex("00" + strings.repeat("ff", 2049))
+    key := tlv(0x30, tlv(0x30, tlv(0x06, unhex("2a864886f70d010101")) + tlv(0x05, "")) + tlv(0x03, unhex("00") + tlv(0x30, tlv(0x02, n) + tlv(0x02, unhex("010001")))))
+    kind, bits, err := pubkey.key_info(key)
+    expect(err).to_be_nil()
+    expect(kind).to_equal("rsa")
+    expect(bits).to_equal(16392)
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", key, MSG, SIG_PKCS1_SHA256)).to_be_error("pubkey: RSA key of 16392 bits is too large")
+  })
+  it("refuses an RSA key with an even modulus or exponent", fn() {
+    n := unhex("00" + strings.repeat("ff", 255) + "fe")
+    key := tlv(0x30, tlv(0x30, tlv(0x06, unhex("2a864886f70d010101")) + tlv(0x05, "")) + tlv(0x03, unhex("00") + tlv(0x30, tlv(0x02, n) + tlv(0x02, unhex("010001")))))
+    _, _, err := pubkey.key_info(key)
+    expect(err).to_be_error("pubkey: bad RSA modulus")
+    n = unhex("00" + strings.repeat("ff", 256))
+    key = tlv(0x30, tlv(0x30, tlv(0x06, unhex("2a864886f70d010101")) + tlv(0x05, "")) + tlv(0x03, unhex("00") + tlv(0x30, tlv(0x02, n) + tlv(0x02, unhex("010000")))))
+    _, _, err = pubkey.key_info(key)
+    expect(err).to_be_error("pubkey: bad RSA exponent")
+  })
+  it("refuses an ECDSA public key that is not on the curve", fn() {
+    bad := flip(P256, len(P256) - 1)
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", bad, MSG, SIG_P256_SHA256)).to_be_error("pubkey: EC point is not on the curve")
+    bad = flip(P384, len(P384) - 10)
+    _, _, err := pubkey.key_info(bad)
+    expect(err).to_be_error("pubkey: EC point is not on the curve")
+  })
+  it("refuses an ECDSA public key with a coordinate not below p", fn() {
+    # x = p, y = 0 (y^2 = p^3 - 3p + b = b != 0 anyway, but the range check comes first)
+    point := unhex("04ffffffff00000001000000000000000000000000ffffffffffffffffffffffff" + strings.repeat("00", 32))
+    key := P256[0:len(P256) - 65] + point
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", key, MSG, SIG_P256_SHA256)).to_be_error("pubkey: EC point is not on the curve")
+  })
+  it("refuses a compressed or wrongly sized ECDSA point", fn() {
+    key := P256[0:len(P256) - 65] + unhex("02") + P256[len(P256) - 64:len(P256)]
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", key, MSG, SIG_P256_SHA256)).to_be_error("pubkey: only uncompressed EC points are supported")
+  })
+})
+
+# the r and s of the P-256 test signature; both have the top bit set, so DER puts a 0x00 before
+let P256_R = SIG_P256_SHA256[4:37]
+let P256_S = SIG_P256_SHA256[39:72]
+let P256_N = unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+
+describe("pubkey ECDSA signature encoding", fn() {
+  it("accepts r and s whose DER integers carry a leading zero byte", fn() {
+    expect(hex.encode(P256_R[0:1])).to_equal("00")
+    expect(hex.encode(P256_S[0:1])).to_equal("00")
+    sig := tlv(0x30, tlv(0x02, P256_R) + tlv(0x02, P256_S))
+    expect(sig).to_equal(SIG_P256_SHA256)
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_nil()
+  })
+  it("refuses a non-minimal integer (an extra leading zero)", fn() {
+    sig := tlv(0x30, tlv(0x02, unhex("00") + P256_R) + tlv(0x02, P256_S))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: non-minimal DER integer")
+  })
+  it("refuses a negative integer (the leading zero dropped)", fn() {
+    sig := tlv(0x30, tlv(0x02, P256_R[1:33]) + tlv(0x02, P256_S))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: negative DER integer")
+  })
+  it("refuses s >= n", fn() {
+    sig := tlv(0x30, tlv(0x02, P256_R) + tlv(0x02, unhex("00") + P256_N))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: ECDSA signature out of range")
+    sig = tlv(0x30, tlv(0x02, P256_R) + tlv(0x02, unhex("00") + strings.repeat(unhex("ff"), 32)))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: ECDSA signature out of range")
+    sig = tlv(0x30, tlv(0x02, P256_R) + tlv(0x02, unhex("01") + strings.repeat(unhex("00"), 32)))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: ECDSA signature out of range")
+  })
+  it("refuses r = 0 and s = 0", fn() {
+    sig := tlv(0x30, tlv(0x02, unhex("00")) + tlv(0x02, P256_S))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: ECDSA signature out of range")
+    sig = tlv(0x30, tlv(0x02, P256_R) + tlv(0x02, unhex("00")))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: ECDSA signature out of range")
+  })
+  it("refuses a signature with r and s swapped", fn() {
+    sig := tlv(0x30, tlv(0x02, P256_S) + tlv(0x02, P256_R))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: invalid ECDSA signature")
+  })
+  it("refuses trailing data after the signature and inside it", fn() {
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, SIG_P256_SHA256 + unhex("00"))).to_be_error("pubkey: trailing data after DER")
+    sig := tlv(0x30, tlv(0x02, P256_R) + tlv(0x02, P256_S) + tlv(0x02, unhex("01")))
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, sig)).to_be_error("pubkey: trailing data in ECDSA signature")
+  })
+  it("refuses a truncated signature", fn() {
+    expect(pubkey.verify_signature("ecdsa-p256-sha256", P256, MSG, SIG_P256_SHA256[0:len(SIG_P256_SHA256) - 1])).to_be_error("pubkey: truncated DER")
+  })
+})
+
+describe("pubkey malformed DER", fn() {
+  it("returns an error for a truncated key at every length", fn() {
+    for _, key := range []str{RSA2048, P256, P384, ED25519} {
+      i := 0
+      while i < len(key) {
+        _, _, err := pubkey.key_info(key[0:i])
+        expect(err).not_().to_be_nil()
+        expect(pubkey.verify_signature("ecdsa-p256-sha256", key[0:i], MSG, SIG_P256_SHA256)).not_().to_be_nil()
+        i++
+      }
+    }
+  })
+  it("returns an error for trailing bytes after the key", fn() {
+    _, _, err := pubkey.key_info(P256 + unhex("00"))
+    expect(err).to_be_error("pubkey: trailing data after DER")
+    expect(pubkey.verify_signature("rsa-pkcs1-sha256", RSA2048 + unhex("0500"), MSG, SIG_PKCS1_SHA256)).to_be_error("pubkey: trailing data after DER")
+  })
+  it("returns an error for a huge length", fn() {
+    _, _, err := pubkey.key_info(unhex("30847fffffff3000"))
+    expect(err).to_be_error("pubkey: truncated DER")
+    _, _, err = pubkey.key_info(unhex("3088ffffffffffffffff00"))
+    expect(err).to_be_error("pubkey: DER length too large")
+    _, _, err = pubkey.key_info(unhex("3084ffffffff00"))
+    expect(err).to_be_error("pubkey: truncated DER")
+  })
+  it("returns an error for indefinite and non-minimal lengths", fn() {
+    _, _, err := pubkey.key_info(unhex("3080") + P256[2:len(P256)] + unhex("0000"))
+    expect(err).to_be_error("pubkey: indefinite DER length")
+    _, _, err = pubkey.key_info(unhex("308159") + P256[2:len(P256)])
+    expect(err).to_be_error("pubkey: non-minimal DER length")
+  })
+  it("returns an error for empty input and a wrong tag", fn() {
+    _, _, err := pubkey.key_info("")
+    expect(err).to_be_error("pubkey: truncated DER")
+    _, _, err = pubkey.key_info(unhex("3100"))
+    expect(err).to_be_error("pubkey: unexpected DER tag 49")
+  })
+  it("returns an error for every single-bit flip of a key without crashing", fn() {
+    for _, key := range []str{P256, ED25519} {
+      i := 0
+      while i < len(key) {
+        k := flip(key, i)
+        pubkey.key_info(k)
+        expect(pubkey.verify_signature("ecdsa-p256-sha256", k, MSG, SIG_P256_SHA256)).not_().to_be_nil()
+        i++
+      }
+    }
+  })
+  it("returns an error for an unsupported key algorithm or curve", fn() {
+    # secp256k1 (1.3.132.0.10)
+    key := tlv(0x30, tlv(0x30, tlv(0x06, unhex("2a8648ce3d0201")) + tlv(0x06, unhex("2b8104000a"))) + tlv(0x03, unhex("00") + P256[len(P256) - 65:len(P256)]))
+    _, _, err := pubkey.key_info(key)
+    expect(err).to_be_error("pubkey: unsupported elliptic curve")
+    # DSA (1.2.840.10040.4.1)
+    key = tlv(0x30, tlv(0x30, tlv(0x06, unhex("2a8648ce380401"))) + tlv(0x03, unhex("00")))
+    _, _, err = pubkey.key_info(key)
+    expect(err).to_be_error("pubkey: unsupported public key algorithm")
+  })
+})
+
+describe("pubkey.key_info", fn() {
+  it("reports RSA keys with their modulus size", fn() {
+    kind, bits, err := pubkey.key_info(RSA2048)
+    expect(err).to_be_nil()
+    expect(kind).to_equal("rsa")
+    expect(bits).to_equal(2048)
+    _, bits, _ = pubkey.key_info(RSA3072)
+    expect(bits).to_equal(3072)
+    _, bits, _ = pubkey.key_info(RSA4096)
+    expect(bits).to_equal(4096)
+    _, bits, _ = pubkey.key_info(RSA1024)
+    expect(bits).to_equal(1024)
+    kind, bits, _ = pubkey.key_info(RSA_PSS_KEY)
+    expect(kind).to_equal("rsa")
+    expect(bits).to_equal(2048)
+  })
+  it("reports ECDSA and Ed25519 keys", fn() {
+    kind, bits, err := pubkey.key_info(P256)
+    expect(err).to_be_nil()
+    expect(kind).to_equal("ecdsa-p256")
+    expect(bits).to_equal(256)
+    kind, bits, _ = pubkey.key_info(P384)
+    expect(kind).to_equal("ecdsa-p384")
+    expect(bits).to_equal(384)
+    kind, bits, _ = pubkey.key_info(ED25519)
+    expect(kind).to_equal("ed25519")
+    expect(bits).to_equal(256)
+  })
+})

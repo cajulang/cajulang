@@ -1,0 +1,938 @@
+# std/pubkey: public-key signature verification (RSA PKCS #1 v1.5 and PSS, ECDSA on P-256 and
+# P-384, Ed25519), for TLS 1.3 handshakes and X.509 certificates.
+#
+# Keys come as DER SubjectPublicKeyInfo (the form inside a certificate). Only verification:
+# everything here works on public data, so nothing tries to be constant time.
+#
+#   err := pubkey.verify_signature("ecdsa-p256-sha256", spki, msg, sig)
+#   kind, bits, err := pubkey.key_info(spki)
+#
+# Inside: a strict DER reader, an arbitrary-precision unsigned integer (32-bit limbs in []int,
+# so a limb product fits in 64 bits) with Montgomery multiplication, and Jacobian-coordinate
+# arithmetic on the NIST curves (a = -3) with Shamir's trick for u1*G + u2*Q.
+
+import "std/crypto"
+import "std/hex"
+
+const M32 = 0xFFFFFFFF
+const RSA_MIN_BITS = 2048
+const RSA_MAX_BITS = 16384
+
+# ---------------------------------------------------------------- hashes
+
+# SHA-384: SHA-512 with other initial values, truncated to 48 bytes
+fn sha384(s: str) -> str {
+  h := crypto.new_sha512()
+  h.h = []int{0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+    0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4}
+  h.write(s)
+  return h.sum()[0:48]
+}
+
+fn hash_of(name: str, s: str) -> str {
+  if name == "sha256" { return crypto.sha256(s) }
+  if name == "sha384" { return sha384(s) }
+  if name == "sha512" { return crypto.sha512(s) }
+  return crypto.sha1(s)
+}
+
+fn unhex(s: str) -> str {
+  b, err := hex.decode(s)
+  if err != nil { panic("pubkey: bad constant " + s) }
+  return b
+}
+
+fn zeros(n: int) -> str {
+  p := __newstr(n)
+  i := 0
+  while i < n {
+    __store8(p + 8 + i, 0)
+    i++
+  }
+  return __pstr(p)
+}
+
+# a xor b (same length)
+fn bytes_xor(a: str, b: str) -> str {
+  n := len(a)
+  p := __newstr(n)
+  i := 0
+  while i < n {
+    __store8(p + 8 + i, int(a[i]) ^ int(b[i]))
+    i++
+  }
+  return __pstr(p)
+}
+
+fn be32(x: int) -> str {
+  p := __newstr(4)
+  __store8(p + 8, (x >> 24) & 255)
+  __store8(p + 9, (x >> 16) & 255)
+  __store8(p + 10, (x >> 8) & 255)
+  __store8(p + 11, x & 255)
+  return __pstr(p)
+}
+
+# ---------------------------------------------------------------- strict DER reader
+
+const TAG_INTEGER = 0x02
+const TAG_BIT_STRING = 0x03
+const TAG_NULL = 0x05
+const TAG_OID = 0x06
+const TAG_SEQUENCE = 0x30
+
+struct Der {
+  s: str
+  pos: int
+}
+
+fn new_der(s: str) -> *Der { return &Der{s: s, pos: 0} }
+
+fn (d: *Der) done() -> bool { return d.pos >= len(d.s) }
+
+# the tag of the next element, or -1 at the end
+fn (d: *Der) peek() -> int {
+  if d.pos >= len(d.s) { return -1 }
+  return int(d.s[d.pos])
+}
+
+# reads one element with the given tag and returns its contents
+fn (d: *Der) read(tag: int) -> (str, error) {
+  s := d.s
+  end := len(s)
+  if d.pos + 2 > end { return "", errors.New("pubkey: truncated DER") }
+  if int(s[d.pos]) != tag { return "", errors.New("pubkey: unexpected DER tag " + str(int(s[d.pos]))) }
+  l := int(s[d.pos + 1])
+  p := d.pos + 2
+  if l >= 0x80 {
+    nb := l & 0x7f
+    if nb == 0 { return "", errors.New("pubkey: indefinite DER length") }
+    if nb > 4 { return "", errors.New("pubkey: DER length too large") }
+    if p + nb > end { return "", errors.New("pubkey: truncated DER") }
+    if int(s[p]) == 0 { return "", errors.New("pubkey: non-minimal DER length") }
+    l = 0
+    i := 0
+    while i < nb {
+      l = (l << 8) | int(s[p + i])
+      i++
+    }
+    if l < 0x80 { return "", errors.New("pubkey: non-minimal DER length") }
+    p += nb
+  }
+  if l > end - p { return "", errors.New("pubkey: truncated DER") }
+  d.pos = p + l
+  return s[p:p + l], nil
+}
+
+# a whole string that must be exactly one element with the given tag
+fn der_only(s: str, tag: int) -> (str, error) {
+  d := new_der(s)
+  c, err := d.read(tag)
+  if err != nil { return "", err }
+  if !d.done() { return "", errors.New("pubkey: trailing data after DER") }
+  return c, nil
+}
+
+# the magnitude of a non-negative INTEGER (big-endian, without leading zeros)
+fn (d: *Der) read_uint() -> (str, error) {
+  c, err := d.read(TAG_INTEGER)
+  if err != nil { return "", err }
+  if len(c) == 0 { return "", errors.New("pubkey: empty DER integer") }
+  if int(c[0]) >= 0x80 { return "", errors.New("pubkey: negative DER integer") }
+  if len(c) > 1 && int(c[0]) == 0 && int(c[1]) < 0x80 { return "", errors.New("pubkey: non-minimal DER integer") }
+  i := 0
+  while i < len(c) && int(c[i]) == 0 { i++ }
+  return c[i:len(c)], nil
+}
+
+# ---------------------------------------------------------------- big unsigned integers
+#
+# Little-endian limbs of 32 bits in []int. The functions take the limb count from their
+# arguments; the Montgomery code works with exactly mt.n limbs.
+
+# big-endian bytes to limbs; at least nl limbs
+fn bn_from_bytes(s: str, nl: int) -> []int {
+  n := (len(s) + 3) / 4
+  if n < nl { n = nl }
+  if n == 0 { n = 1 }
+  a := make([]int, n)
+  k := len(s)
+  i := 0
+  while i < k {
+    a[i / 4] = a[i / 4] | (int(s[k - 1 - i]) << (8 * (i % 4)))
+    i++
+  }
+  return a
+}
+
+# the k-byte big-endian form of a (the high bytes beyond k are dropped)
+fn bn_to_bytes(a: []int, k: int) -> str {
+  p := __newstr(k)
+  i := 0
+  while i < k {
+    b := 0
+    if i / 4 < len(a) { b = (a[i / 4] >> (8 * (i % 4))) & 255 }
+    __store8(p + 8 + k - 1 - i, b)
+    i++
+  }
+  return __pstr(p)
+}
+
+fn bn_bits(a: []int) -> int {
+  i := len(a) - 1
+  while i >= 0 && a[i] == 0 { i-- }
+  if i < 0 { return 0 }
+  b := 0
+  x := a[i]
+  while x != 0 {
+    b++
+    x = x >> 1
+  }
+  return 32 * i + b
+}
+
+fn bn_bit(a: []int, i: int) -> int {
+  if i / 32 >= len(a) { return 0 }
+  return (a[i / 32] >> (i % 32)) & 1
+}
+
+fn bn_is_zero(a: []int) -> bool {
+  for _, v := range a {
+    if v != 0 { return false }
+  }
+  return true
+}
+
+fn bn_cmp(a: []int, b: []int) -> int {
+  n := len(a)
+  if len(b) > n { n = len(b) }
+  i := n - 1
+  while i >= 0 {
+    x := 0
+    y := 0
+    if i < len(a) { x = a[i] }
+    if i < len(b) { y = b[i] }
+    if x != y {
+      if x < y { return -1 }
+      return 1
+    }
+    i--
+  }
+  return 0
+}
+
+fn bn_copy(a: []int) -> []int {
+  o := make([]int, len(a))
+  copy(o, a)
+  return o
+}
+
+# a resized to n limbs (a must fit)
+fn bn_fit(a: []int, n: int) -> []int {
+  o := make([]int, n)
+  i := 0
+  while i < n && i < len(a) {
+    o[i] = a[i]
+    i++
+  }
+  return o
+}
+
+# o = a - b over the first n limbs; returns the borrow (0 or 1)
+fn bn_sub(o: []int, a: []int, b: []int, n: int) -> int {
+  br := 0
+  i := 0
+  while i < n {
+    x := a[i] - b[i] - br
+    br = (x >> 32) & 1
+    o[i] = x & M32
+    i++
+  }
+  return br
+}
+
+# o = a + b over the first n limbs; returns the carry
+fn bn_add(o: []int, a: []int, b: []int, n: int) -> int {
+  c := 0
+  i := 0
+  while i < n {
+    x := a[i] + b[i] + c
+    c = x >> 32
+    o[i] = x & M32
+    i++
+  }
+  return c
+}
+
+fn bn_sub_small(a: []int, v: int) -> []int {
+  o := bn_copy(a)
+  i := 0
+  br := v
+  while br != 0 && i < len(o) {
+    x := o[i] - br
+    br = (x >> 32) & 1
+    o[i] = x & M32
+    i++
+  }
+  return o
+}
+
+# ---------------------------------------------------------------- Montgomery arithmetic
+
+struct Mont {
+  m: []int      # the odd modulus, n limbs
+  n: int
+  minv: int     # -m^-1 mod 2^32
+  rr: []int     # R^2 mod m, R = 2^(32n)
+  one: []int    # R mod m (1 in Montgomery form)
+  plain1: []int # 1
+  t: []int      # scratch, n + 2 limbs
+}
+
+fn new_mont(m0: []int) -> *Mont {
+  n := len(m0)
+  while n > 1 && m0[n - 1] == 0 { n-- }
+  m := bn_fit(m0, n)
+  x := m[0]
+  inv := x
+  k := 0
+  while k < 5 {
+    inv = (inv * (2 - x * inv)) & M32
+    k++
+  }
+  mt := &Mont{m: m, n: n, minv: (0 - inv) & M32, t: make([]int, n + 2)}
+  mt.plain1 = make([]int, n)
+  mt.plain1[0] = 1
+  # R*2^j mod m by doubling, then t squarings in Montgomery form: (R*2^j)^(2^t)/R^(2^t-1) =
+  # R*2^(j*2^t) = R^2 when j*2^t = 32n
+  tz := 0
+  j := 32 * n
+  while j % 2 == 0 {
+    j = j / 2
+    tz++
+  }
+  r := make([]int, n)
+  r[0] = 1
+  i := 0
+  while i < 32 * n + j {
+    mt.dbl(r)
+    if i == 32 * n - 1 { mt.one = bn_copy(r) }
+    i++
+  }
+  i = 0
+  while i < tz {
+    mt.mul(r, r, r)
+    i++
+  }
+  mt.rr = r
+  return mt
+}
+
+# r = 2r mod m (r < m)
+fn (mt: *Mont) dbl(r: []int) {
+  n := mt.n
+  c := 0
+  i := 0
+  while i < n {
+    x := (r[i] << 1) | c
+    c = (x >> 32) & 1
+    r[i] = x & M32
+    i++
+  }
+  if c != 0 || bn_cmp(r, mt.m) >= 0 { bn_sub(r, r, mt.m, n) }
+}
+
+# o = a*b/R mod m (a, b < m; o may alias a or b)
+fn (mt: *Mont) mul(o: []int, a: []int, b: []int) {
+  n := mt.n
+  m := mt.m
+  t := mt.t
+  minv := mt.minv
+  j := 0
+  while j < n + 2 {
+    t[j] = 0
+    j++
+  }
+  x := 0
+  c := 0
+  i := 0
+  while i < n {
+    bi := b[i]
+    c = 0
+    j = 0
+    while j < n {
+      x = t[j] + a[j] * bi + c
+      t[j] = x & M32
+      c = (x >> 32) & M32
+      j++
+    }
+    x = t[n] + c
+    t[n] = x & M32
+    t[n + 1] = (x >> 32) & M32
+    q := (t[0] * minv) & M32
+    x = t[0] + q * m[0]
+    c = (x >> 32) & M32
+    j = 1
+    while j < n {
+      x = t[j] + q * m[j] + c
+      t[j - 1] = x & M32
+      c = (x >> 32) & M32
+      j++
+    }
+    x = t[n] + c
+    t[n - 1] = x & M32
+    t[n] = t[n + 1] + ((x >> 32) & M32)
+    i++
+  }
+  ge := t[n] != 0
+  if !ge {
+    ge = true
+    j = n - 1
+    while j >= 0 {
+      if t[j] != m[j] {
+        ge = t[j] > m[j]
+        break
+      }
+      j--
+    }
+  }
+  if ge {
+    bn_sub(o, t, m, n)
+  } else {
+    j = 0
+    while j < n {
+      o[j] = t[j]
+      j++
+    }
+  }
+}
+
+fn (mt: *Mont) to_m(a: []int) -> []int {
+  o := make([]int, mt.n)
+  mt.mul(o, a, mt.rr)
+  return o
+}
+
+fn (mt: *Mont) from_m(a: []int) -> []int {
+  o := make([]int, mt.n)
+  mt.mul(o, a, mt.plain1)
+  return o
+}
+
+# a^e with a and the result in Montgomery form
+fn (mt: *Mont) pow_m(a: []int, e: []int) -> []int {
+  acc := bn_copy(mt.one)
+  i := bn_bits(e) - 1
+  while i >= 0 {
+    mt.mul(acc, acc, acc)
+    if bn_bit(e, i) == 1 { mt.mul(acc, acc, a) }
+    i--
+  }
+  return acc
+}
+
+# a^e mod m in the ordinary domain (a < m)
+fn (mt: *Mont) exp(a: []int, e: []int) -> []int {
+  return mt.from_m(mt.pow_m(mt.to_m(a), e))
+}
+
+# ---------------------------------------------------------------- keys
+
+const KIND_RSA = 1
+const KIND_EC = 2
+const KIND_ED25519 = 3
+
+let OID_RSA = unhex("2a864886f70d010101")
+let OID_RSA_PSS = unhex("2a864886f70d01010a")
+let OID_EC = unhex("2a8648ce3d0201")
+let OID_P256 = unhex("2a8648ce3d030107")
+let OID_P384 = unhex("2b81040022")
+let OID_ED25519 = unhex("2b6570")
+
+struct Key {
+  kind: int
+  pss_only: bool  # an id-RSASSA-PSS key
+  bits: int
+  n: []int        # RSA
+  e: []int
+  curve: *Curve   # ECDSA
+  x: []int        # the public point, ordinary domain
+  y: []int
+  raw: str        # Ed25519: the 32-byte key
+}
+
+fn parse_spki(spki: str) -> (*Key, error) {
+  body, err := der_only(spki, TAG_SEQUENCE)
+  if err != nil { return nil, err }
+  d := new_der(body)
+  algid, err := d.read(TAG_SEQUENCE)
+  if err != nil { return nil, err }
+  bits, err := d.read(TAG_BIT_STRING)
+  if err != nil { return nil, err }
+  if !d.done() { return nil, errors.New("pubkey: trailing data in SubjectPublicKeyInfo") }
+  if len(bits) == 0 || int(bits[0]) != 0 { return nil, errors.New("pubkey: bad public key BIT STRING") }
+  pub := bits[1:len(bits)]
+  a := new_der(algid)
+  oid, err := a.read(TAG_OID)
+  if err != nil { return nil, err }
+  if oid == OID_RSA || oid == OID_RSA_PSS {
+    if oid == OID_RSA {
+      # parameters: NULL (or, tolerated, absent)
+      if !a.done() {
+        nul, err := a.read(TAG_NULL)
+        if err != nil { return nil, err }
+        if len(nul) != 0 { return nil, errors.New("pubkey: bad RSA parameters") }
+      }
+    } else if !a.done() {
+      # RSASSA-PSS-params: accepted, not enforced (the signature algorithm says the hash)
+      _, err = a.read(TAG_SEQUENCE)
+      if err != nil { return nil, err }
+    }
+    if !a.done() { return nil, errors.New("pubkey: trailing data in AlgorithmIdentifier") }
+    return parse_rsa(pub, oid == OID_RSA_PSS)
+  }
+  if oid == OID_EC {
+    cid, err := a.read(TAG_OID)
+    if err != nil { return nil, err }
+    if !a.done() { return nil, errors.New("pubkey: trailing data in AlgorithmIdentifier") }
+    let c: *Curve = nil
+    if cid == OID_P256 { c = p256() } else if cid == OID_P384 { c = p384() } else { return nil, errors.New("pubkey: unsupported elliptic curve") }
+    return parse_ec(pub, c)
+  }
+  if oid == OID_ED25519 {
+    if !a.done() { return nil, errors.New("pubkey: Ed25519 key with parameters") }
+    if len(pub) != 32 { return nil, errors.New("pubkey: bad Ed25519 key size") }
+    return &Key{kind: KIND_ED25519, bits: 256, raw: pub}, nil
+  }
+  return nil, errors.New("pubkey: unsupported public key algorithm")
+}
+
+fn parse_rsa(pub: str, pss: bool) -> (*Key, error) {
+  body, err := der_only(pub, TAG_SEQUENCE)
+  if err != nil { return nil, err }
+  d := new_der(body)
+  nb, err := d.read_uint()
+  if err != nil { return nil, err }
+  eb, err := d.read_uint()
+  if err != nil { return nil, err }
+  if !d.done() { return nil, errors.New("pubkey: trailing data in RSA key") }
+  if len(nb) == 0 || int(nb[len(nb) - 1]) & 1 == 0 { return nil, errors.New("pubkey: bad RSA modulus") }
+  n := bn_from_bytes(nb, 0)
+  e := bn_from_bytes(eb, 0)
+  if len(eb) == 0 || int(eb[len(eb) - 1]) & 1 == 0 || bn_bits(e) < 2 || bn_cmp(e, n) >= 0 { return nil, errors.New("pubkey: bad RSA exponent") }
+  return &Key{kind: KIND_RSA, pss_only: pss, bits: bn_bits(n), n: n, e: e}, nil
+}
+
+fn parse_ec(pub: str, c: *Curve) -> (*Key, error) {
+  k := c.size
+  if len(pub) == 0 || int(pub[0]) != 4 { return nil, errors.New("pubkey: only uncompressed EC points are supported") }
+  if len(pub) != 1 + 2 * k { return nil, errors.New("pubkey: bad EC point size") }
+  x := bn_from_bytes(pub[1:1 + k], c.p.n)
+  y := bn_from_bytes(pub[1 + k:1 + 2 * k], c.p.n)
+  if !c.on_curve(x, y) { return nil, errors.New("pubkey: EC point is not on the curve") }
+  return &Key{kind: KIND_EC, bits: c.bits, curve: c, x: x, y: y}, nil
+}
+
+# the kind ("rsa", "ecdsa-p256", "ecdsa-p384", "ed25519") and size in bits of a DER
+# SubjectPublicKeyInfo. RSA sizes are reported as they are (verify_signature applies the policy).
+export fn key_info(spki: str) -> (kind: str, bits: int, err: error) {
+  k, e := parse_spki(spki)
+  if e != nil {
+    err = e
+    return "", 0, err
+  }
+  bits = k.bits
+  if k.kind == KIND_RSA {
+    kind = "rsa"
+  } else if k.kind == KIND_EC {
+    kind = k.curve.name
+  } else {
+    kind = "ed25519"
+  }
+  return
+}
+
+# ---------------------------------------------------------------- RSA
+
+fn digest_info(hname: str) -> str {
+  if hname == "sha256" { return unhex("3031300d060960864801650304020105000420") }
+  if hname == "sha384" { return unhex("3041300d060960864801650304020205000430") }
+  if hname == "sha512" { return unhex("3051300d060960864801650304020305000440") }
+  return unhex("3021300906052b0e03021a05000414")
+}
+
+# the encoded message s^e mod n (k bytes, k = the modulus size in bytes)
+fn rsa_open(key: *Key, sig: str) -> (str, error) {
+  if key.bits < RSA_MIN_BITS { return "", errors.New("pubkey: RSA key of " + str(key.bits) + " bits is too small") }
+  if key.bits > RSA_MAX_BITS { return "", errors.New("pubkey: RSA key of " + str(key.bits) + " bits is too large") }
+  k := (key.bits + 7) / 8
+  if len(sig) != k { return "", errors.New("pubkey: RSA signature has the wrong size") }
+  mt := new_mont(key.n)
+  s := bn_from_bytes(sig, mt.n)
+  if bn_cmp(s, mt.m) >= 0 { return "", errors.New("pubkey: RSA signature out of range") }
+  return bn_to_bytes(mt.exp(s, key.e), k), nil
+}
+
+fn rsa_pkcs1_verify(key: *Key, hname: str, msg: str, sig: str) -> error {
+  em, err := rsa_open(key, sig)
+  if err != nil { return err }
+  t := digest_info(hname) + hash_of(hname, msg)
+  k := len(em)
+  if k < len(t) + 11 { return errors.New("pubkey: RSA key too small for the digest") }
+  p := __newstr(k - len(t) - 1)
+  __store8(p + 8, 0)
+  __store8(p + 9, 1)
+  i := 2
+  while i < k - len(t) - 1 {
+    __store8(p + 8 + i, 0xff)
+    i++
+  }
+  want := __pstr(p) + zeros(1) + t
+  if em != want { return errors.New("pubkey: invalid RSA PKCS #1 v1.5 signature") }
+  return nil
+}
+
+fn mgf1(seed: str, n: int, hname: str) -> str {
+  out := ""
+  ctr := 0
+  while len(out) < n {
+    out = out + hash_of(hname, seed + be32(ctr))
+    ctr++
+  }
+  return out[0:n]
+}
+
+# EMSA-PSS-VERIFY (RFC 8017 9.1.2) with the salt length recovered from the encoding
+fn rsa_pss_verify(key: *Key, hname: str, msg: str, sig: str) -> error {
+  em, err := rsa_open(key, sig)
+  if err != nil { return err }
+  bad := errors.New("pubkey: invalid RSA-PSS signature")
+  embits := key.bits - 1
+  emlen := (embits + 7) / 8
+  if emlen < len(em) {
+    if int(em[0]) != 0 { return bad }
+    em = em[1:len(em)]
+  }
+  mhash := hash_of(hname, msg)
+  hlen := len(mhash)
+  if emlen < hlen + 2 { return bad }
+  if int(em[emlen - 1]) != 0xbc { return bad }
+  dblen := emlen - hlen - 1
+  masked := em[0:dblen]
+  h := em[dblen:dblen + hlen]
+  topmask := 0xff >> (8 * emlen - embits)
+  if int(masked[0]) & (0xff ^ topmask) != 0 { return bad }
+  db := bytes_xor(masked, mgf1(h, dblen, hname))
+  # DB = PS (zeros) || 0x01 || salt; the top bits of the first byte were masked off
+  i := 0
+  b := int(db[0]) & topmask
+  while b == 0 {
+    i++
+    if i >= dblen { return bad }
+    b = int(db[i])
+  }
+  if b != 1 { return bad }
+  m2 := zeros(8) + mhash + db[i + 1:dblen]
+  if hash_of(hname, m2) != h { return bad }
+  return nil
+}
+
+# ---------------------------------------------------------------- elliptic curves
+#
+# Short Weierstrass curves y^2 = x^3 - 3x + b over GF(p). Coordinates are in Montgomery form
+# (mod p); points are Jacobian (X, Y, Z) with x = X/Z^2, y = Y/Z^3, and Z = 0 for infinity.
+
+struct Curve {
+  name: str
+  bits: int
+  size: int       # bytes of a coordinate / scalar
+  p: *Mont
+  n: *Mont        # the group order
+  b: []int        # Montgomery form
+  gx: []int       # Montgomery form
+  gy: []int
+  t: [][]int      # scratch field elements
+}
+
+struct Pt {
+  x: []int
+  y: []int
+  z: []int
+}
+
+let curve256: *Curve = nil
+let curve384: *Curve = nil
+
+fn new_curve(name: str, bits: int, p: str, n: str, b: str, gx: str, gy: str) -> *Curve {
+  k := bits / 8
+  c := &Curve{name: name, bits: bits, size: k}
+  c.p = new_mont(bn_from_bytes(unhex(p), 0))
+  c.n = new_mont(bn_from_bytes(unhex(n), 0))
+  c.b = c.p.to_m(bn_from_bytes(unhex(b), c.p.n))
+  c.gx = c.p.to_m(bn_from_bytes(unhex(gx), c.p.n))
+  c.gy = c.p.to_m(bn_from_bytes(unhex(gy), c.p.n))
+  c.t = [][]int{}
+  i := 0
+  while i < 8 {
+    c.t = append(c.t, make([]int, c.p.n))
+    i++
+  }
+  return c
+}
+
+fn p256() -> *Curve {
+  if curve256 == nil {
+    curve256 = new_curve("ecdsa-p256", 256,
+      "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+      "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+      "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
+      "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+      "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+  }
+  return curve256
+}
+
+fn p384() -> *Curve {
+  if curve384 == nil {
+    curve384 = new_curve("ecdsa-p384", 384,
+      "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff",
+      "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973",
+      "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef",
+      "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7",
+      "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")
+  }
+  return curve384
+}
+
+# o = a + b mod p
+fn (c: *Curve) add(o: []int, a: []int, b: []int) {
+  m := c.p
+  cy := bn_add(o, a, b, m.n)
+  if cy != 0 || bn_cmp(o, m.m) >= 0 { bn_sub(o, o, m.m, m.n) }
+}
+
+# o = a - b mod p
+fn (c: *Curve) sub(o: []int, a: []int, b: []int) {
+  m := c.p
+  if bn_sub(o, a, b, m.n) != 0 { bn_add(o, o, m.m, m.n) }
+}
+
+fn (c: *Curve) mul(o: []int, a: []int, b: []int) { c.p.mul(o, a, b) }
+
+# is (x, y) (ordinary domain) a point of the curve? (infinity has no affine form)
+fn (c: *Curve) on_curve(x: []int, y: []int) -> bool {
+  if bn_cmp(x, c.p.m) >= 0 || bn_cmp(y, c.p.m) >= 0 { return false }
+  xm := c.p.to_m(x)
+  ym := c.p.to_m(y)
+  l := make([]int, c.p.n)
+  r := make([]int, c.p.n)
+  c.mul(l, ym, ym)
+  c.mul(r, xm, xm)
+  c.mul(r, r, xm)
+  c.sub(r, r, xm)
+  c.sub(r, r, xm)
+  c.sub(r, r, xm)
+  c.add(r, r, c.b)
+  return bn_cmp(l, r) == 0
+}
+
+fn (c: *Curve) point(x: []int, y: []int) -> *Pt {
+  return &Pt{x: bn_copy(x), y: bn_copy(y), z: bn_copy(c.p.one)}
+}
+
+fn (c: *Curve) set(r: *Pt, q: *Pt) {
+  copy(r.x, q.x)
+  copy(r.y, q.y)
+  copy(r.z, q.z)
+}
+
+# r = 2r (dbl-2001-b, a = -3)
+fn (c: *Curve) double(r: *Pt) {
+  if bn_is_zero(r.z) { return }
+  t := c.t
+  delta := t[0]
+  gamma := t[1]
+  beta := t[2]
+  alpha := t[3]
+  t4 := t[4]
+  t5 := t[5]
+  c.mul(delta, r.z, r.z)
+  c.mul(gamma, r.y, r.y)
+  c.mul(beta, r.x, gamma)
+  c.sub(t4, r.x, delta)
+  c.add(t5, r.x, delta)
+  c.mul(alpha, t4, t5)
+  c.add(t4, alpha, alpha)
+  c.add(alpha, t4, alpha)
+  # Z3 = (Y + Z)^2 - gamma - delta
+  c.add(t4, r.y, r.z)
+  c.mul(t4, t4, t4)
+  c.sub(t4, t4, gamma)
+  c.sub(r.z, t4, delta)
+  # X3 = alpha^2 - 8 beta
+  c.add(beta, beta, beta)
+  c.add(beta, beta, beta)
+  c.add(t5, beta, beta)
+  c.mul(t4, alpha, alpha)
+  c.sub(r.x, t4, t5)
+  # Y3 = alpha (4 beta - X3) - 8 gamma^2
+  c.sub(beta, beta, r.x)
+  c.mul(beta, alpha, beta)
+  c.mul(gamma, gamma, gamma)
+  c.add(gamma, gamma, gamma)
+  c.add(gamma, gamma, gamma)
+  c.add(gamma, gamma, gamma)
+  c.sub(r.y, beta, gamma)
+}
+
+# r = r + q (q is not r)
+fn (c: *Curve) add_pt(r: *Pt, q: *Pt) {
+  if bn_is_zero(q.z) { return }
+  if bn_is_zero(r.z) {
+    c.set(r, q)
+    return
+  }
+  t := c.t
+  z1z1 := t[0]
+  z2z2 := t[1]
+  u1 := t[2]
+  u2 := t[3]
+  s1 := t[4]
+  s2 := t[5]
+  hh := t[6]
+  hhh := t[7]
+  c.mul(z1z1, r.z, r.z)
+  c.mul(z2z2, q.z, q.z)
+  c.mul(u1, r.x, z2z2)
+  c.mul(u2, q.x, z1z1)
+  c.mul(s1, r.y, q.z)
+  c.mul(s1, s1, z2z2)
+  c.mul(s2, q.y, r.z)
+  c.mul(s2, s2, z1z1)
+  c.sub(u2, u2, u1)         # H
+  c.sub(s2, s2, s1)         # R
+  if bn_is_zero(u2) {
+    if bn_is_zero(s2) {
+      c.double(r)
+    } else {
+      i := 0
+      while i < len(r.z) {
+        r.z[i] = 0
+        i++
+      }
+    }
+    return
+  }
+  c.mul(hh, u2, u2)
+  c.mul(hhh, u2, hh)
+  c.mul(u1, u1, hh)          # V = U1 H^2
+  # X3 = R^2 - H^3 - 2V
+  c.mul(z1z1, s2, s2)
+  c.sub(z1z1, z1z1, hhh)
+  c.sub(z1z1, z1z1, u1)
+  c.sub(z1z1, z1z1, u1)
+  # Y3 = R (V - X3) - S1 H^3
+  c.sub(u1, u1, z1z1)
+  c.mul(u1, s2, u1)
+  c.mul(s1, s1, hhh)
+  c.sub(r.y, u1, s1)
+  # Z3 = Z1 Z2 H
+  c.mul(r.z, r.z, q.z)
+  c.mul(r.z, r.z, u2)
+  copy(r.x, z1z1)
+}
+
+fn ecdsa_verify(key: *Key, hname: str, msg: str, sig: str) -> error {
+  c := key.curve
+  body, err := der_only(sig, TAG_SEQUENCE)
+  if err != nil { return err }
+  d := new_der(body)
+  rb, err := d.read_uint()
+  if err != nil { return err }
+  sb, err := d.read_uint()
+  if err != nil { return err }
+  if !d.done() { return errors.New("pubkey: trailing data in ECDSA signature") }
+  nm := c.n
+  nl := nm.n
+  if len(rb) > c.size || len(sb) > c.size { return errors.New("pubkey: ECDSA signature out of range") }
+  r := bn_from_bytes(rb, nl)
+  s := bn_from_bytes(sb, nl)
+  if bn_is_zero(r) || bn_is_zero(s) || bn_cmp(r, nm.m) >= 0 || bn_cmp(s, nm.m) >= 0 { return errors.New("pubkey: ECDSA signature out of range") }
+  hv := hash_of(hname, msg)
+  if len(hv) > c.size { hv = hv[0:c.size] }
+  e := bn_from_bytes(hv, nl)
+  if bn_cmp(e, nm.m) >= 0 { bn_sub(e, e, nm.m, nl) }
+  # w = s^-1 (Fermat); u1 = e w, u2 = r w (a Montgomery product of an ordinary and a
+  # Montgomery-form value is ordinary)
+  w := nm.pow_m(nm.to_m(s), bn_sub_small(nm.m, 2))
+  u1 := make([]int, nl)
+  u2 := make([]int, nl)
+  nm.mul(u1, e, w)
+  nm.mul(u2, r, w)
+  # Shamir's trick: one pass over the bits of u1 and u2
+  g := c.point(c.gx, c.gy)
+  q := c.point(c.p.to_m(key.x), c.p.to_m(key.y))
+  gq := c.point(c.gx, c.gy)
+  c.add_pt(gq, q)
+  tab := []*Pt{nil, g, q, gq}
+  acc := &Pt{x: make([]int, c.p.n), y: make([]int, c.p.n), z: make([]int, c.p.n)}
+  i := c.bits - 1
+  while i >= 0 {
+    c.double(acc)
+    k := bn_bit(u1, i) + 2 * bn_bit(u2, i)
+    if k != 0 { c.add_pt(acc, tab[k]) }
+    i--
+  }
+  if bn_is_zero(acc.z) { return errors.New("pubkey: invalid ECDSA signature") }
+  zi := c.p.pow_m(acc.z, bn_sub_small(c.p.m, 2))
+  c.mul(zi, zi, zi)
+  x := make([]int, c.p.n)
+  c.mul(x, acc.x, zi)
+  x = c.p.from_m(x)
+  xn := bn_fit(x, nl)
+  if bn_cmp(xn, nm.m) >= 0 { bn_sub(xn, xn, nm.m, nl) }
+  if bn_cmp(xn, r) != 0 { return errors.New("pubkey: invalid ECDSA signature") }
+  return nil
+}
+
+# ---------------------------------------------------------------- the entry point
+
+# verifies that sig is a signature of msg by the key in spki (DER SubjectPublicKeyInfo), with
+# the algorithm alg: "rsa-pkcs1-sha256", "rsa-pkcs1-sha384", "rsa-pkcs1-sha512",
+# "rsa-pkcs1-sha1", "rsa-pss-sha256", "rsa-pss-sha384", "rsa-pss-sha512", "ecdsa-p256-sha256",
+# "ecdsa-p384-sha384", "ecdsa-p256-sha384", "ecdsa-p384-sha256" or "ed25519". nil when valid.
+export fn verify_signature(alg: str, spki: str, msg: str, sig: str) -> error {
+  kind := 0
+  scheme := ""
+  hname := ""
+  curve := ""
+  if alg == "ed25519" {
+    kind = KIND_ED25519
+  } else if alg == "rsa-pkcs1-sha256" || alg == "rsa-pkcs1-sha384" || alg == "rsa-pkcs1-sha512" || alg == "rsa-pkcs1-sha1" {
+    kind = KIND_RSA
+    scheme = "pkcs1"
+    hname = alg[10:len(alg)]
+  } else if alg == "rsa-pss-sha256" || alg == "rsa-pss-sha384" || alg == "rsa-pss-sha512" {
+    kind = KIND_RSA
+    scheme = "pss"
+    hname = alg[8:len(alg)]
+  } else if alg == "ecdsa-p256-sha256" || alg == "ecdsa-p384-sha384" || alg == "ecdsa-p256-sha384" || alg == "ecdsa-p384-sha256" {
+    kind = KIND_EC
+    curve = alg[0:10]
+    hname = alg[11:len(alg)]
+  } else {
+    return errors.New("pubkey: unsupported signature algorithm " + alg)
+  }
+  key, err := parse_spki(spki)
+  if err != nil { return err }
+  if key.kind != kind || (kind == KIND_EC && key.curve.name != curve) || (scheme == "pkcs1" && key.pss_only) {
+    return errors.New("pubkey: key does not match the signature algorithm " + alg)
+  }
+  if kind == KIND_ED25519 {
+    if !crypto.ed25519_verify(key.raw, msg, sig) { return errors.New("pubkey: invalid Ed25519 signature") }
+    return nil
+  }
+  if kind == KIND_EC { return ecdsa_verify(key, hname, msg, sig) }
+  if scheme == "pss" { return rsa_pss_verify(key, hname, msg, sig) }
+  return rsa_pkcs1_verify(key, hname, msg, sig)
+}
