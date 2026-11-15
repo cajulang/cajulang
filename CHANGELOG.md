@@ -6,6 +6,13 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Changed
+- `caju pkg` resolves versions before downloading: visiting a version reads only its `caju.toml`
+  (from the cache, or from git without the rest of the files) and only the versions it chooses are
+  downloaded. Installing a project whose dependencies ask for ui 0.3.0 and ui 0.4.1 no longer
+  downloads ui 0.3.0. A release with a wrong caju.toml, a missing repository or a conflict of
+  major versions is now reported before anything is downloaded.
+
 ## [0.9.1] - 2026-11-15
 
 ### Fixed

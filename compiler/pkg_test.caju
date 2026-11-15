@@ -251,6 +251,11 @@ fn publish_all() {
   # a package whose caju.toml version does not match its tag
   publish("github.com/acme/bad", "1.0.0", package("github.com/acme/bad", "0.9.0", "", "export const X = 1\n"))
   publish("github.com/acme/strutil", "2.0.0", package("github.com/acme/strutil", "2.0.0", "", "export fn shout(s: str) -> str { return s + \"?\" }\n"))
+  # ui 0.3.0 and 0.4.1: fetch asks for the first, web3 for the second
+  publish("github.com/acme/ui", "0.3.0", package("github.com/acme/ui", "0.3.0", "", "export const V = \"0.3.0\"\n"))
+  publish("github.com/acme/ui", "0.4.1", package("github.com/acme/ui", "0.4.1", "", "export const V = \"0.4.1\"\n"))
+  publish("github.com/acme/fetch", "0.1.0", package("github.com/acme/fetch", "0.1.0", "\"github.com/acme/ui\" = \"0.3.0\"\n", "import \"github.com/acme/ui\"\nexport fn ui_version() -> str { return ui.V }\n"))
+  publish("github.com/acme/web3", "0.1.0", package("github.com/acme/web3", "0.1.0", "\"github.com/acme/ui\" = \"0.4.1\"\n", "export const X = 1\n"))
   os.write_file(W + "/app/main.caju", "import \"github.com/acme/greet\"\nprint(greet.hello(\"caju\"))\n", 0o644)
 }
 
@@ -408,19 +413,19 @@ describe("caju pkg, step by step", fn() {
   })
   it("refuses a release whose caju.toml has another version", fn() {
     out, code := caju([]str{"pkg", "add", "github.com/acme/bad@1.0.0"})
-    expect(out).to_equal("downloading github.com/acme/bad@1.0.0\ncaju pkg: github.com/acme/bad: the tag v1.0.0 has version = \"0.9.0\" in its caju.toml")
+    expect(out).to_equal("caju pkg: github.com/acme/bad: the tag v1.0.0 has version = \"0.9.0\" in its caju.toml")
     expect(code).to_equal(1)
     expect(read_app("caju.toml")).not_().to_contain("acme/bad")
   })
   it("refuses two major versions of the same package", fn() {
     out, code := caju([]str{"pkg", "add", "github.com/acme/strutil@2.0.0"})
-    expect(out).to_equal("downloading github.com/acme/strutil@2.0.0\ncaju pkg: github.com/acme/strutil is needed in different major versions: 2.0.0 (by github.com/me/app), 1.1.0 (by github.com/acme/greet@0.3.0); they are not compatible")
+    expect(out).to_equal("caju pkg: github.com/acme/strutil is needed in different major versions: 2.0.0 (by github.com/me/app), 1.1.0 (by github.com/acme/greet@0.3.0); they are not compatible")
     expect(code).to_equal(1)
     expect(read_app("caju.toml")).to_contain("\"github.com/acme/strutil\" = \"1.1.0\"")
   })
   it("reports a repository that does not exist", fn() {
     out, code := caju([]str{"pkg", "add", "github.com/acme/nothere@1.0.0"})
-    expect(out).to_equal("downloading github.com/acme/nothere@1.0.0\ncaju pkg: cannot download github.com/acme/nothere@1.0.0 (git tag v1.0.0 of $W/remote/github.com/acme/nothere): fatal: repository '$W/remote/github.com/acme/nothere' does not exist")
+    expect(out).to_equal("caju pkg: cannot download github.com/acme/nothere@1.0.0 (git tag v1.0.0 of $W/remote/github.com/acme/nothere): fatal: repository '$W/remote/github.com/acme/nothere' does not exist")
     expect(code).to_equal(1)
   })
   it("remove keeps a package that another dependency still needs", fn() {
@@ -445,6 +450,22 @@ describe("caju pkg, step by step", fn() {
     expect(out).to_start_with("downloading github.com/acme/greet@0.3.0\ndownloading github.com/acme/strutil@1.1.0\ncaju pkg: the tag v1.1.0 of github.com/acme/strutil has moved\n  caju.lock: commit ")
     expect(out).to_end_with("A published version must not change. If you trust the new content, remove the package from caju.lock and install again.")
     expect(code).to_equal(1)
+  })
+  it("downloads only the versions it chooses, not the lower ones it saw on the way", fn() {
+    fs.mkdir_all(W + "/app3", 0o755)
+    os.write_file(W + "/app3/caju.toml", "[package]\nname = \"github.com/me/app3\"\nversion = \"0.1.0\"\n\n[dependencies]\n\"github.com/acme/fetch\" = \"0.1.0\"\n\"github.com/acme/web3\" = \"0.1.0\"\n", 0o644)
+    os.write_file(W + "/app3/main.caju", "import \"github.com/acme/fetch\"\nprint(fetch.ui_version())\n", 0o644)
+    out, code := in_dir("app3", []str{os.getenv("CAJU_BIN"), "pkg", "install"})
+    expect(out).to_equal("downloading github.com/acme/fetch@0.1.0\ndownloading github.com/acme/web3@0.1.0\ndownloading github.com/acme/ui@0.4.1\n3 packages ok")
+    expect(code).to_equal(0)
+    expect(fs.is_dir(W + "/home/pkg/github.com/acme/ui@0.4.1")).to_be_true()
+    expect(fs.is_dir(W + "/home/pkg/github.com/acme/ui@0.3.0")).to_be_false()
+    out2, _ := in_dir("app3", []str{os.getenv("CAJU_BIN"), "run", "main.caju"})
+    expect(out2).to_equal("0.4.1")
+    # what is already cached is read from the cache: nothing is downloaded again
+    fs.remove(W + "/app3/caju.lock")
+    out3, _ := in_dir("app3", []str{os.getenv("CAJU_BIN"), "pkg", "install"})
+    expect(out3).to_equal("3 packages ok")
   })
   it("hash prints the hash of a directory", fn() {
     out, code := caju([]str{"pkg", "hash", W + "/remote/github.com/acme/greet"})

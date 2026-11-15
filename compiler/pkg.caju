@@ -224,6 +224,12 @@ export fn read_manifest(dir: str) -> (*Manifest, error) {
   file := path.join(dir, "caju.toml")
   src, err := os.read_file(file)
   if err != nil { return nil, errors.New("cannot read " + file + ": " + err.Error()) }
+  return parse_manifest(src, file, dir)
+}
+
+# a caju.toml given as text (file names it in errors; dir is the package's directory)
+fn parse_manifest(src: str, file: str, dir: str) -> (*Manifest, error) {
+  let err: error = nil
   doc, err2 := toml.parse(src)
   if err2 != nil { return nil, errors.New(file + ": " + err2.Error()) }
   m := &Manifest{dir: dir, authors: []str{}, deps: []*Dep{}}
@@ -616,6 +622,11 @@ export fn check_cached(name: str, version: str) -> (*CacheEntry, str, error) {
 # the cached copy of name@version, downloading it if needed. want_commit / want_hash ("" = not
 # known yet) come from caju.lock: a copy that does not match them is an error.
 export fn fetch(name: str, version: str, want_commit: str, want_hash: str) -> (*Fetched, error) {
+  return fetch_from(name, version, want_commit, want_hash, "")
+}
+
+# fetch, given a clone of the release without its files checked out ("" = clone it now)
+fn fetch_from(name: str, version: str, want_commit: str, want_hash: str, cloned: str) -> (*Fetched, error) {
   dst := cache_dir(name, version)
   if e, h, err := check_cached(name, version); e != nil {
     if err != nil {
@@ -640,17 +651,23 @@ export fn fetch(name: str, version: str, want_commit: str, want_hash: str) -> (*
   if err2 != nil { return nil, err2 }
   defer fs.remove_all(tmp)
   src := path.join(tmp, "src")
-  _, err = git([]str{"-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1", "--branch", "v" + version, source_url(name), src})
-  if err != nil { return nil, errors.New("cannot download " + name + "@" + version + " (git tag v" + version + " of " + source_url(name) + "): " + err.Error()) }
+  if cloned != "" {
+    # the clone made while resolving: now its files (a partial clone fetches them here)
+    _, err = git([]str{"-C", cloned, "checkout", "--quiet", "HEAD", "--", "."})
+    if err != nil { return nil, errors.New("cannot download " + name + "@" + version + ": " + err.Error()) }
+    err = fs.rename(cloned, src)
+    if err != nil { return nil, err }
+  } else {
+    _, err = git([]str{"-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1", "--branch", "v" + version, source_url(name), src})
+    if err != nil { return nil, clone_error(name, version, err) }
+  }
   commit, err3 := git([]str{"-C", src, "rev-parse", "HEAD"})
   if err3 != nil { return nil, err3 }
   err = fs.remove_all(path.join(src, ".git"))
   if err != nil { return nil, err }
   h, err4 := hash_dir(src)
   if err4 != nil { return nil, err4 }
-  if want_commit != "" && commit != want_commit {
-    return nil, errors.New("the tag v" + version + " of " + name + " has moved\n  caju.lock: commit " + want_commit + "\n  now:       commit " + commit + "\nA published version must not change. If you trust the new content, remove the package from caju.lock and install again.")
-  }
+  if want_commit != "" && commit != want_commit { return nil, moved_error(name, version, want_commit, commit) }
   if want_hash != "" && h != want_hash {
     return nil, errors.New("checksum mismatch for " + name + "@" + version + "\n  caju.lock:  " + want_hash + "\n  downloaded: " + h + "\nThe downloaded files are not the ones the lock was made with.")
   }
@@ -670,6 +687,22 @@ export fn fetch(name: str, version: str, want_commit: str, want_hash: str) -> (*
   if err != nil { return nil, err }
   fetch_log = append(fetch_log, "downloaded " + name + "@" + version + " (commit " + short_commit(commit) + ", " + h + ")")
   return &Fetched{dir: dst, commit: commit, hash: h}, nil
+}
+
+fn clone_error(name: str, version: str, err: error) -> error {
+  return errors.New("cannot download " + name + "@" + version + " (git tag v" + version + " of " + source_url(name) + "): " + err.Error())
+}
+
+fn moved_error(name: str, version: str, want_commit: str, commit: str) -> error {
+  return errors.New("the tag v" + version + " of " + name + " has moved\n  caju.lock: commit " + want_commit + "\n  now:       commit " + commit + "\nA published version must not change. If you trust the new content, remove the package from caju.lock and install again.")
+}
+
+# clones the release name@version into dir without checking out its files (with git's partial
+# clone, only the commit and its tree travel), for its caju.toml; its commit
+fn clone_bare_release(name: str, version: str, dir: str) -> (str, error) {
+  _, err := git([]str{"-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1", "--filter=blob:none", "--no-checkout", "--branch", "v" + version, source_url(name), dir})
+  if err != nil { return "", clone_error(name, version, err) }
+  return git([]str{"-C", dir, "rev-parse", "HEAD"})
 }
 
 # every copy in the cache, sorted by name and version
@@ -739,17 +772,23 @@ struct Want {
 
 struct Resolver {
   pins: map[str]*Locked         # name@version -> entry of the old caju.lock
-  seen: map[str]*Locked         # name@version -> what we found
+  seen: map[str]*Locked         # name@version -> what we found (commit and hash once downloaded)
+  order: []str                  # name@version in the order they were visited
   selected: map[str]str         # name -> chosen version
   asked: map[str][]str          # name -> "version (by)" for error messages
+  clones: map[str]str           # name@version -> a clone without files (clone_bare_release)
+  tmp: str                      # where the clones are
 }
 
 # minimal version selection over the whole graph: every version asked for anywhere is visited
-# (its dependencies count too), and each package ends at the highest version asked for
+# (its dependencies count too), and each package ends at the highest version asked for. Visiting a
+# version only needs its caju.toml (from the cache, or from git without the rest of the files);
+# only the versions chosen at the end are downloaded.
 fn resolve(m: *Manifest, old: *Lock) -> (*Lock, error) {
   cerr := check_compiler(m.name, m.caju)
   if cerr != nil { return nil, cerr }
-  r := &Resolver{pins: map[str]*Locked{}, seen: map[str]*Locked{}, selected: map[str]str{}, asked: map[str][]str{}}
+  r := &Resolver{pins: map[str]*Locked{}, seen: map[str]*Locked{}, order: []str{}, selected: map[str]str{}, asked: map[str][]str{}, clones: map[str]str{}}
+  defer fn() { if r.tmp != "" { fs.remove_all(r.tmp) } }()
   if old != nil { for _, l := range old.pkgs { r.pins[l.name + "@" + l.version] = l } }
   queue := []*Want{}
   for _, d := range m.deps { queue = append(queue, &Want{name: d.name, version: d.version, by: m.name}) }
@@ -774,25 +813,32 @@ fn resolve(m: *Manifest, old: *Lock) -> (*Lock, error) {
     }
     key := w.name + "@" + w.version
     if _, ok := r.seen[key]; ok { continue }
-    pin := r.pins[key]
-    want_commit := ""
-    want_hash := ""
-    if pin != nil {
-      want_commit = pin.commit
-      want_hash = pin.hash
-    }
-    f, err := fetch(w.name, w.version, want_commit, want_hash)
+    dm, err := r.manifest_of(w.name, w.version)
     if err != nil { return nil, err }
-    dm, err2 := read_manifest(f.dir)
-    if err2 != nil { return nil, errors.New(w.name + "@" + w.version + ": " + err2.Error()) }
     if dm.name != w.name { return nil, errors.New(w.name + "@" + w.version + ": its caju.toml says the name is " + dm.name) }
     err = check_compiler(w.name + "@" + w.version, dm.caju)
     if err != nil { return nil, err }
     if dm.version != w.version { return nil, errors.New(w.name + ": the tag v" + w.version + " has version = \"" + dm.version + "\" in its caju.toml") }
-    l := &Locked{name: w.name, version: w.version, source: source_url(w.name), commit: f.commit, hash: f.hash, deps: requires_of(dm)}
+    l := &Locked{name: w.name, version: w.version, source: source_url(w.name), deps: requires_of(dm)}
     if os.getenv("CAJU_PKG_SOURCE") != "" { l.source = "https://" + w.name }
     r.seen[key] = l
+    r.order = append(r.order, key)
     for _, d := range dm.deps { queue = append(queue, &Want{name: d.name, version: d.version, by: key}) }
+  }
+  # download (or reuse) only the chosen versions
+  for _, key := range r.order {
+    l := r.seen[key]
+    if r.selected[l.name] != l.version { continue }
+    want_commit := ""
+    want_hash := ""
+    if pin := r.pins[key]; pin != nil {
+      want_commit = pin.commit
+      want_hash = pin.hash
+    }
+    f, err := fetch_from(l.name, l.version, want_commit, want_hash, r.clones[key])
+    if err != nil { return nil, err }
+    l.commit = f.commit
+    l.hash = f.hash
   }
   names := []str{}
   for n, _ := range r.selected { names = append(names, n) }
@@ -800,6 +846,37 @@ fn resolve(m: *Manifest, old: *Lock) -> (*Lock, error) {
   lk := &Lock{requires: requires_of(m), pkgs: []*Locked{}}
   for _, n := range names { lk.pkgs = append(lk.pkgs, r.seen[n + "@" + r.selected[n]]) }
   return lk, nil
+}
+
+# the caju.toml of name@version: from a cached copy that checks out (and matches caju.lock), or
+# else from git, cloning the release without its files (kept for fetch_from if it is chosen)
+fn (r: *Resolver) manifest_of(name: str, version: str) -> (*Manifest, error) {
+  key := name + "@" + version
+  pin := r.pins[key]
+  if e, h, err := check_cached(name, version); e != nil && err == nil {
+    if pin == nil || ((pin.hash == "" || pin.hash == h) && (pin.commit == "" || e.commit == "" || pin.commit == e.commit)) {
+      return read_manifest(e.dir)
+    }
+  }
+  if r.tmp == "" {
+    err := fs.mkdir_all(path.join(home(), "tmp"), 0o755)
+    if err != nil { return nil, err }
+    t, err2 := fs.temp_dir(path.join(home(), "tmp"), "resolve-")
+    if err2 != nil { return nil, err2 }
+    r.tmp = t
+  }
+  dir := path.join(r.tmp, str(len(r.clones)))
+  commit, err := clone_bare_release(name, version, dir)
+  if err != nil { return nil, err }
+  if pin != nil && pin.commit != "" && commit != pin.commit { return nil, moved_error(name, version, pin.commit, commit) }
+  # only the standard output: fetching the file's blob may report progress on the error output
+  p, err2 := os.run([]str{"git", "-C", dir, "cat-file", "blob", "HEAD:caju.toml"}, nil, false)
+  if err2 == nil && p.code != 0 { err2 = errors.New("git cat-file failed (exit code " + str(p.code) + ")") }
+  if err2 != nil { return nil, errors.New("cannot read the caju.toml of " + key + ": " + err2.Error()) }
+  src := p.output
+  r.clones[key] = dir
+  fetch_log = append(fetch_log, "read the caju.toml of " + key + " (commit " + short_commit(commit) + ")")
+  return parse_manifest(src, key + "/caju.toml", "")
 }
 
 fn sort_strs(xs: []str) {
