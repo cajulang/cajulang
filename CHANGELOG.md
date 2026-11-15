@@ -6,6 +6,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-15
+
 ### Added
 - `std/tls`: TLS 1.3 and 1.2 clients: `tls.dial(host, port, config)` and `tls.client(sock, name,
   config)` give a `*tls.Conn` with `read`, `write`, `close`. TLS 1.3 with X25519 and
@@ -250,7 +252,8 @@ notes from the section of its version here (`tools/changelog.sh`).
 - Benchmark against Go, Rust and Python (`bench/compare`).
 - Release package, installer (`install.sh`) and GitHub workflows. MIT license.
 
-[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/cajulang/cajulang/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/cajulang/cajulang/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cajulang/cajulang/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cajulang/cajulang/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cajulang/cajulang/compare/v0.4.0...v0.5.0
