@@ -1,9 +1,9 @@
 import { describe, it, expect, run_file } from "std/testing"
 
 describe("closures in an imported module", fn() {
-  it("call their own function-valued parameters and locals", fn() {
+  it("call their own function-valued parameters, locals and range variables", fn() {
     r := run_file("testdata/closure_mod_main.caju")
-    expect(r.output).to_equal("parameter ran\nlocal ran\n41")
+    expect(r.output).to_equal("parameter ran\nlocal ran\n41\nrange ran\nclosure range 0\nparameter ran\nswitch ran")
     expect(r.code).to_equal(0)
   })
 })

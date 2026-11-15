@@ -16,3 +16,18 @@ export fn nested() -> fn(int) -> int {
     return twice(n) + 1
   }
 }
+export fn ranged() {
+  offs := []fn(){fn() { print("range ran") }}
+  for _, off := range offs { off() }
+  run(fn(done: fn()) {
+    for i, cb := range []fn(int){fn(n: int) { print("closure range " + str(n)) }} { cb(i) }
+    done()
+  })
+}
+export fn switched(v: any) -> str {
+  switch s := v.(type) {
+  case str:
+    return s
+  }
+  return ""
+}

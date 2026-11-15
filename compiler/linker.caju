@@ -15,6 +15,7 @@ struct Mod {
   exports: map[str]*ast.Node
   callables: map[str]bool
   declared: map[str]bool
+  bound: map[str]bool      # range variables and type-switch bindings (renamed like locals)
 }
 
 struct Linker {
@@ -52,6 +53,22 @@ fn walk_declared(n: *ast.Node, names: map[str]bool) {
   # closure would keep its plain name while the parameter gets the module's
   walk_literals(n, names)
 }
+# the variables of for ... := range and the bindings of switch v := x.(type), anywhere in a file
+# (also inside function literals): a call to one of them must be renamed like the variable. They
+# are kept apart from declared_in, which also decides conflicts with imported names.
+fn walk_bound(n: *ast.Node, names: map[str]bool) {
+  if n == nil { return }
+  if n.kind == "Range" && n.define {
+    for _, v := range n.vars { if v != nil && v.kind == "Var" { names[v.name] = true } }
+  }
+  if n.kind == "TypeSwitch" && n.bind != "" { names[n.bind] = true }
+  for _, k := range []*ast.Node{n.value, n.expr, n.left, n.right, n.arg, n.cond, n.obj, n.index, n.lo, n.hi, n.key, n.call, n.fn_, n.from_, n.to_, n.subject, n.body, n.then, n.otherwise, n.init, n.post} { walk_bound(k, names) }
+  for _, xs := range [][]*ast.Node{n.stmts, n.args, n.values, n.exprs, n.elems, n.targets, n.cases, n.vars} {
+    for _, x := range xs { walk_bound(x, names) }
+  }
+  for _, f := range n.fields { walk_bound(f.value, names) }
+}
+
 fn walk_literals(n: *ast.Node, names: map[str]bool) {
   if n == nil { return }
   if n.kind == "FuncLit" {
@@ -96,6 +113,8 @@ fn (l: *Linker) load(name: str, from_: *ast.Node) {
     if st.kind == "Func" || st.kind == "Extern" { m.callables[st.name] = true }
   }
   m.declared = declared_in(tree)
+  m.bound = map[str]bool{}
+  walk_bound(tree, m.bound)
   l.mods[name] = m
   l.order = append(l.order, name)
 }
@@ -335,7 +354,7 @@ fn (r: *Renamer) tx(n: *ast.Node) -> *ast.Node {
   # calls: the module's own or imported functions and externs get their linked name; built-ins stay as they are
   if n.kind == "Call" {
     _, imp := r.imported[n.name]
-    if imp || r.m.callables[n.name] || r.m.declared[n.name] || strings.index_byte(n.name, 46) >= 0 { o.name = r.rename(n.name) }
+    if imp || r.m.callables[n.name] || r.m.declared[n.name] || r.m.bound[n.name] || strings.index_byte(n.name, 46) >= 0 { o.name = r.rename(n.name) }
   }
   # children, in the order of the JavaScript
   o.expr = r.tx(n.expr)
