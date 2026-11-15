@@ -180,12 +180,12 @@ describe("http client", fn() {
     expect(err2).to_be_nil()
     expect(len(r.body)).to_equal(10000)
   })
-  it("refuses https and malformed URLs, and reports refused connections", fn() {
-    _, a := http.get("https://example.com/")
+  it("refuses other schemes and malformed URLs, and reports refused connections", fn() {
+    _, a := http.get("https://127.0.0.1:1/")
     _, b := http.get("ftp://x/")
     _, c := http.get("http://127.0.0.1:1/")
     _, d := http.get("http://host:99999/")
-    expect(a.Error()).to_contain("https is not supported")
+    expect(a).to_be_error("http: tls: dial 127.0.0.1:1: connection refused")
     expect(b.Error()).to_contain("not an http:// URL")
     expect(c).to_be_error("http: dial 127.0.0.1:1: connection refused")
     expect(d.Error()).to_contain("invalid port")

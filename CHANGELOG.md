@@ -6,6 +6,25 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Added
+- `std/tls`: TLS 1.3 clients (RFC 8446): `tls.dial(host, port, config)` and `tls.client(sock, name,
+  config)` give a `*tls.Conn` with `read`, `write`, `close`. X25519 key exchange; cipher suites
+  TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; SNI, ALPN,
+  KeyUpdate; the certificate chain is verified against the system's roots and the host name.
+  No session resumption, 0-RTT or client certificates; TLS 1.2-only servers get an error.
+  `docs/tls.md`.
+- `std/http`'s client speaks `https://` (`ClientRequest.tls` for another `*tls.Config`).
+- `std/x509`: X.509 certificates: strict DER parsing (`parse`, `parse_pem`), the system's roots
+  (`system_roots`, `$SSL_CERT_FILE`), chain verification with dates, CA flags, key usage, path
+  length, extended key usage and host names (`verify`, `match_hostname`). `docs/x509.md`.
+- `std/pubkey`: signature verification for RSA (PKCS#1 v1.5 and PSS), ECDSA P-256/P-384 and
+  Ed25519 keys given as SubjectPublicKeyInfo (`verify_signature`, `key_info`). `docs/pubkey.md`.
+- `std/cipher`: AES-GCM (128/192/256) and ChaCha20-Poly1305 (`aes_gcm_seal`/`open`,
+  `chacha20_poly1305_seal`/`open`, and `new_aes_gcm`/`new_chacha20_poly1305` for many messages
+  with one key). `docs/cipher.md`.
+- `std/crypto`: X25519 (`x25519`, `x25519_base`), SHA-384 (`sha384`, `new_sha384`,
+  `hmac_sha384`) and HKDF (`hkdf_extract`, `hkdf_expand`).
+
 ## [0.7.0] - 2026-11-15
 
 ### Added

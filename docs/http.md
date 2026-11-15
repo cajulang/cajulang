@@ -95,8 +95,11 @@ What it does:
 - **Names**: `net.resolve` looks in `/etc/hosts`, then asks the DNS servers of `/etc/resolv.conf`
   (A records, cached for their TTL). IPv4 only.
 
-Limits: no TLS, so `https://` URLs are refused; requests run one at a time (Caju has no threads),
-and the whole body is read into memory.
+- **https://**: TLS 1.3 through `std/tls` (`docs/tls.md`), with the certificate checked against
+  the system's roots and the host name. `ClientRequest.tls` takes a `*tls.Config` (other roots,
+  another server name). Servers that only speak TLS 1.2 get an error.
+
+Limits: requests run one at a time (Caju has no threads), and the whole body is read into memory.
 
 ## Encoding
 

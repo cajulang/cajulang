@@ -18,6 +18,7 @@ import "std/net"
 import "std/strings"
 import "std/strconv"
 import "std/os"
+import "std/tls"
 import urlpath "std/path"
 
 export struct Request {
@@ -993,8 +994,8 @@ export fn listen_and_serve_workers(host: str, port: int, n: int) -> error {
 #   r3, err3 := http.request(&http.ClientRequest{method: "PUT", url: u, body: b,
 #                                                  headers: map[str]str{"Authorization": "Bearer x"}})
 #
-# HTTP/1.1 over plain TCP: "https://" URLs are refused (there is no TLS yet). Hosts are names or
-# IPv4 addresses (net.resolve). Connections are kept alive and reused for the next request to the
+# HTTP/1.1 over TCP, and over TLS 1.3 for "https://" URLs (std/tls: the certificate is verified
+# against the system's roots and the host name). Hosts are names or IPv4 addresses (net.resolve). Connections are kept alive and reused for the next request to the
 # same host:port; redirects are followed (up to 10); bodies come whole, by Content-Length, chunked
 # or until the server closes. Each read, write and connect waits at most the request's timeout.
 
@@ -1005,6 +1006,16 @@ export struct ClientRequest {
   body: str
   timeout_ms: int           # 0: the default (set_client_timeout, 30 s)
   no_redirects: bool        # give 3xx responses back instead of following them
+  tls: *tls.Config          # https: other roots, a server name... (nil: the defaults)
+}
+
+# a connection the client sends requests on: a *net.Conn (http://) or a *tls.Conn (https://)
+export interface ClientConn {
+  read(max: int) -> (str, error)
+  write(s: str) -> error
+  set_timeout(ms: int)
+  readable() -> bool
+  close()
 }
 
 export struct ClientResponse {
@@ -1025,7 +1036,7 @@ let user_agent: str = "caju-http/1"
 let max_response: int = 64 << 20
 const MAX_RESPONSE_HEADERS = 200
 # idle kept-alive connections by "host:port"
-let idle_conns = map[str][]*net.Conn{}
+let idle_conns = map[str][]ClientConn{}
 const MAX_IDLE_PER_HOST = 8
 
 # the timeout of requests that do not give one
@@ -1039,7 +1050,7 @@ export fn close_idle_connections() {
   for _, conns := range idle_conns {
     for _, c := range conns { c.close() }
   }
-  idle_conns = map[str][]*net.Conn{}
+  idle_conns = map[str][]ClientConn{}
 }
 
 export fn get(url: str) -> (*ClientResponse, error) {
@@ -1069,7 +1080,7 @@ export fn request(req: *ClientRequest) -> (*ClientResponse, error) {
   timeout := req.timeout_ms
   if timeout <= 0 { timeout = client_timeout_ms }
   for hop := 0; hop <= 10; hop++ {
-    res, err := round_trip(method, url, headers, body, timeout)
+    res, err := round_trip(method, url, headers, body, timeout, req.tls)
     if err != nil { return nil, err }
     loc := res.headers["location"]
     if req.no_redirects || loc == "" || (res.status != 301 && res.status != 302 && res.status != 303 && res.status != 307 && res.status != 308) {
@@ -1094,8 +1105,12 @@ export fn request(req: *ClientRequest) -> (*ClientResponse, error) {
 fn origin_of(url: str) -> str {
   host, port, _, err := split_url(url)
   if err != nil { return "" }
-  return strings.to_lower(host) + ":" + str(port)
+  scheme := "http://"
+  if is_https(url) { scheme = "https://" }
+  return scheme + strings.to_lower(host) + ":" + str(port)
 }
+
+fn is_https(url: str) -> bool { return strings.has_prefix(url, "https://") }
 
 # a copy of headers without the given names (any case; names in lower case)
 fn without(headers: map[str]str, names: []str) -> map[str]str {
@@ -1111,10 +1126,12 @@ fn without(headers: map[str]str, names: []str) -> map[str]str {
 # the parts of an http URL: host, port, the request target (path and query)
 fn split_url(url: str) -> (str, int, str, error) {
   rest := ""
+  port := 80
   if strings.has_prefix(url, "http://") {
     rest = url[7:len(url)]
   } else if strings.has_prefix(url, "https://") {
-    return "", 0, "", errors.New("http: " + url + ": https is not supported (std/http has no TLS yet)")
+    rest = url[8:len(url)]
+    port = 443
   } else {
     return "", 0, "", errors.New("http: " + url + ": not an http:// URL")
   }
@@ -1133,7 +1150,6 @@ fn split_url(url: str) -> (str, int, str, error) {
   if target == "" || int(target[0]) == 63 { target = "/" + target }
   if strings.index_byte(authority, 64) >= 0 { return "", 0, "", errors.New("http: " + url + ": user info in URLs is not supported (send an Authorization header)") }
   host := authority
-  port := 80
   colon := strings.last_index(authority, ":")
   if colon >= 0 {
     host = authority[0:colon]
@@ -1153,13 +1169,15 @@ fn split_url(url: str) -> (str, int, str, error) {
 # a Location header made absolute against the URL that sent it
 fn resolve_url(base: str, loc: str) -> str {
   if strings.has_prefix(loc, "http://") || strings.has_prefix(loc, "https://") { return loc }
-  if strings.has_prefix(loc, "//") { return "http:" + loc }
-  rest := base[7:len(base)]
+  scheme := "http://"
+  if is_https(base) { scheme = "https://" }
+  if strings.has_prefix(loc, "//") { return scheme[0:len(scheme) - 2] + loc }
+  rest := base[len(scheme):len(base)]
   slash := strings.index_byte(rest, 47)
-  origin := "http://" + rest
+  origin := scheme + rest
   path := "/"
   if slash >= 0 {
-    origin = "http://" + rest[0:slash]
+    origin = scheme + rest[0:slash]
     path = rest[slash:len(rest)]
   }
   if strings.has_prefix(loc, "/") { return origin + loc }
@@ -1172,22 +1190,36 @@ fn resolve_url(base: str, loc: str) -> str {
 
 # one request on a kept-alive connection or a new one; a reused connection the server had
 # already closed is replaced once
-fn round_trip(method: str, url: str, headers: map[str]str, body: str, timeout: int) -> (*ClientResponse, error) {
+fn round_trip(method: str, url: str, headers: map[str]str, body: str, timeout: int, tc: *tls.Config) -> (*ClientResponse, error) {
   host, port, target, err := split_url(url)
   if err != nil { return nil, err }
+  secure := is_https(url)
   key := host + ":" + str(port)
+  if secure { key = "tls " + key }
   if !valid_name(method) { return nil, errors.New("http: invalid method " + strconv.quote(method)) }
   for k, v := range headers {
     if !valid_name(k) { return nil, errors.New("http: invalid header name " + strconv.quote(k)) }
     if clean_value(v) != v { return nil, errors.New("http: invalid value for header " + k + " (CR, LF or NUL)") }
   }
-  msg := request_text(method, host, port, target, headers, body)
+  default_port := 80
+  if secure { default_port = 443 }
+  msg := request_text(method, host, port, default_port, target, headers, body)
   for attempt := 0; attempt < 2; attempt++ {
     c, reused := take_idle(key)
     if c == nil {
-      nc, derr := net.dial_timeout(host, port, timeout)
-      if derr != nil { return nil, errors.New("http: " + derr.Error()) }
-      c = nc
+      if secure {
+        cfg := &tls.Config{timeout_ms: timeout, alpn: []str{"http/1.1"}}
+        if tc != nil {
+          cfg = &tls.Config{server_name: tc.server_name, roots: tc.roots, insecure_skip_verify: tc.insecure_skip_verify, alpn: []str{"http/1.1"}, timeout_ms: timeout}
+        }
+        tcn, terr := tls.dial(host, port, cfg)
+        if terr != nil { return nil, errors.New("http: " + terr.Error()) }
+        c = tcn
+      } else {
+        nc, derr := net.dial_timeout(host, port, timeout)
+        if derr != nil { return nil, errors.New("http: " + derr.Error()) }
+        c = nc
+      }
     }
     c.set_timeout(timeout)
     werr := c.write(msg)
@@ -1210,7 +1242,7 @@ fn round_trip(method: str, url: str, headers: map[str]str, body: str, timeout: i
   return nil, errors.New("http: " + key + ": the connection was closed")
 }
 
-fn take_idle(key: str) -> (*net.Conn, bool) {
+fn take_idle(key: str) -> (ClientConn, bool) {
   conns := idle_conns[key]
   while len(conns) > 0 {
     c := conns[len(conns) - 1]
@@ -1223,7 +1255,7 @@ fn take_idle(key: str) -> (*net.Conn, bool) {
   return nil, false
 }
 
-fn put_idle(key: str, c: *net.Conn) {
+fn put_idle(key: str, c: ClientConn) {
   conns := idle_conns[key]
   if len(conns) >= MAX_IDLE_PER_HOST {
     c.close()
@@ -1239,7 +1271,7 @@ fn has_header(headers: map[str]str, name: str) -> bool {
   return false
 }
 
-fn request_text(method: str, host: str, port: int, target: str, headers: map[str]str, body: str) -> str {
+fn request_text(method: str, host: str, port: int, default_port: int, target: str, headers: map[str]str, body: str) -> str {
   b := strings.Builder{}
   b.write(method)
   b.write(" ")
@@ -1248,7 +1280,7 @@ fn request_text(method: str, host: str, port: int, target: str, headers: map[str
   if !has_header(headers, "host") {
     b.write("Host: ")
     b.write(host)
-    if port != 80 { b.write(":" + str(port)) }
+    if port != default_port { b.write(":" + str(port)) }
     b.write("\r\n")
   }
   if !has_header(headers, "user-agent") { b.write("User-Agent: " + user_agent + "\r\n") }
@@ -1283,7 +1315,7 @@ fn sorted_keys(m: map[str]str) -> []str {
 
 # reads the bytes of a response as they arrive
 struct Reader {
-  conn: *net.Conn
+  conn: ClientConn
   buf: str
   pos: int
   got: bool       # something arrived
@@ -1383,7 +1415,7 @@ fn (r: *Reader) rest() -> (str, error) {
 }
 
 # reads one response: it, whether any byte arrived, whether the connection can be kept
-fn read_reply(c: *net.Conn, method: str) -> (*ClientResponse, bool, bool, error) {
+fn read_reply(c: ClientConn, method: str) -> (*ClientResponse, bool, bool, error) {
   r := &Reader{conn: c}
   informational := 0
   while true {

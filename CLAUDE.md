@@ -39,7 +39,7 @@ compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module ta
   graph.caju           the in-memory code graph behind the MCP graph tools (caju_find, caju_symbol...)
 rt/*.caju            runtime for programs: core, gc, values, dynamic, panic, linux, windows, wasm
 lib/*.caju           standard library (import "std/x"): strings, strconv, math, bytes, os, fs, path,
-                     net, http, websocket, toml, json, crypto, hash, hex, base64, cli, testing; each with its _test.caju
+                     net, http, websocket, tls, x509, pubkey, cipher, toml, json, crypto, hash, hex, base64, cli, testing; each with its _test.caju
 bootstrap/*.js       the original JavaScript compiler (lexer, parser, types, linker, VM, native.js)
 tests/lang/          language tests (*_test.caju + testdata/)
 examples/            language examples; examples_test.caju runs each one and checks the output

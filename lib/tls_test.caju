@@ -1,0 +1,156 @@
+# std/tls against `openssl s_server` (TLS 1.3, test certificates in testdata/tls/, made by gen.sh),
+# and std/http's https:// client on top of it. With CAJU_NET_TESTS=1, also real servers.
+import "std/tls"
+import "std/http"
+import "std/x509"
+import "std/net"
+import "std/os"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+# below 32768, outside Linux's range for outgoing ports (see http_test)
+let next_port: int = 28000 + os.getpid() % 3000
+let port: int = 0
+let pid: str = ""
+
+fn roots() -> []*x509.Certificate {
+  pem, _ := os.read_file("testdata/tls/ca.pem")
+  cs, err := x509.parse_pem(pem)
+  if err != nil { panic(err.Error()) }
+  return cs
+}
+
+# starts openssl s_server with the key of name and extra options; it answers GET with a page
+fn serve(name: str, extra: str) {
+  next_port++
+  port = next_port
+  p, err := os.run([]str{"sh", "-c", "openssl s_server -accept " + str(port) + " -cert testdata/tls/" + name + ".pem -key testdata/tls/" + name + ".key -www -quiet " + extra + " >/dev/null 2>&1 & echo $!"}, nil, false)
+  if err != nil { panic(err.Error()) }
+  pid = strings.trim_space(p.output)
+  deadline := os.nanotime() + 10000000000
+  while os.nanotime() < deadline {
+    c, err2 := net.dial("127.0.0.1", port)
+    if err2 == nil {
+      c.close()
+      return
+    }
+  }
+  panic("openssl s_server did not start")
+}
+
+fn stop() {
+  if pid != "" { os.run([]str{"sh", "-c", "kill " + pid + " 2>/dev/null; while kill -0 " + pid + " 2>/dev/null; do sleep 0.05; done"}, nil, true) }
+  pid = ""
+}
+
+# a GET over a TLS connection: the start of the response, or "error: ..."
+fn get(cfg: *tls.Config) -> str {
+  c, err := tls.dial("127.0.0.1", port, cfg)
+  if err != nil { return "error: " + err.Error() }
+  c.write("GET / HTTP/1.0\r\n\r\n")
+  out := ""
+  while true {
+    chunk, rerr := c.read(65536)
+    if rerr != nil { return "error: " + rerr.Error() }
+    if chunk == "" { break }
+    out = out + chunk
+  }
+  c.close()
+  return out
+}
+
+fn has_openssl() -> bool {
+  p, err := os.run([]str{"sh", "-c", "openssl version"}, nil, true)
+  return err == nil && p.code == 0
+}
+
+describe("tls client", fn() {
+  if !has_openssl() { return }
+  it("handshakes with an ECDSA certificate and exchanges data", fn() {
+    serve("ecdsa", "")
+    r := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    expect(r).to_start_with("HTTP/1.0 200 ok")
+    expect(r).to_contain("TLSv1.3")
+  })
+  it("verifies RSA (PSS) and Ed25519 certificates", fn() {
+    serve("rsa", "")
+    r1 := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    serve("ed25519", "")
+    r2 := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    expect(r1).to_start_with("HTTP/1.0 200 ok")
+    expect(r2).to_start_with("HTTP/1.0 200 ok")
+  })
+  it("speaks each cipher suite", fn() {
+    for _, suite := range []str{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"} {
+      serve("ecdsa", "-ciphersuites " + suite)
+      c, err := tls.dial("127.0.0.1", port, &tls.Config{server_name: "localhost", roots: roots()})
+      got := ""
+      if err != nil { got = err.Error() } else {
+        got = c.cipher_suite
+        c.write("GET / HTTP/1.0\r\n\r\n")
+        data, _ := c.read(100)
+        got = got + " " + data[0:15]
+        c.close()
+      }
+      stop()
+      expect(got).to_equal(suite + " HTTP/1.0 200 ok")
+    }
+  })
+  it("checks the address dialed against the certificate's IP addresses", fn() {
+    serve("ecdsa", "")
+    r := get(&tls.Config{roots: roots()})
+    stop()
+    expect(r).to_start_with("HTTP/1.0 200 ok")
+  })
+  it("refuses a certificate for another name, or from an unknown authority", fn() {
+    serve("ecdsa", "")
+    r1 := get(&tls.Config{server_name: "other.test", roots: roots()})
+    r2 := get(&tls.Config{server_name: "localhost"})
+    r3 := get(&tls.Config{server_name: "other.test", insecure_skip_verify: true})
+    stop()
+    expect(r1).to_start_with("error: tls: certificate is valid for localhost")
+    expect(r2).to_start_with("error: tls: certificate signed by unknown authority")
+    expect(r3).to_start_with("HTTP/1.0 200 ok")
+  })
+  it("refuses a server that only speaks TLS 1.2", fn() {
+    serve("ecdsa", "-tls1_2")
+    r := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    expect(r).to_start_with("error: tls:")
+  })
+  it("agrees on an application protocol (ALPN)", fn() {
+    serve("ecdsa", "-alpn http/1.1")
+    c, err := tls.dial("127.0.0.1", port, &tls.Config{server_name: "localhost", roots: roots(), alpn: []str{"h2", "http/1.1"}})
+    proto := ""
+    if err == nil {
+      proto = c.protocol
+      c.close()
+    }
+    stop()
+    expect(err).to_be_nil()
+    expect(proto).to_equal("http/1.1")
+  })
+  it("carries std/http's https:// requests", fn() {
+    serve("ecdsa", "")
+    r, err := http.request(&http.ClientRequest{url: "https://localhost:" + str(port) + "/", tls: &tls.Config{roots: roots()}})
+    _, err2 := http.get("https://localhost:" + str(port) + "/")
+    stop()
+    expect(err).to_be_nil()
+    expect(r.status).to_equal(200)
+    expect(r.body).to_contain("TLSv1.3")
+    expect(err2.Error()).to_contain("unknown authority")
+  })
+})
+
+describe("tls with real servers (CAJU_NET_TESTS=1)", fn() {
+  if os.getenv("CAJU_NET_TESTS") == "" { return }
+  it("gets pages over https with the system's roots", fn() {
+    for _, u := range []str{"https://github.com/", "https://www.google.com/", "https://cloudflare.com/", "https://api.github.com/zen"} {
+      r, err := http.get(u)
+      if err != nil { expect(u + ": " + err.Error()).to_equal(u + ": ok") } else { expect(r.status < 500).to_be_true() }
+    }
+  })
+})
