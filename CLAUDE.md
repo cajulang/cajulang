@@ -38,7 +38,7 @@ compiler/*.caju      the compiler, in Caju (see docs/compiler-port.md, module ta
   graph.caju           the in-memory code graph behind the MCP graph tools (caju_find, caju_symbol...)
 rt/*.caju            runtime for programs: core, gc, values, dynamic, panic, linux, windows, wasm
 lib/*.caju           standard library (import "std/x"): strings, strconv, math, bytes, os, fs, path,
-                     net, http, toml, json, crypto, hash, hex, base64, cli, testing; each with its _test.caju
+                     net, http, websocket, toml, json, crypto, hash, hex, base64, cli, testing; each with its _test.caju
 bootstrap/*.js       the original JavaScript compiler (lexer, parser, types, linker, VM, native.js)
 tests/lang/          language tests (*_test.caju + testdata/)
 examples/            language examples; examples_test.caju runs each one and checks the output
@@ -76,8 +76,8 @@ expect(v).to_equal(w) }) })`. There are no `.out` files. Compile/run errors of a
 `run_file("testdata/x.caju")` → `r.output`, `r.code`. Known bug not fixed yet: write the correct
 test with `skip("... (known bug)", ...)`.
 
-In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`, `http` and `http_client`
-(no sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
+In wasm (`--target wasm tests/lang lib examples`) everything passes except `net`, `http`, `http_client` and
+`websocket` (no sockets). Changed the native generator or `rt/`? Also run the wasm suite: `compiler/wasm.caju`
 repeats the semantics of `native.caju` (without the optimizations) and uses the same runtime.
 
 Expected result today: **888 pass, 0 fail, 9 skipped** (goroutines, alloc/peek/poke, Windows

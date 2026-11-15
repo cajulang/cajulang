@@ -33,11 +33,71 @@ export struct Response {
   status: int
   headers: map[str]str
   body: strings.Builder
+  upgrade_to: StreamHandler    # set by upgrade: the connection changes protocol after this response
 }
 
 export fn (r: *Response) set_header(name: str, value: str) { r.headers[name] = value }
 export fn (r: *Response) set_status(code: int) { r.status = code }
 export fn (r: *Response) write(s: str) { r.body.write(s) }
+
+# ---------------------------------------------------------------- streams (protocol upgrades)
+#
+# A handler can hand its connection over to another protocol (WebSocket): it answers
+# 101 Switching Protocols and calls res.upgrade(h). After that response the event loop calls
+# h.stream_open with the stream, gives
+# h.stream_data every byte that arrives on the connection (including any that came right after the
+# request), sends what s.write queues, and calls h.stream_closed once when the connection ends. A
+# stream is never closed for being idle (the protocol pings on its own). Only listen_and_serve
+# and listen_and_serve_workers do this; serve_conn answers and closes.
+
+export interface StreamHandler {
+  stream_open(s: *Stream)
+  stream_data(s: *Stream, data: str)
+  stream_closed(s: *Stream)
+}
+
+export struct Stream {
+  id: int                 # unique in this process
+  remote_addr: str
+  closed: bool            # the connection ended (writes are dropped)
+  peer: *Peer
+  handler: StreamHandler
+}
+
+let next_stream_id: int = 0
+let pending_peers = []*Peer{}       # peers with output queued outside their own event
+
+# the connection becomes a stream of h after this response (send status 101 and the protocol's headers)
+export fn (r: *Response) upgrade(h: StreamHandler) { r.upgrade_to = h }
+
+# queues data to send on the stream
+export fn (s: *Stream) write(data: str) {
+  if s.closed || s.peer == nil || s.peer.closing { return }
+  cl := s.peer
+  if cl.out_n == 0 { pending_peers = append(pending_peers, cl) }
+  cl.put(data)
+}
+
+# closes the stream once what was queued has been sent
+export fn (s: *Stream) close() {
+  if s.closed || s.peer == nil { return }
+  s.peer.closing = true
+  if s.peer.out_n == 0 { pending_peers = append(pending_peers, s.peer) }
+}
+
+struct Timer {
+  every_ms: int
+  next: int
+  f: fn()
+}
+let timers = []*Timer{}
+
+# runs f every ms milliseconds inside the server's event loop (between events), for work that is
+# not an answer to a request: pings, broadcasts, cleanups
+export fn every(ms: int, f: fn()) {
+  if ms < 1 { ms = 1 }
+  timers = append(timers, &Timer{every_ms: ms, next: now_ms() + ms, f: f})
+}
 
 # the header value for name (any case), or ""
 export fn (r: *Request) header(name: str) -> str {
@@ -97,6 +157,7 @@ export fn status_text(code: int) -> str {
   switch code {
   case 200: return "OK"
   case 201: return "Created"
+  case 101: return "Switching Protocols"
   case 202: return "Accepted"
   case 204: return "No Content"
   case 301: return "Moved Permanently"
@@ -112,6 +173,7 @@ export fn status_text(code: int) -> str {
   case 405: return "Method Not Allowed"
   case 408: return "Request Timeout"
   case 409: return "Conflict"
+  case 426: return "Upgrade Required"
   case 411: return "Length Required"
   case 413: return "Payload Too Large"
   case 422: return "Unprocessable Entity"
@@ -246,6 +308,7 @@ struct Peer {
   closing: bool   # close once the output is sent
   dead: bool
   waiting_out: bool
+  stream: *Stream # after an upgrade: the bytes go to its handler
 }
 
 # Buffers start small (they grow when needed) and closed connections give their Peer back for
@@ -287,6 +350,7 @@ fn release(cl: *Peer) {
   cl.closing = false
   cl.dead = false
   cl.waiting_out = false
+  cl.stream = nil
   free_peers = append(free_peers, cl)
 }
 
@@ -437,6 +501,17 @@ fn (cl: *Peer) put_response(res: *Response, head_only: bool, keep: bool, http10:
   cl.put(" ")
   cl.put(status_text(res.status))
   cl.put("\r\n")
+  if res.status == 101 {
+    # switching protocols: only the handler's headers, no body
+    for k, v := range res.headers {
+      cl.put(k)
+      cl.put(": ")
+      cl.put(v)
+      cl.put("\r\n")
+    }
+    cl.put("\r\n")
+    return
+  }
   typed := false
   for k, v := range res.headers {
     if eq_fold(k, "content-length") || eq_fold(k, "connection") { continue }
@@ -479,9 +554,33 @@ fn (cl: *Peer) handle_input() {
       res.status = 404
       res.write("404 page not found\n")
     } else { h(req, res) }
+    if res.status == 101 && res.upgrade_to != nil {
+      cl.put_response(res, false, true, false)
+      next_stream_id++
+      st := &Stream{id: next_stream_id, remote_addr: cl.conn.remote_addr, peer: cl, handler: res.upgrade_to}
+      cl.stream = st
+      st.handler.stream_open(st)
+      # what arrived after the request already belongs to the new protocol
+      if cl.end > cl.start {
+        rest := mem_str(cl.inb + cl.start, cl.end - cl.start)
+        cl.start = 0
+        cl.end = 0
+        cl.scanned = 0
+        st.handler.stream_data(st, rest)
+      }
+      return
+    }
     cl.put_response(res, req.method == "HEAD", keep, req.version == "HTTP/1.0")
     if !keep { cl.closing = true }
   }
+}
+
+# a peer that ends: its stream (if any) is told once
+fn (cl: *Peer) end_stream() {
+  st := cl.stream
+  if st == nil || st.closed { return }
+  st.closed = true
+  st.handler.stream_closed(st)
 }
 
 # sends what it can of the output; true when everything went out
@@ -503,6 +602,17 @@ fn (cl: *Peer) flush() -> bool {
 
 # reads what arrived and answers the complete requests
 fn (cl: *Peer) on_readable() {
+  if cl.stream != nil {
+    r := cl.conn.read_into(cl.inb, cl.icap)
+    if r == -11 { return }
+    if r <= 0 {
+      cl.closing = true
+      cl.dead = true
+      return
+    }
+    cl.stream.handler.stream_data(cl.stream, mem_str(cl.inb, r))
+    return
+  }
   cl.in_room(4096)
   r := cl.conn.read_into(cl.inb + cl.end, cl.icap - cl.end)
   if r == -11 { return }
@@ -526,6 +636,27 @@ fn now_ms() -> int {
 
 const LISTENER = -1
 
+# after an event (or a timer) touched cl: send what it can, wait for room if the socket is full,
+# and drop it if it ended
+fn settle(p: *net.Poller, clients: map[int]*Peer, cl: *Peer) {
+  if cl.conn == nil { return }                   # already released
+  if !cl.dead && cl.out_n > 0 && !cl.waiting_out {
+    if !cl.flush() && !cl.dead {
+      # the socket is full: wait until it can take more, without reading meanwhile
+      cl.waiting_out = true
+      p.modify(cl.conn.fd, net.EV_OUT, cl.conn.fd)
+    }
+  }
+  if !cl.dead && cl.closing && cl.out_n == 0 && !cl.waiting_out { cl.dead = true }
+  if cl.dead {
+    fd := cl.conn.fd
+    p.remove(fd)
+    delete(clients, fd)
+    cl.end_stream()
+    release(cl)
+  }
+}
+
 # the event loop: serves the connections of l until an error
 fn serve_loop(l: *net.Listener) -> error {
   p, err := net.new_poller(512)
@@ -536,6 +667,14 @@ fn serve_loop(l: *net.Listener) -> error {
   while true {
     tick := 1000
     if idle_timeout_ms > 0 && idle_timeout_ms < 2000 { tick = idle_timeout_ms / 2 + 1 }
+    if len(timers) > 0 {
+      now := now_ms()
+      for _, tm := range timers {
+        wait := tm.next - now
+        if wait < 0 { wait = 0 }
+        if wait < tick { tick = wait }
+      }
+    }
     n := p.wait(tick)
     if n < 0 { return errors.New("epoll_wait: error " + str(-n)) }
     t := now_ms()
@@ -558,35 +697,38 @@ fn serve_loop(l: *net.Listener) -> error {
       if !ok { continue }
       cl.last = t
       if cl.waiting_out {
-        if ev & (net.EV_ERR | net.EV_HUP) != 0 { cl.dead = true }
+        if (ev & (net.EV_ERR | net.EV_HUP)) != 0 { cl.dead = true }
         if !cl.dead && cl.flush() {
           # everything went out: back to reading (and answer what arrived meanwhile)
           cl.waiting_out = false
           if !cl.dead {
             p.modify(cl.conn.fd, net.EV_IN | net.EV_RDHUP, cl.conn.fd)
-            cl.handle_input()
+            if cl.stream == nil { cl.handle_input() }
           }
         }
       } else {
         cl.on_readable()
       }
-      if !cl.dead && cl.out_n > 0 && !cl.waiting_out {
-        if !cl.flush() && !cl.dead {
-          # the socket is full: wait until it can take more, without reading meanwhile
-          cl.waiting_out = true
-          p.modify(cl.conn.fd, net.EV_OUT, cl.conn.fd)
+      settle(p, clients, cl)
+    }
+    if len(timers) > 0 {
+      for _, tm := range timers {
+        if t >= tm.next {
+          tm.next = t + tm.every_ms
+          tm.f()
         }
       }
-      if cl.dead {
-        p.remove(cl.conn.fd)
-        delete(clients, d)
-        release(cl)
-      }
+    }
+    # output queued for other connections (a broadcast, a timer)
+    while len(pending_peers) > 0 {
+      batch := pending_peers
+      pending_peers = []*Peer{}
+      for _, pc := range batch { settle(p, clients, pc) }
     }
     if idle_timeout_ms > 0 && t - last_sweep >= tick {
       last_sweep = t
       idle := []int{}
-      for fd, ic := range clients { if t - ic.last >= idle_timeout_ms { idle = append(idle, fd) } }
+      for fd, ic := range clients { if ic.stream == nil && t - ic.last >= idle_timeout_ms { idle = append(idle, fd) } }
       for _, fd := range idle {
         ic := clients[fd]
         p.remove(fd)

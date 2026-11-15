@@ -1,0 +1,780 @@
+# std/websocket: WebSocket (RFC 6455) clients and servers.
+#
+# Client, blocking (one connection at a time, or several with net.Poller over ws.fd()):
+#
+#   ws, err := websocket.dial("ws://localhost:3800/live")
+#   ws.send_text("hello")
+#   while true {
+#     m, err := ws.read()                 # pings are answered inside read
+#     if err != nil { break }             # *websocket.CloseError when the other side closed
+#     print(m.text())
+#   }
+#
+#   ws2, err2 := websocket.dial_with("ws://api.local/feed", &websocket.Options{
+#     headers: map[str]str{"Authorization": "Bearer x"}, protocols: []str{"feed.v1"},
+#     ping_interval_ms: 20000, reconnect: true})
+#
+# Server, inside std/http's event loop (and so inside github.com/cajulang/web):
+#
+#   http.handle("/live", fn(req: *http.Request, res: *http.Response) {
+#     ws, err := websocket.accept(req, res)          # answers 101, or 400/426 with err
+#     if err != nil { return }
+#     ws.on_message(fn(c: *websocket.Conn, m: *websocket.Message) { c.send_text("echo " + m.text()) })
+#     ws.on_close(fn(c: *websocket.Conn, code: int, reason: str) { ... })
+#   })
+#
+# Plain ws:// only: wss:// needs TLS, which Caju does not have yet.
+
+import "std/net"
+import "std/http"
+import "std/strings"
+import "std/strconv"
+import "std/crypto"
+import "std/base64"
+import "std/json"
+import "std/os"
+
+export const TEXT = 1
+export const BINARY = 2
+const OP_CONT = 0
+const OP_CLOSE = 8
+const OP_PING = 9
+const OP_PONG = 10
+
+# close codes
+export const NORMAL = 1000
+export const GOING_AWAY = 1001
+export const PROTOCOL_ERROR = 1002
+export const UNSUPPORTED = 1003
+export const NO_STATUS = 1005
+export const ABNORMAL = 1006           # the connection ended without a close frame
+export const INVALID_DATA = 1007
+export const POLICY = 1008
+export const TOO_BIG = 1009
+export const INTERNAL_ERROR = 1011
+
+const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+export struct Message {
+  kind: int        # TEXT or BINARY
+  data: str
+}
+
+export fn (m: *Message) text() -> str { return m.data }
+export fn (m: *Message) is_text() -> bool { return m.kind == TEXT }
+# decodes a JSON message into v (a pointer), with std/json
+export fn (m: *Message) json(v: any) -> error { return json.unmarshal(m.data, v) }
+
+# the error read gives when the connection was closed by a close frame (or ended: code 1006)
+export struct CloseError {
+  code: int
+  reason: str
+}
+
+export fn (e: *CloseError) Error() -> str {
+  s := "websocket: closed (" + str(e.code) + ")"
+  if e.reason != "" { s = s + ": " + e.reason }
+  return s
+}
+
+export struct Options {
+  headers: map[str]str     # extra headers of the handshake (client)
+  protocols: []str         # client: the subprotocols offered; server: the ones accepted, in order of preference
+  timeout_ms: int          # client: connect, handshake and each write (0: 30 s)
+  ping_interval_ms: int    # send a ping when nothing arrived for this long; no pong by the next one ends the connection (0: off)
+  reconnect: bool          # client: when the connection drops, dial again (with backoff) inside read and send
+  reconnect_max_ms: int    # the longest wait between attempts (0: 30 s)
+  max_retries: int         # attempts in a row before giving up (0: no limit)
+  max_message: int         # the largest message accepted (0: 16 MB); larger ones close with 1009
+}
+
+export struct Conn {
+  url: str
+  protocol: str            # the subprotocol both sides agreed on, or ""
+  reconnects: int          # client: how many times it dialed again
+  remote_addr: str
+  id: int                  # server: unique in the process, set by accept
+  closed: bool
+  close_code: int
+  close_reason: str
+  opts: *Options
+  server: bool
+  # client
+  sock: *net.Conn
+  buf: str
+  pos: int
+  read_timeout_ms: int
+  asm: *Assembler
+  awaiting_pong: bool
+  last_in: int             # ms of the last byte received
+  on_open_fn: fn(*Conn)
+  # server
+  stream: *http.Stream
+  early: []str             # frames sent before the 101 went out
+  inbuf: str
+  on_message_fn: fn(*Conn, *Message)
+  on_close_fn: fn(*Conn, int, str)
+  ping_sent: int
+}
+
+fn noop_message(c: *Conn, m: *Message) {}
+fn noop_close(c: *Conn, code: int, reason: str) {}
+fn noop_open(c: *Conn) {}
+
+fn now_ms() -> int { return os.nanotime() / 1000000 }
+
+fn defaults(o: *Options) -> *Options {
+  if o == nil { o = &Options{} }
+  r := &Options{headers: o.headers, protocols: o.protocols, timeout_ms: o.timeout_ms, ping_interval_ms: o.ping_interval_ms,
+    reconnect: o.reconnect, reconnect_max_ms: o.reconnect_max_ms, max_retries: o.max_retries, max_message: o.max_message}
+  if r.timeout_ms <= 0 { r.timeout_ms = 30000 }
+  if r.reconnect_max_ms <= 0 { r.reconnect_max_ms = 30000 }
+  if r.max_message <= 0 { r.max_message = 16 << 20 }
+  if r.headers == nil { r.headers = map[str]str{} }
+  if r.protocols == nil { r.protocols = []str{} }
+  return r
+}
+
+# ---------------------------------------------------------------- frames
+
+let rng: int = 0
+fn mask_key() -> str {
+  if rng == 0 {
+    seed, err := crypto.random_bytes(8)
+    rng = os.nanotime() | 1
+    if err == nil { for i := 0; i < 8; i++ { rng = (rng << 8) ^ int(seed[i]) ^ (rng >> 56) } }
+    if rng == 0 { rng = 88172645463325252 }
+  }
+  rng = rng ^ (rng << 13)
+  rng = rng ^ (rng >> 7)
+  rng = rng ^ (rng << 17)
+  b := strings.Builder{}
+  for i := 0; i < 4; i++ { b.write_byte((rng >> (8 * i)) & 255) }
+  return b.string()
+}
+
+# one frame: FIN set, the opcode, the payload (masked when mask)
+export fn frame(op: int, payload: str, mask: bool) -> str {
+  b := strings.Builder{}
+  b.write_byte(128 | op)
+  n := len(payload)
+  mbit := 0
+  if mask { mbit = 128 }
+  if n < 126 {
+    b.write_byte(mbit | n)
+  } else if n < 65536 {
+    b.write_byte(mbit | 126)
+    b.write_byte(n >> 8)
+    b.write_byte(n & 255)
+  } else {
+    b.write_byte(mbit | 127)
+    for i := 7; i >= 0; i-- { b.write_byte((n >> (8 * i)) & 255) }
+  }
+  if !mask {
+    b.write(payload)
+    return b.string()
+  }
+  key := mask_key()
+  b.write(key)
+  k0 := int(key[0])
+  k1 := int(key[1])
+  k2 := int(key[2])
+  k3 := int(key[3])
+  for i := 0; i < n; i++ {
+    k := k0
+    j := i & 3
+    if j == 1 { k = k1 } else if j == 2 { k = k2 } else if j == 3 { k = k3 }
+    b.write_byte(int(payload[i]) ^ k)
+  }
+  return b.string()
+}
+
+# a frame at the start of s: (fin, opcode, payload, bytes used); used 0 when s does not hold a
+# whole frame yet, -1 when the frame is malformed (or masked when it must not be, or the reverse),
+# -2 when it is larger than max
+fn parse_frame(s: str, want_mask: bool, max: int) -> (bool, int, str, int) {
+  if len(s) < 2 { return false, 0, "", 0 }
+  b0 := int(s[0])
+  b1 := int(s[1])
+  if (b0 & 112) != 0 { return false, 0, "", -1 }      # RSV bits: no extension was agreed
+  fin := (b0 & 128) != 0
+  op := b0 & 15
+  masked := (b1 & 128) != 0
+  if masked != want_mask { return false, 0, "", -1 }
+  n := b1 & 127
+  p := 2
+  if n == 126 {
+    if len(s) < 4 { return false, 0, "", 0 }
+    n = (int(s[2]) << 8) | int(s[3])
+    p = 4
+  } else if n == 127 {
+    if len(s) < 10 { return false, 0, "", 0 }
+    n = 0
+    for i := 2; i < 10; i++ { n = (n << 8) | int(s[i]) }
+    p = 10
+    if n < 0 { return false, 0, "", -2 }
+  }
+  if n > max { return false, 0, "", -2 }
+  if op >= 8 && (n > 125 || !fin) { return false, 0, "", -1 }   # control frames are short and whole
+  key := ""
+  if masked {
+    if len(s) < p + 4 { return false, 0, "", 0 }
+    key = s[p:p + 4]
+    p += 4
+  }
+  if len(s) < p + n { return false, 0, "", 0 }
+  payload := s[p:p + n]
+  if masked {
+    b := strings.Builder{}
+    k0 := int(key[0])
+    k1 := int(key[1])
+    k2 := int(key[2])
+    k3 := int(key[3])
+    for i := 0; i < n; i++ {
+      k := k0
+      j := i & 3
+      if j == 1 { k = k1 } else if j == 2 { k = k2 } else if j == 3 { k = k3 }
+      b.write_byte(int(payload[i]) ^ k)
+    }
+    payload = b.string()
+  }
+  return fin, op, payload, p + n
+}
+
+fn close_payload(code: int, reason: str) -> str {
+  if code == 0 || code == NO_STATUS || code == ABNORMAL { return "" }
+  if len(reason) > 123 { reason = reason[0:123] }
+  return strings.from_byte(code >> 8) + strings.from_byte(code & 255) + reason
+}
+
+fn parse_close(payload: str) -> (int, str) {
+  if len(payload) < 2 { return NO_STATUS, "" }
+  return (int(payload[0]) << 8) | int(payload[1]), payload[2:len(payload)]
+}
+
+# Sec-WebSocket-Accept for a key
+export fn accept_key(key: str) -> str { return base64.encode(crypto.sha1(key + GUID)) }
+
+# ---------------------------------------------------------------- sending (both sides)
+
+fn (c: *Conn) send_frame(op: int, payload: str) -> error {
+  if c.server {
+    if c.closed { return errors.New("websocket: the connection is closed") }
+    if c.stream == nil {
+      c.early = append(c.early, frame(op, payload, false))
+      return nil
+    }
+    c.stream.write(frame(op, payload, false))
+    return nil
+  }
+  data := frame(op, payload, true)
+  for attempt := 0; attempt < 2; attempt++ {
+    if c.closed { return errors.New("websocket: the connection is closed") }
+    if c.sock == nil {
+      err := c.redial()
+      if err != nil { return err }
+    }
+    err := c.sock.write(data)
+    if err == nil { return nil }
+    c.drop()
+    if !c.opts.reconnect || op == OP_CLOSE { return errors.New("websocket: " + err.Error()) }
+  }
+  return errors.New("websocket: the connection dropped while sending")
+}
+
+export fn (c: *Conn) send_text(s: str) -> error { return c.send_frame(TEXT, s) }
+export fn (c: *Conn) send_binary(s: str) -> error { return c.send_frame(BINARY, s) }
+# sends v as a JSON text message (std/json)
+export fn (c: *Conn) send_json(v: any) -> error {
+  s, err := json.marshal(v)
+  if err != nil { return err }
+  return c.send_frame(TEXT, s)
+}
+export fn (c: *Conn) ping(data: str) -> error { return c.send_frame(OP_PING, data) }
+
+# closes the connection with a code (NORMAL...) and a reason; a client waits up to a second for
+# the other side's close frame
+export fn (c: *Conn) close(code: int, reason: str) {
+  if c.closed { return }
+  if code == 0 { code = NORMAL }
+  if c.server {
+    if c.close_code != 0 { return }
+    c.close_code = code
+    c.close_reason = reason
+    if c.stream == nil {
+      c.early = append(c.early, frame(OP_CLOSE, close_payload(code, reason), false))
+      return
+    }
+    c.stream.write(frame(OP_CLOSE, close_payload(code, reason), false))
+    c.stream.close()
+    return
+  }
+  if c.sock != nil {
+    c.sock.write(frame(OP_CLOSE, close_payload(code, reason), true))
+    c.sock.set_timeout(1000)
+    deadline := now_ms() + 1000
+    while now_ms() < deadline {
+      fin, op, _, used := parse_frame(c.buf[c.pos:len(c.buf)], false, c.opts.max_message)
+      if used > 0 {
+        c.pos += used
+        if op == OP_CLOSE { break }
+        continue
+      }
+      if used < 0 { break }
+      chunk, err := c.sock.read(65536)
+      if err != nil || chunk == "" { break }
+      c.buf = c.buf[c.pos:len(c.buf)] + chunk
+      c.pos = 0
+    }
+    c.sock.close()
+    c.sock = nil
+  }
+  c.closed = true
+  c.close_code = code
+  c.close_reason = reason
+}
+
+# ---------------------------------------------------------------- client
+
+# connects to a ws:// URL
+export fn dial(url: str) -> (*Conn, error) { return dial_with(url, nil) }
+
+export fn dial_with(url: str, o: *Options) -> (*Conn, error) {
+  c := &Conn{url: url, opts: defaults(o), on_open_fn: noop_open, on_message_fn: noop_message, on_close_fn: noop_close}
+  err := c.connect()
+  if err != nil { return nil, err }
+  return c, nil
+}
+
+# f runs after every successful connection, the first one and each reconnection (subscribe
+# again there); a client only
+export fn (c: *Conn) on_open(f: fn(*Conn)) { c.on_open_fn = f }
+
+# read gives up after ms without a message, with an error whose text ends in "timed out" (the
+# connection stays usable); 0 waits forever
+export fn (c: *Conn) set_read_timeout(ms: int) { c.read_timeout_ms = ms }
+
+# the socket, for net.Poller; read what is buffered (buffered()) before waiting on it again
+export fn (c: *Conn) fd() -> int {
+  if c.sock == nil { return -1 }
+  return c.sock.fd
+}
+export fn (c: *Conn) buffered() -> bool { return c.pos < len(c.buf) }
+
+fn split_ws_url(url: str) -> (str, int, str, error) {
+  rest := ""
+  if strings.has_prefix(url, "ws://") {
+    rest = url[5:len(url)]
+  } else if strings.has_prefix(url, "wss://") {
+    return "", 0, "", errors.New("websocket: " + url + ": wss is not supported (no TLS yet)")
+  } else {
+    return "", 0, "", errors.New("websocket: " + url + ": not a ws:// URL")
+  }
+  cut := len(rest)
+  for i := 0; i < len(rest); i++ {
+    ch := int(rest[i])
+    if ch == 47 || ch == 63 {
+      cut = i
+      break
+    }
+  }
+  authority := rest[0:cut]
+  target := rest[cut:len(rest)]
+  if target == "" || int(target[0]) == 63 { target = "/" + target }
+  host := authority
+  port := 80
+  colon := strings.last_index(authority, ":")
+  if colon >= 0 {
+    host = authority[0:colon]
+    pn, err := strconv.atoi(authority[colon + 1:len(authority)])
+    if err != nil || pn <= 0 || pn > 65535 { return "", 0, "", errors.New("websocket: " + url + ": invalid port") }
+    port = pn
+  }
+  if host == "" { return "", 0, "", errors.New("websocket: " + url + ": no host") }
+  return host, port, target, nil
+}
+
+fn header_has(headers: map[str]str, name: str) -> bool {
+  for k, _ := range headers {
+    if strings.to_lower(k) == name { return true }
+  }
+  return false
+}
+
+fn (c: *Conn) connect() -> error {
+  host, port, target, err := split_ws_url(c.url)
+  if err != nil { return err }
+  sock, derr := net.dial_timeout(host, port, c.opts.timeout_ms)
+  if derr != nil { return errors.New("websocket: " + derr.Error()) }
+  sock.set_nodelay()
+  sock.set_timeout(c.opts.timeout_ms)
+  raw, _ := crypto.random_bytes(16)
+  key := base64.encode(raw)
+  b := strings.Builder{}
+  b.write("GET " + target + " HTTP/1.1\r\n")
+  if !header_has(c.opts.headers, "host") {
+    hp := host
+    if port != 80 { hp = hp + ":" + str(port) }
+    b.write("Host: " + hp + "\r\n")
+  }
+  b.write("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n")
+  if len(c.opts.protocols) > 0 { b.write("Sec-WebSocket-Protocol: " + strings.join(c.opts.protocols, ", ") + "\r\n") }
+  for k, v := range c.opts.headers { b.write(k + ": " + v + "\r\n") }
+  b.write("\r\n")
+  werr := sock.write(b.string())
+  if werr != nil {
+    sock.close()
+    return errors.New("websocket: " + werr.Error())
+  }
+  # the response head
+  got := ""
+  while strings.index(got, "\r\n\r\n") < 0 {
+    chunk, rerr := sock.read(4096)
+    if rerr != nil || chunk == "" {
+      sock.close()
+      if rerr != nil { return errors.New("websocket: handshake: " + rerr.Error()) }
+      return errors.New("websocket: handshake: the server closed the connection")
+    }
+    got = got + chunk
+    if len(got) > 65536 {
+      sock.close()
+      return errors.New("websocket: handshake: response head too long")
+    }
+  }
+  he := strings.index(got, "\r\n\r\n")
+  lines := strings.split(got[0:he], "\r\n")
+  parts := strings.split(lines[0], " ")
+  if len(parts) < 2 || parts[1] != "101" {
+    sock.close()
+    return errors.New("websocket: handshake: the server answered \"" + lines[0] + "\" instead of 101")
+  }
+  hs := map[str]str{}
+  for _, l := range lines[1:len(lines)] {
+    colon := strings.index(l, ":")
+    if colon > 0 { hs[strings.to_lower(strings.trim_space(l[0:colon]))] = strings.trim_space(l[colon + 1:len(l)]) }
+  }
+  if strings.to_lower(hs["upgrade"]) != "websocket" || hs["sec-websocket-accept"] != accept_key(key) {
+    sock.close()
+    return errors.New("websocket: handshake: invalid Upgrade or Sec-WebSocket-Accept")
+  }
+  proto := hs["sec-websocket-protocol"]
+  if proto != "" {
+    offered := false
+    for _, p := range c.opts.protocols { if p == proto { offered = true } }
+    if !offered {
+      sock.close()
+      return errors.New("websocket: handshake: the server chose a subprotocol that was not offered: " + proto)
+    }
+  }
+  sock.set_timeout(0)
+  c.sock = sock
+  c.protocol = proto
+  c.remote_addr = sock.remote_addr
+  c.buf = got[he + 4:len(got)]
+  c.pos = 0
+  c.awaiting_pong = false
+  c.last_in = now_ms()
+  c.asm = &Assembler{}
+  c.on_open_fn(c)
+  return nil
+}
+
+# the connection dropped (without a close we asked for)
+fn (c: *Conn) drop() {
+  if c.sock != nil { c.sock.close() }
+  c.sock = nil
+  c.buf = ""
+  c.pos = 0
+}
+
+# dials again with backoff (250 ms, doubling up to reconnect_max_ms), up to max_retries attempts
+fn (c: *Conn) redial() -> error {
+  if !c.opts.reconnect { return &CloseError{code: ABNORMAL, reason: "the connection dropped"} }
+  wait := 250
+  last := errors.New("")
+  for attempt := 1; c.opts.max_retries == 0 || attempt <= c.opts.max_retries; attempt++ {
+    err := c.connect()
+    if err == nil {
+      c.reconnects++
+      return nil
+    }
+    last = err
+    if c.opts.max_retries != 0 && attempt == c.opts.max_retries { break }
+    sleep(num(wait) / 1000.0)
+    wait = wait * 2
+    if wait > c.opts.reconnect_max_ms { wait = c.opts.reconnect_max_ms }
+  }
+  c.closed = true
+  return errors.New("websocket: could not reconnect: " + last.Error())
+}
+
+# the next message; answers pings, keeps the connection alive with pings (ping_interval_ms) and,
+# with reconnect, dials again when it drops
+export fn (c: *Conn) read() -> (*Message, error) {
+  if c.server { return nil, errors.New("websocket: a server connection delivers messages to on_message") }
+  started := now_ms()
+  while true {
+    if c.closed { return nil, &CloseError{code: c.close_code, reason: c.close_reason} }
+    if c.sock == nil {
+      err := c.redial()
+      if err != nil { return nil, err }
+    }
+    # the frames already buffered
+    fin, op, payload, used := parse_frame(c.buf[c.pos:len(c.buf)], false, c.opts.max_message)
+    if used < 0 {
+      code := PROTOCOL_ERROR
+      if used == -2 { code = TOO_BIG }
+      c.close(code, "")
+      return nil, &CloseError{code: code, reason: "invalid frame from the server"}
+    }
+    if used > 0 {
+      c.pos += used
+      if c.pos == len(c.buf) {
+        c.buf = ""
+        c.pos = 0
+      }
+      m, done, err := c.on_frame(fin, op, payload)
+      if err != nil { return nil, err }
+      if done { return m, nil }
+      continue
+    }
+    # wait for more: until the read timeout, or the ping interval
+    wait := 0
+    if c.read_timeout_ms > 0 {
+      wait = c.read_timeout_ms - (now_ms() - started)
+      if wait <= 0 { return nil, errors.New("websocket: read: timed out") }
+    }
+    if c.opts.ping_interval_ms > 0 {
+      until_ping := c.opts.ping_interval_ms - (now_ms() - c.last_in)
+      if until_ping < 1 { until_ping = 1 }
+      if wait == 0 || until_ping < wait { wait = until_ping }
+    }
+    c.sock.set_timeout(wait)
+    chunk, rerr := c.sock.read(65536)
+    if rerr != nil && strings.has_suffix(rerr.Error(), "timed out") {
+      if c.opts.ping_interval_ms > 0 && now_ms() - c.last_in >= c.opts.ping_interval_ms {
+        if c.awaiting_pong {
+          # no answer to the last ping: the connection is dead
+          c.drop()
+          if !c.opts.reconnect { return nil, &CloseError{code: ABNORMAL, reason: "no pong from the server"} }
+          continue
+        }
+        c.awaiting_pong = true
+        c.last_in = now_ms()
+        c.sock.write(frame(OP_PING, "", true))
+      }
+      continue
+    }
+    if rerr != nil || chunk == "" {
+      c.drop()
+      if !c.opts.reconnect {
+        c.closed = true
+        c.close_code = ABNORMAL
+        return nil, &CloseError{code: ABNORMAL, reason: "the connection dropped"}
+      }
+      continue
+    }
+    c.last_in = now_ms()
+    c.awaiting_pong = false
+    if c.pos > 0 {
+      c.buf = c.buf[c.pos:len(c.buf)]
+      c.pos = 0
+    }
+    c.buf = c.buf + chunk
+  }
+  return nil, nil
+}
+
+# a frame for the client: (message, it is a whole message, error)
+fn (c: *Conn) on_frame(fin: bool, op: int, payload: str) -> (*Message, bool, error) {
+  switch op {
+  case OP_PING:
+    c.sock.write(frame(OP_PONG, payload, true))
+    return nil, false, nil
+  case OP_PONG:
+    c.awaiting_pong = false
+    return nil, false, nil
+  case OP_CLOSE:
+    code, reason := parse_close(payload)
+    c.sock.write(frame(OP_CLOSE, close_payload(code, ""), true))
+    c.drop()
+    c.close_code = code
+    c.close_reason = reason
+    if c.opts.reconnect && code != NORMAL && code != POLICY {
+      return nil, false, nil                 # read dials again
+    }
+    c.closed = true
+    return nil, false, &CloseError{code: code, reason: reason}
+  }
+  m, done, perr := c.asm.add(fin, op, payload, c.opts.max_message)
+  if perr != 0 {
+    c.close(perr, "")
+    return nil, false, &CloseError{code: perr, reason: "invalid message from the server"}
+  }
+  return m, done, nil
+}
+
+# joins fragmented messages
+struct Assembler {
+  buf: strings.Builder
+  kind: int          # the kind of the message being joined, 0 when none
+}
+
+# a data frame: (the message when it is whole, whether it is, a close code on error)
+fn (a: *Assembler) add(fin: bool, op: int, payload: str, max: int) -> (*Message, bool, int) {
+  if op == TEXT || op == BINARY {
+    if a.kind != 0 { return nil, false, PROTOCOL_ERROR }        # a new message inside a fragmented one
+    if fin { return &Message{kind: op, data: payload}, true, 0 }
+    a.kind = op
+    a.buf.reset()
+    a.buf.write(payload)
+    return nil, false, 0
+  }
+  if op == OP_CONT {
+    if a.kind == 0 { return nil, false, PROTOCOL_ERROR }
+    a.buf.write(payload)
+    if a.buf.len() > max { return nil, false, TOO_BIG }
+    if !fin { return nil, false, 0 }
+    m := &Message{kind: a.kind, data: a.buf.string()}
+    a.kind = 0
+    a.buf.reset()
+    return m, true, 0
+  }
+  return nil, false, PROTOCOL_ERROR
+}
+
+# ---------------------------------------------------------------- server
+
+let next_id: int = 0
+
+# answers a WebSocket handshake in an std/http handler: the connection becomes c (status 101),
+# or the response says why not (400, 426) and err is set
+export fn accept(req: *http.Request, res: *http.Response) -> (*Conn, error) { return accept_with(req, res, nil) }
+
+export fn accept_with(req: *http.Request, res: *http.Response, o: *Options) -> (*Conn, error) {
+  opts := defaults(o)
+  key := req.header("sec-websocket-key")
+  if req.method != "GET" || strings.to_lower(req.header("upgrade")) != "websocket" || !strings.contains(strings.to_lower(req.header("connection")), "upgrade") || key == "" {
+    res.set_status(400)
+    res.write("expected a WebSocket handshake\n")
+    return nil, errors.New("websocket: not a WebSocket handshake")
+  }
+  if req.header("sec-websocket-version") != "13" {
+    res.set_status(426)
+    res.set_header("Sec-WebSocket-Version", "13")
+    return nil, errors.New("websocket: unsupported version " + req.header("sec-websocket-version"))
+  }
+  next_id++
+  c := &Conn{id: next_id, server: true, asm: &Assembler{}, early: []str{}, opts: opts, url: req.path, remote_addr: req.remote_addr, on_open_fn: noop_open, on_message_fn: noop_message, on_close_fn: noop_close}
+  offered := req.header("sec-websocket-protocol")
+  if offered != "" && len(opts.protocols) > 0 {
+    asked := []str{}
+    for _, p := range strings.split(offered, ",") { asked = append(asked, strings.trim_space(p)) }
+    for _, mine := range opts.protocols {
+      for _, a := range asked {
+        if c.protocol == "" && a == mine { c.protocol = mine }
+      }
+    }
+  }
+  res.set_status(101)
+  res.set_header("Upgrade", "websocket")
+  res.set_header("Connection", "Upgrade")
+  res.set_header("Sec-WebSocket-Accept", accept_key(key))
+  if c.protocol != "" { res.set_header("Sec-WebSocket-Protocol", c.protocol) }
+  res.upgrade(c)
+  if opts.ping_interval_ms > 0 { watch(c) }
+  return c, nil
+}
+
+export fn (c: *Conn) on_message(f: fn(*Conn, *Message)) { c.on_message_fn = f }
+# f runs once when the connection ends: the close code (ABNORMAL when it just dropped) and reason
+export fn (c: *Conn) on_close(f: fn(*Conn, int, str)) { c.on_close_fn = f }
+
+# http.StreamHandler: the 101 went out; what was sent before it follows
+export fn (c: *Conn) stream_open(s: *http.Stream) {
+  c.stream = s
+  c.last_in = now_ms()
+  for _, f := range c.early { s.write(f) }
+  c.early = nil
+  if c.close_code != 0 { s.close() }
+}
+
+# http.StreamHandler: bytes from the client
+export fn (c: *Conn) stream_data(s: *http.Stream, data: str) {
+  if c.closed { return }
+  c.ping_sent = 0
+  c.last_in = now_ms()
+  if c.inbuf == "" { c.inbuf = data } else { c.inbuf = c.inbuf + data }
+  while !c.closed {
+    fin, op, payload, used := parse_frame(c.inbuf, true, c.opts.max_message)
+    if used == 0 { return }
+    if used < 0 {
+      code := PROTOCOL_ERROR
+      if used == -2 { code = TOO_BIG }
+      c.close(code, "")
+      return
+    }
+    c.inbuf = c.inbuf[used:len(c.inbuf)]
+    switch op {
+    case OP_PING:
+      s.write(frame(OP_PONG, payload, false))
+      continue
+    case OP_PONG:
+      continue
+    case OP_CLOSE:
+      code, reason := parse_close(payload)
+      s.write(frame(OP_CLOSE, close_payload(code, ""), false))
+      c.close_code = code
+      c.close_reason = reason
+      s.close()
+      return
+    }
+    m, done, perr := c.asm.add(fin, op, payload, c.opts.max_message)
+    if perr != 0 {
+      c.close(perr, "")
+      return
+    }
+    if done { c.on_message_fn(c, m) }
+  }
+}
+
+# http.StreamHandler: the connection ended
+export fn (c: *Conn) stream_closed(s: *http.Stream) {
+  if c.closed { return }
+  c.closed = true
+  if c.close_code == 0 { c.close_code = ABNORMAL }
+  c.on_close_fn(c, c.close_code, c.close_reason)
+}
+
+# the server connections that ping (ping_interval_ms), checked once a second in the event loop
+let watched = []*Conn{}
+let watching: bool = false
+
+fn watch(c: *Conn) {
+  watched = append(watched, c)
+  if watching { return }
+  watching = true
+  http.every(1000, check_pings)
+}
+
+fn check_pings() {
+  t := now_ms()
+  keep := []*Conn{}
+  for _, c := range watched {
+    if c.closed { continue }
+    keep = append(keep, c)
+    if c.stream == nil { continue }
+    iv := c.opts.ping_interval_ms
+    if c.ping_sent > 0 {
+      if t - c.ping_sent >= iv {
+        c.close_code = ABNORMAL
+        c.close_reason = "no pong from the client"
+        c.stream.close()
+      }
+    } else if t - c.last_in >= iv {
+      c.ping_sent = t
+      c.stream.write(frame(OP_PING, "", false))
+    }
+  }
+  watched = keep
+}

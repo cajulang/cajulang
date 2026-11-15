@@ -69,7 +69,7 @@ Details in `docs/wasm.md`.
 
 ## Standard library
 
-`import "std/x"`: `strings`, `strconv`, `math`, `bytes`, `os`, `fs`, `path`, `net`, `http`, `json`,
+`import "std/x"`: `strings`, `strconv`, `math`, `bytes`, `os`, `fs`, `path`, `net`, `http`, `websocket`, `json`,
 `toml`, `crypto`, `hash`, `hex`, `base64`, `cli` (command line programs: commands, flags, arguments
 and generated help, `docs/cli.md`), `testing`.
 
@@ -81,6 +81,9 @@ and generated help, `docs/cli.md`), `testing`.
   connections, redirects, chunked bodies and timeouts (plain `http://` only: no TLS yet). See
   `docs/http.md`.
 - `std/net`: TCP sockets, and `net.resolve(host)` for host names (`/etc/hosts` and DNS).
+- `std/websocket`: WebSocket clients (`websocket.dial`, blocking `read`, pings, reconnection) and
+  servers inside `std/http`'s event loop (`websocket.accept(req, res)` and callbacks). `ws://`
+  only. See `docs/websocket.md`.
 
 For REST APIs there is a Gin-style framework, [`github.com/cajulang/web`](https://github.com/cajulang/web):
 

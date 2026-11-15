@@ -1,0 +1,46 @@
+# The server the tests of std/websocket talk to: PORT, PING_MS (server pings).
+import "std/http"
+import "std/websocket"
+import "std/os"
+import "std/strconv"
+
+let clients = map[int]*websocket.Conn{}
+let closes: int = 0
+
+ping_ms, _ := strconv.atoi(os.getenv("PING_MS"))
+
+http.handle("/echo", fn(req: *http.Request, res: *http.Response) {
+  ws, err := websocket.accept_with(req, res, &websocket.Options{protocols: []str{"chat.v2", "chat.v1"}, ping_interval_ms: ping_ms})
+  if err != nil { return }
+  clients[ws.id] = ws
+  ws.send_text("welcome " + ws.protocol + " " + req.header("x-token"))
+  ws.on_message(fn(c: *websocket.Conn, m: *websocket.Message) {
+    t := m.text()
+    if t == "bye" {
+      c.close(4000, "see you")
+      return
+    }
+    if t == "all" {
+      for _, o := range clients { o.send_text("broadcast from " + str(c.id)) }
+      return
+    }
+    if t == "closes" {
+      c.send_text(str(closes))
+      return
+    }
+    if m.is_text() { c.send_text(t) } else { c.send_binary(t) }
+  })
+  ws.on_close(fn(c: *websocket.Conn, code: int, reason: str) {
+    delete(clients, c.id)
+    closes++
+  })
+})
+http.handle("/plain", fn(req: *http.Request, res: *http.Response) { res.write("not a websocket") })
+http.handle("/ws-only", fn(req: *http.Request, res: *http.Response) { websocket.accept(req, res) })
+
+port, _ := strconv.atoi(os.getenv("PORT"))
+err := http.listen_and_serve("127.0.0.1", port)
+if err != nil {
+  os.eprintln(err.Error())
+  os.exit(1)
+}

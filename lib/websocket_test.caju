@@ -1,0 +1,242 @@
+# std/websocket: frames, and a client against a server in another process (testdata/ws_server.caju).
+import "std/websocket"
+import "std/net"
+import "std/os"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+let next_port: int = 40000 + os.getpid() % 10000
+let pid: str = ""
+let port: int = 0
+
+fn bin() -> str {
+  t := os.getenv("TMPDIR")
+  if t == "" { t = "/tmp" }
+  return t + "/caju-ws-test-" + str(os.getpid())
+}
+
+# starts the test server (a new port unless same_port) and waits until it accepts connections
+fn start(env: str, same_port: bool) -> str {
+  if !os.exists(bin()) {
+    p, err := os.run([]str{os.getenv("CAJU_BIN"), "build", "-o", bin(), "testdata/ws_server.caju"}, nil, true)
+    if err != nil || p.code != 0 { panic("cannot build the test server: " + p.output) }
+  }
+  if !same_port {
+    next_port++
+    port = next_port
+  }
+  p, err := os.run([]str{"sh", "-c", "PORT=" + str(port) + " " + env + " " + bin() + " >/dev/null 2>&1 & echo $!"}, nil, false)
+  if err != nil { panic(err.Error()) }
+  pid = strings.trim_space(p.output)
+  deadline := os.nanotime() + 20000000000
+  while os.nanotime() < deadline {
+    c, err2 := net.dial("127.0.0.1", port)
+    if err2 == nil {
+      c.close()
+      return "ws://127.0.0.1:" + str(port)
+    }
+  }
+  panic("the test server did not start")
+  return ""
+}
+
+fn stop() {
+  if pid != "" { os.run([]str{"sh", "-c", "kill " + pid + "; while kill -0 " + pid + " 2>/dev/null; do sleep 0.05; done"}, nil, true) }
+  pid = ""
+}
+
+fn read_text(ws: *websocket.Conn) -> str {
+  m, err := ws.read()
+  if err != nil { return "error: " + err.Error() }
+  return m.text()
+}
+
+fn bytes_of(s: str) -> []int {
+  out := []int{}
+  for i := 0; i < len(s); i++ { out = append(out, int(s[i])) }
+  return out
+}
+
+# a string of raw bytes (a literal's \xNN is a character, not a byte)
+fn raw(bs: []int) -> str {
+  b := strings.Builder{}
+  for _, x := range bs { b.write_byte(x) }
+  return b.string()
+}
+
+fn dial(url: str) -> *websocket.Conn {
+  ws, err := websocket.dial(url)
+  if err != nil { panic(err.Error()) }
+  return ws
+}
+
+describe("websocket frames", fn() {
+  it("compute Sec-WebSocket-Accept as RFC 6455 says", fn() {
+    expect(websocket.accept_key("dGhlIHNhbXBsZSBub25jZQ==")).to_equal("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+  })
+  it("write the length in 7, 16 or 64 bits", fn() {
+    expect(bytes_of(websocket.frame(websocket.TEXT, "hi", false))).to_equal([]int{129, 2, 104, 105})
+    f2 := websocket.frame(websocket.BINARY, strings.repeat("a", 300), false)
+    expect(bytes_of(f2[0:4])).to_equal([]int{130, 126, 1, 44})
+    f3 := websocket.frame(websocket.BINARY, strings.repeat("a", 70000), false)
+    expect(bytes_of(f3[0:10])).to_equal([]int{130, 127, 0, 0, 0, 0, 0, 1, 17, 112})
+    expect(len(websocket.frame(websocket.TEXT, "hi", true))).to_equal(8)
+  })
+})
+
+describe("websocket client and server", fn() {
+  it("exchanges text, binary and JSON messages", fn() {
+    base := start("", false)
+    ws := dial(base + "/echo")
+    welcome := read_text(ws)
+    ws.send_text("olá, caju")
+    t := read_text(ws)
+    bin := raw([]int{0, 1, 254, 255}) + strings.repeat(raw([]int{128}), 70000)
+    ws.send_binary(bin)
+    m, _ := ws.read()
+    ws.send_json(map[str]any{"n": 7, "s": "x"})
+    j, _ := ws.read()
+    v := map[str]any{}
+    jerr := j.json(&v)
+    ws.close(websocket.NORMAL, "")
+    stop()
+    expect(welcome).to_equal("welcome  ")
+    expect(t).to_equal("olá, caju")
+    expect(m.kind).to_equal(websocket.BINARY)
+    expect(m.data == bin).to_be_true()
+    expect(jerr).to_be_nil()
+    expect(v["s"]).to_equal("x")
+  })
+  it("sends headers and agrees on a subprotocol", fn() {
+    base := start("", false)
+    ws, err := websocket.dial_with(base + "/echo", &websocket.Options{headers: map[str]str{"X-Token": "abc"}, protocols: []str{"chat.v1", "chat.v2"}})
+    expect(err).to_be_nil()
+    welcome := read_text(ws)
+    stop()
+    expect(ws.protocol).to_equal("chat.v2")
+    expect(welcome).to_equal("welcome chat.v2 abc")
+  })
+  it("broadcasts from one connection to the others", fn() {
+    base := start("", false)
+    a := dial(base + "/echo")
+    b := dial(base + "/echo")
+    read_text(a)
+    read_text(b)
+    a.send_text("all")
+    ra := read_text(a)
+    rb := read_text(b)
+    stop()
+    expect(ra).to_start_with("broadcast from ")
+    expect(rb).to_equal(ra)
+  })
+  it("gives the close code and reason the server sent", fn() {
+    base := start("", false)
+    ws := dial(base + "/echo")
+    read_text(ws)
+    ws.send_text("bye")
+    _, err := ws.read()
+    stop()
+    expect(err).to_be_error("websocket: closed (4000): see you")
+  })
+  it("tells the server when the client goes away", fn() {
+    base := start("", false)
+    a := dial(base + "/echo")
+    read_text(a)
+    a.close(websocket.NORMAL, "done")
+    b := dial(base + "/echo")
+    read_text(b)
+    b.send_text("closes")
+    n := read_text(b)
+    stop()
+    expect(n).to_equal("1")
+  })
+  it("answers the server's pings while reading", fn() {
+    base := start("PING_MS=300", false)
+    ws := dial(base + "/echo")
+    read_text(ws)
+    ws.set_read_timeout(2500)
+    _, err := ws.read()                       # nothing to read: only pings for 2.5 s
+    ws.send_text("still here")
+    t := read_text(ws)
+    stop()
+    expect(err.Error()).to_end_with("timed out")
+    expect(t).to_equal("still here")
+  })
+  it("pings the server and keeps the connection", fn() {
+    base := start("", false)
+    ws, _ := websocket.dial_with(base + "/echo", &websocket.Options{ping_interval_ms: 200})
+    read_text(ws)
+    ws.set_read_timeout(1000)
+    _, err := ws.read()
+    ws.send_text("ok")
+    t := read_text(ws)
+    stop()
+    expect(err.Error()).to_end_with("timed out")
+    expect(t).to_equal("ok")
+  })
+  it("reconnects when the server comes back, and runs on_open again", fn() {
+    base := start("", false)
+    opened := 0
+    ws, _ := websocket.dial_with(base + "/echo", &websocket.Options{reconnect: true, reconnect_max_ms: 300})
+    ws.on_open(fn(c: *websocket.Conn) { opened++ })
+    read_text(ws)
+    stop()
+    start("", true)
+    welcome := read_text(ws)                  # the old connection dropped: read dials again
+    ws.send_text("back")
+    t := read_text(ws)
+    stop()
+    expect(welcome).to_equal("welcome  ")
+    expect(t).to_equal("back")
+    expect(ws.reconnects).to_equal(1)
+    expect(opened).to_equal(1)
+  })
+  it("refuses wss, other schemes and endpoints that do not upgrade", fn() {
+    base := start("", false)
+    _, a := websocket.dial("wss://example.com/")
+    _, b := websocket.dial("http://example.com/")
+    _, c := websocket.dial(base + "/plain")
+    _, d := websocket.dial(base + "/nothing")
+    stop()
+    expect(a.Error()).to_contain("wss is not supported")
+    expect(b.Error()).to_contain("not a ws:// URL")
+    expect(c.Error()).to_contain("instead of 101")
+    expect(d.Error()).to_contain("404")
+  })
+  it("refuses a plain request to a WebSocket endpoint with 400", fn() {
+    base := start("", false)
+    c, _ := net.dial("127.0.0.1", port)
+    c.write("GET /ws-only HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    r := ""
+    while true {
+      chunk, _ := c.read(4096)
+      if chunk == "" { break }
+      r = r + chunk
+    }
+    stop()
+    expect(r).to_start_with("HTTP/1.1 400 Bad Request")
+  })
+  it("joins a fragmented message, and works with the browser's client (Node)", fn() {
+    base := start("", false)
+    # two masked fragments and a ping in between, written by hand
+    c, _ := net.dial("127.0.0.1", port)
+    c.write("GET /echo HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    c.write(raw([]int{1, 131, 0, 0, 0, 0}) + "abc" + raw([]int{137, 128, 0, 0, 0, 0}) + raw([]int{128, 130, 0, 0, 0, 0}) + "de")
+    got := ""
+    while !strings.contains(got, "abcde") {
+      chunk, err := c.read(4096)
+      if err != nil || chunk == "" { break }
+      got = got + chunk
+    }
+    c.close()
+    node := `const ws = new WebSocket(process.argv[1]); let n = 0
+ws.onmessage = (e) => { if (n++ === 0) ws.send("from node"); else { console.log(e.data); ws.close() } }
+ws.onerror = (e) => { console.log("error", e.message); process.exit(1) }`
+    p, _ := os.run([]str{"node", "-e", node, base + "/echo"}, nil, true)
+    stop()
+    os.remove(bin())
+    expect(got).to_contain(raw([]int{138, 0}))         # the pong
+    expect(got).to_contain(raw([]int{129, 5}) + "abcde")
+    expect(strings.trim_space(p.output)).to_equal("from node")
+  })
+})

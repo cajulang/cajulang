@@ -6,6 +6,18 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Added
+- `std/websocket`: WebSocket (RFC 6455). A blocking client (`dial`, `dial_with`, `read`,
+  `send_text`, `send_binary`, `send_json`, `close`) with headers and subprotocols in the
+  handshake, automatic answers to pings, pings to detect a dead connection, a read timeout and
+  reconnection with backoff (`on_open` after each one); and a server inside `std/http`'s event
+  loop (`accept`, `accept_with`, `on_message`, `on_close`, broadcasts, pings to quiet clients).
+  Fragmented messages are joined; `ws://` only (no TLS). `docs/websocket.md`.
+- `std/http`: protocol upgrades. `res.upgrade(h)` after a 101 hands the connection to an
+  `http.StreamHandler` (`stream_open`, `stream_data`, `stream_closed`; `Stream.write`,
+  `Stream.close`), served by the event loop and never closed for being idle. `http.every(ms, f)`
+  runs `f` periodically inside the loop.
+
 ## [0.6.0] - 2026-11-14
 
 ### Added
