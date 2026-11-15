@@ -1,0 +1,3 @@
+# pbkdf2 with a negative key length: the runtime refuses the string of length -5
+import "std/crypto"
+print(len(crypto.pbkdf2_sha256("password", "salt", 1, -5)))

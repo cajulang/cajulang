@@ -13,6 +13,7 @@ export fn new_buffer(cap: int) -> *Buffer {
 }
 
 fn (b: *Buffer) reserve(extra: int) {
+  if extra < 0 { panic("bytes.Buffer: negative length " + str(extra)) }
   if b.n + extra <= b.cap { return }
   c := b.cap * 2
   if c < 64 { c = 64 }
@@ -34,7 +35,10 @@ fn (b: *Buffer) reserve(extra: int) {
 export fn (b: *Buffer) len() -> int { return b.n }
 export fn (b: *Buffer) reset() { b.n = 0 }
 # cuts the buffer to n bytes
-export fn (b: *Buffer) truncate(n: int) { if n < b.n { b.n = n } }
+export fn (b: *Buffer) truncate(n: int) {
+  if n < 0 { panic("bytes.Buffer: truncate to a negative length " + str(n)) }
+  if n < b.n { b.n = n }
+}
 
 export fn (b: *Buffer) byte(c: int) {
   if b.n >= b.cap { b.reserve(1) }
@@ -82,7 +86,8 @@ export fn (b: *Buffer) append(o: *Buffer) {
 
 # reading and patching at an offset (must be inside the buffer)
 fn (b: *Buffer) check(at: int, n: int) {
-  if at < 0 || at + n > b.n { panic("bytes.Buffer: offset " + str(at) + " out of range (length " + str(b.n) + ")") }
+  # written so that no sum can overflow: at + n with a huge n would wrap around
+  if at < 0 || n < 0 || at > b.n - n { panic("bytes.Buffer: offset " + str(at) + " (" + str(n) + " bytes) out of range (length " + str(b.n) + ")") }
 }
 export fn (b: *Buffer) get(at: int) -> int {
   b.check(at, 1)
@@ -127,6 +132,7 @@ export fn (b: *Buffer) string() -> str {
 }
 # a copy of bytes [lo, hi)
 export fn (b: *Buffer) slice(lo: int, hi: int) -> str {
+  if hi < lo { panic("bytes.Buffer: slice [" + str(lo) + ":" + str(hi) + "] with hi < lo") }
   b.check(lo, hi - lo)
   m := __newstr(hi - lo)
   for i := lo; i < hi; i++ { __store8(m + 8 + i - lo, __load8(b.mem + 8 + i)) }

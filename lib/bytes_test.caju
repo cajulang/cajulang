@@ -1,5 +1,15 @@
 import "std/bytes"
-import { describe, it, expect, before_each } from "std/testing"
+import { describe, it, expect, before_each, run_file } from "std/testing"
+
+# the message of the panic f raises, or ""
+fn guarded(f: fn()) -> (msg: str) {
+  defer fn() {
+    r := recover()
+    if r != nil { msg = str(r) }
+  }()
+  f()
+  return ""
+}
 
 describe("bytes.Buffer", fn() {
   let b: *bytes.Buffer = nil
@@ -36,5 +46,33 @@ describe("bytes.Buffer", fn() {
     expect(c.len()).to_equal(318)
     expect(c.slice(0, 2)).to_equal("xy")
     expect(len(c.string())).to_equal(318)
+  })
+})
+
+describe("bytes.Buffer bounds", fn() {
+  it("refuses slices and offsets outside the buffer, including negative and huge ones", fn() {
+    b := bytes.new_buffer(16)
+    b.write("abcdef")
+    expect(b.slice(1, 3)).to_equal("bc")
+    expect(guarded(fn() { b.slice(2, 1) })).to_contain("hi < lo")
+    expect(guarded(fn() { b.slice(4, 9) })).to_contain("out of range")
+    expect(guarded(fn() { b.get(-1) })).to_contain("out of range")
+    expect(guarded(fn() { b.get_u64(4) })).to_contain("out of range")
+    expect(guarded(fn() { b.get_u32(1 << 62) })).to_contain("out of range")
+  })
+  it("refuses negative lengths in truncate and zeros", fn() {
+    b := bytes.new_buffer(16)
+    b.write("abc")
+    expect(guarded(fn() { b.truncate(-40) })).to_contain("negative length")
+    expect(guarded(fn() { b.zeros(-3) })).to_contain("negative length")
+    expect(b.len()).to_equal(3)
+  })
+})
+
+describe("strings of an invalid length", fn() {
+  it("end the program with a runtime error instead of a block that claims a huge length", fn() {
+    r := run_file("testdata/negative_length.caju")
+    expect(r.output).to_contain("invalid string length -5")
+    expect(r.code).not_().to_equal(0)
   })
 })

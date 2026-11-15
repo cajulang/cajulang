@@ -38,6 +38,9 @@ fn rt_copy(d: int, s: int, n: int) {
 
 # ---------------------------------------------------------------- strings
 fn rt_newstr(n: int) -> int {
+  # a negative or absurd length (from a bad argument) must not become a small block whose header
+  # claims a huge string: reading or writing through it would leave the block
+  if n < 0 || n > (1 << 40) { rt_fail("runtime", "invalid string length " + rt_int_str(n)) }
   p := rt_alloc_ns(n + 9)
   __store64(p, n)
   __store8(p + 8 + n, 0)
