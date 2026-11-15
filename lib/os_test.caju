@@ -81,3 +81,21 @@ describe("os.executable", fn() {
     expect(os.executable()).to_start_with("/")
   })
 })
+
+describe("os.unix_time", fn() {
+  it("gives the wall clock in seconds since 1970", fn() {
+    t := os.unix_time()
+    expect(t > 1700000000).to_be_true()
+    expect(t < 4102444800).to_be_true()
+  })
+})
+
+describe("os.is_terminal", fn() {
+  it("is false for a descriptor that is not open", fn() {
+    expect(os.is_terminal(-1)).to_be_false()
+    expect(os.is_terminal(9999)).to_be_false()
+  })
+  it("is false for the standard output, which caju test reads through a pipe", fn() {
+    expect(os.is_terminal(1)).to_be_false()
+  })
+})

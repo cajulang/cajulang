@@ -232,6 +232,22 @@ export fn nanotime() -> int {
   return __load64(ts + 8) * 1000000000 + __load64(ts + 16)
 }
 
+# the wall clock: seconds since 1970-01-01 UTC
+export fn unix_time() -> int {
+  ts := __newstr(16)
+  __syscall(SYS_CLOCK_GETTIME, 0, ts + 8, 0, 0, 0, 0)
+  return __load64(ts + 8)
+}
+
+const SYS_IOCTL = 16
+const TCGETS = 0x5401
+
+# is the file descriptor fd (0 stdin, 1 stdout, 2 stderr) a terminal?
+export fn is_terminal(fd: int) -> bool {
+  t := __newstr(64)
+  return __syscall(SYS_IOCTL, fd, TCGETS, t + 8, 0, 0, 0) == 0
+}
+
 # a NULL-terminated array of C strings, for execve
 fn cstr_array(xs: []str) -> int {
   a := __newstr(8 * (len(xs) + 1))
