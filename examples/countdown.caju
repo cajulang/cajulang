@@ -1,8 +1,9 @@
 # while + sleep: waits 1 second on each iteration
+import "std/os"
 let n = 5
 while n > 0 {
   print(n + "...")
-  sleep(1)
+  os.sleep(1)
   n = n - 1
 }
 print("Liftoff! 🚀")

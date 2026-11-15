@@ -2584,7 +2584,7 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     }
     f.call_fn(g.rt_call("rt_out_nl"))
     return
-  case "sleep":
+  case "__sleep":
     f.where_arg(n)
     f.expr_to(args[0], "num")
     f.push()

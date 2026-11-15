@@ -386,6 +386,7 @@ fn (c: *Compiler) call_expr(n: *ast.Node) {
     c.call_expr(n)
     return
   }
+  if n.name == "sleep" { c.err("sleep is not part of the language (waiting is the operating system's business): import \"std/os\" and call os.sleep(seconds)", n) }
   c.err("The function \"" + n.name + "\" does not exist", n)
 }
 fn (c: *Compiler) builtin_call(n: *ast.Node) {

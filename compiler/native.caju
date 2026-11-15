@@ -4729,7 +4729,7 @@ fn (f: *Fn) builtin(n: *ast.Node) {
     }
     A.call(g.rt_call("rt_out_nl"))
     return
-  case "sleep":
+  case "__sleep":
     f.where_arg(n)
     f.expr_to(args[0], "num")
     A.push(RAX)

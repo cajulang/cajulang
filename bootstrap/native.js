@@ -934,7 +934,7 @@
             A.call(rtCall("rt_out_nl"));
             return;
           }
-          case "sleep":
+          case "sleep": case "__sleep":
             whereArg(n); exprTo(args[0], "num"); A.push(RAX); rt("rt_sleep", 2);
             return;
           case "len": case "cap": {

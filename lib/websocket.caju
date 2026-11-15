@@ -558,7 +558,7 @@ fn (c: *Conn) redial() -> error {
     }
     last = err
     if c.opts.max_retries != 0 && attempt == c.opts.max_retries { break }
-    sleep(num(wait) / 1000.0)
+    os.sleep(num(wait) / 1000.0)
     wait = wait * 2
     if wait > c.opts.reconnect_max_ms { wait = c.opts.reconnect_max_ms }
   }

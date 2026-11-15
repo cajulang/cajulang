@@ -232,6 +232,10 @@ export fn nanotime() -> int {
   return __load64(ts + 8) * 1000000000 + __load64(ts + 16)
 }
 
+# waits seconds (fractions too: os.sleep(0.25)). Under `caju test` (CAJU_SKIP_SLEEP) it returns at
+# once. In a browser page's program it blocks the program's worker, not the page.
+export fn sleep(seconds: num) { __sleep(seconds) }
+
 # the wall clock: seconds since 1970-01-01 UTC
 export fn unix_time() -> int {
   ts := __newstr(16)

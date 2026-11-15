@@ -6,6 +6,14 @@ notes from the section of its version here (`tools/changelog.sh`).
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `sleep` is no longer part of the language. Waiting is the operating system's
+  business, so it lives in the standard library: `import "std/os"` and call `os.sleep(seconds)`
+  (fractions too). A program that calls `sleep(...)` gets a compile error that says so, and
+  `sleep` is now an ordinary name a program may use for its own function. Inside the standard
+  library, `os.sleep` uses the intrinsic `__sleep`, which each runtime implements (Linux, Windows,
+  WebAssembly).
+
 ## [0.8.0] - 2026-11-15
 
 ### Added

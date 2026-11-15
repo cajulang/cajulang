@@ -1,7 +1,8 @@
 # go starts a goroutine; channels carry values between them.
+import "std/os"
 fn worker(id: int, jobs: chan int, results: chan str) {
   for t := range jobs {
-    sleep(0.1)                  # pretends to work
+    os.sleep(0.1)                  # pretends to work
     results <- "worker " + str(id) + " did job " + str(t)
   }
 }
@@ -17,7 +18,7 @@ ticker := make(chan int)
 done := make(chan bool)
 go fn() {
   for i := 1; i <= 3; i++ {
-    sleep(0.2)
+    os.sleep(0.2)
     ticker <- i
   }
   done <- true

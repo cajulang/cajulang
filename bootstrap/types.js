@@ -82,7 +82,7 @@
     __strp: [["str"], "int"], __pstr: [["int"], "str"], __fbits: [["num"], "int"], __bitsf: [["int"], "num"],
     __sqrt: [["num"], "num"], __fmod: [["num", "num"], "num"],
     // for the standard library: a new string block [length n][bytes][0] (bytes not zeroed), flush print's buffer, exit
-    __newstr: [["int"], "int"], __flush: [[], "void"], __exit: [["int"], "void"],
+    __newstr: [["int"], "int"], __flush: [[], "void"], __exit: [["int"], "void"], __sleep: [["num"], "void"],
   };
   // language functions with their own typing rules
   const SPECIAL_BUILTINS = ["print", "len", "cap", "append", "copy", "delete", "make", "new", "panic", "recover", "close"];

@@ -1,5 +1,6 @@
+import "std/os"
 let number = 7
 for i = 1 to 10 {
   print(number + " x " + i + " = " + number * i)
-  sleep(0.15)
+  os.sleep(0.15)
 }

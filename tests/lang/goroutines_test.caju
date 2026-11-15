@@ -1,5 +1,6 @@
 # Goroutines, channels and select. The native compiler does not support them yet (phase 6),
 # so `caju test` skips this whole file until it does.
+import "std/os"
 import { describe, it, expect, run_file } from "std/testing"
 
 fn sorted(xs: []str) -> []str {
@@ -19,14 +20,14 @@ fn sorted(xs: []str) -> []str {
 
 fn worker(id: int, jobs: chan int, results: chan str) {
   for t := range jobs {
-    sleep(0.1)
+    os.sleep(0.1)
     results <- "worker " + str(id) + " did job " + str(t)
   }
 }
 
 fn squarer(id: int, jobs: chan int, res: chan int) {
   for j := range jobs {
-    sleep(0.01 * id)
+    os.sleep(0.01 * id)
     res <- j * j
   }
 }
@@ -109,10 +110,10 @@ describe("goroutines and channels", fn() {
   it("a goroutine runs while main sleeps", fn() {
     log := []str{}
     go fn() {
-      sleep(0.2)
+      os.sleep(0.2)
       log = append(log, "goroutine slept")
     }()
-    sleep(0.5)
+    os.sleep(0.5)
     log = append(log, "end of main")
     expect(log).to_equal([]str{"goroutine slept", "end of main"})
   })
@@ -124,7 +125,7 @@ describe("select", fn() {
     done := make(chan bool)
     go fn() {
       for i := 1; i <= 3; i++ {
-        sleep(0.2)
+        os.sleep(0.2)
         ticker <- i
       }
       done <- true
@@ -147,7 +148,7 @@ describe("select", fn() {
     go fn() {
       for i := 0; i < 3; i++ {
         data <- i
-        sleep(0.1)
+        os.sleep(0.1)
       }
       done <- true
     }()

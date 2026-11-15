@@ -138,7 +138,7 @@ describe("examples", fn() {
     check("types-type-error.caju", "Type error in types-type-error.caju, line 12: Parameter \"product\" of label is str, but got num. Use str(...) to convert to a string.", 1)
   })
   it("with-error stops with a runtime error at the division by zero", fn() {
-    check("with-error.caju", "This line runs\nRuntime error in with-error.caju, line 3: Integer division by zero.", 1)
+    check("with-error.caju", "This line runs\nRuntime error in with-error.caju, line 4: Integer division by zero.", 1)
   })
   it("hello-server compiles (it is a server, so it is not run)", fn() {
     tmp := os.getenv("TMPDIR")

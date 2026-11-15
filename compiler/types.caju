@@ -46,8 +46,8 @@ export const NEVER = "never"
 # language functions with their own typing rules
 export let SPECIAL_BUILTINS = []str{"print", "len", "cap", "append", "copy", "delete", "make", "new", "panic", "recover", "close"}
 # values.js: built-in functions (the position is the number used by the CALL instruction)
-export let BUILTINS = []str{"print", "sleep", "alloc", "free", "peek8", "peek16", "peek32", "peek64", "poke8", "poke16", "poke32", "readstr", "readwstr"}
-export let BUILTIN_ARITY = map[str]int{"print": -1, "sleep": 1, "alloc": 1, "free": 1, "peek8": 1, "peek16": 1, "peek32": 1, "peek64": 1, "poke8": 2, "poke16": 2, "poke32": 2, "readstr": 1, "readwstr": 1}
+export let BUILTINS = []str{"print", "alloc", "free", "peek8", "peek16", "peek32", "peek64", "poke8", "poke16", "poke32", "readstr", "readwstr"}
+export let BUILTIN_ARITY = map[str]int{"print": -1, "alloc": 1, "free": 1, "peek8": 1, "peek16": 1, "peek32": 1, "peek64": 1, "poke8": 2, "poke16": 2, "poke32": 2, "readstr": 1, "readwstr": 1}
 export let FFI_WORDS = map[str]int{"i32": 1, "u32": 1, "i64": 2, "u64": 2, "f32": 1, "f64": 2, "bool": 1, "ptr": 1, "str": 1, "wstr": 1}
 export const MAX_FFI_WORDS = 16
 
@@ -272,7 +272,7 @@ struct Sig {
   r: str
 }
 let BUILTIN_SIG = map[str]*Sig{
-  "sleep": &Sig{[]str{"num"}, "void"}, "alloc": &Sig{[]str{"int"}, "int"}, "free": &Sig{[]str{"any"}, "void"},
+  "alloc": &Sig{[]str{"int"}, "int"}, "free": &Sig{[]str{"any"}, "void"},
   "peek8": &Sig{[]str{"int"}, "int"}, "peek16": &Sig{[]str{"int"}, "int"}, "peek32": &Sig{[]str{"int"}, "int"}, "peek64": &Sig{[]str{"int"}, "int"},
   "poke8": &Sig{[]str{"int", "int"}, "void"}, "poke16": &Sig{[]str{"int", "int"}, "void"}, "poke32": &Sig{[]str{"int", "int"}, "void"},
   "readstr": &Sig{[]str{"int"}, "str"}, "readwstr": &Sig{[]str{"int"}, "str"},
@@ -284,6 +284,7 @@ let INTRINSIC_SIG = map[str]*Sig{
   "__strp": &Sig{[]str{"str"}, "int"}, "__pstr": &Sig{[]str{"int"}, "str"}, "__fbits": &Sig{[]str{"num"}, "int"}, "__bitsf": &Sig{[]str{"int"}, "num"},
   "__sqrt": &Sig{[]str{"num"}, "num"}, "__fmod": &Sig{[]str{"num", "num"}, "num"},
   "__newstr": &Sig{[]str{"int"}, "int"}, "__flush": &Sig{[]str{}, "void"}, "__exit": &Sig{[]str{"int"}, "void"},
+  "__sleep": &Sig{[]str{"num"}, "void"},   # std/os.sleep: each runtime waits its own way (rt_os_sleep)
   "__depth": &Sig{[]str{}, "int"}, "__set_depth": &Sig{[]str{"int"}, "void"},
   # reflection for std/json: the box of an any and back, and the runtime's allocators
   "__anyp": &Sig{[]str{"any"}, "int"}, "__pany": &Sig{[]str{"int"}, "any"},
@@ -1284,6 +1285,9 @@ fn (c: *Checker) call_type(n: *ast.Node, sc: *Scope) -> str {
   if contains_str(SPECIAL_BUILTINS, nm) && !is_fn {
     n.call_kind = "builtin"
     return c.builtin_type(n, sc)
+  }
+  if nm == "sleep" && !is_fn && !c.intrinsics && !n.privileged {
+    c.err("sleep is not part of the language (waiting is the operating system's business): import \"std/os\" and call os.sleep(seconds)", n)
   }
   bsig, hb := BUILTIN_SIG[nm]
   if !hb && (c.intrinsics || n.privileged) { bsig, hb = INTRINSIC_SIG[nm] }

@@ -1,4 +1,5 @@
+import "std/os"
 print("This line runs")
-sleep(0.5)
+os.sleep(0.5)
 print(10 / (5 - 5))
 print("This one never gets to run")
