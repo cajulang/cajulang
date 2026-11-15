@@ -1,0 +1,376 @@
+import "std/x509"
+import "std/os"
+import "std/hex"
+import "std/strings"
+import { describe, it, expect } from "std/testing"
+
+# The Ed25519 certificates come from testdata/x509/gen.sh (valid for 100 years from their
+# creation); github_chain.pem and kernel_chain.pem are real chains, only parsed (their ECDSA and
+# RSA signatures are std/pubkey's business, tested there).
+
+fn load(name: str) -> []*x509.Certificate {
+  text, err := os.read_file("testdata/x509/" + name + ".pem")
+  if err != nil { panic(err) }
+  cs, err2 := x509.parse_pem(text)
+  if err2 != nil { panic(err2) }
+  return cs
+}
+
+fn one(name: str) -> *x509.Certificate { return load(name)[0] }
+
+let root = one("root")
+let inter = one("inter")
+let leaf = one("leaf")
+let now: int = leaf.not_before + 60
+
+fn opts(dns: str, inters: []*x509.Certificate) -> *x509.VerifyOptions {
+  return &x509.VerifyOptions{dns_name: dns, roots: []*x509.Certificate{root}, intermediates: inters, now: now}
+}
+
+fn verify_err(c: *x509.Certificate, o: *x509.VerifyOptions) -> str {
+  _, err := x509.verify(c, o)
+  if err == nil { return "" }
+  return err.Error()
+}
+
+fn host_err(c: *x509.Certificate, host: str) -> str {
+  err := x509.match_hostname(c, host)
+  if err == nil { return "" }
+  return err.Error()
+}
+
+fn subjects(chain: []*x509.Certificate) -> []str {
+  out := []str{}
+  for _, c := range chain { out = append(out, c.common_name) }
+  return out
+}
+
+describe("x509.parse", fn() {
+  it("reads the names, dates and alternative names of a leaf", fn() {
+    expect(leaf.version).to_equal(3)
+    expect(leaf.sig_alg_oid).to_equal("1.3.101.112")
+    expect(leaf.subject).to_equal("CN=example.test, O=Caju Test")
+    expect(leaf.issuer).to_equal("CN=Caju Test Intermediate, O=Caju Test, C=BR")
+    expect(leaf.common_name).to_equal("example.test")
+    expect(leaf.dns_names).to_equal([]str{"example.test", "www.example.test", "*.wild.example.test"})
+    expect(leaf.ip_addresses).to_equal([]str{"127.0.0.1", "::1"})
+    expect(len(leaf.serial)).to_equal(8)
+    expect(len(leaf.signature)).to_equal(64)
+  })
+  it("parses UTCTime and GeneralizedTime (dates after 2049)", fn() {
+    expect(x509.format_time(leaf.not_before)).to_start_with("2026-")
+    expect(x509.format_time(leaf.not_after)).to_start_with("2126-")
+    expect(leaf.not_after - leaf.not_before).to_equal(36500 * 86400)
+  })
+  it("reads the key usages and the leaf's constraints", fn() {
+    expect(leaf.is_ca).to_be_false()
+    expect(leaf.path_len).to_equal(-1)
+    expect(leaf.has_key_usage).to_be_true()
+    expect(leaf.key_usage).to_equal(x509.KU_DIGITAL_SIGNATURE)
+    expect(leaf.ext_key_usage).to_equal([]str{x509.EKU_SERVER_AUTH})
+    expect(leaf.has_unknown_critical).to_be_false()
+    expect(leaf.name_constraints_present).to_be_false()
+  })
+  it("reads basicConstraints with a path length", fn() {
+    expect(inter.is_ca).to_be_true()
+    expect(inter.has_basic_constraints).to_be_true()
+    expect(inter.path_len).to_equal(0)
+    expect(inter.key_usage).to_equal(x509.KU_CERT_SIGN | x509.KU_CRL_SIGN)
+    expect(root.path_len).to_equal(-1)
+  })
+  it("links the key identifiers and the raw names of a chain", fn() {
+    expect(leaf.authority_key_id).to_equal(inter.subject_key_id)
+    expect(inter.authority_key_id).to_equal(root.subject_key_id)
+    expect(len(inter.subject_key_id)).to_equal(20)
+    expect(leaf.issuer_raw == inter.subject_raw).to_be_true()
+    expect(root.issuer_raw == root.subject_raw).to_be_true()
+  })
+  it("keeps the signed bytes and the public key", fn() {
+    expect(strings.contains(leaf.raw, leaf.tbs)).to_be_true()
+    expect(hex.encode(leaf.spki[0:12])).to_equal("302a300506032b6570032100")
+    expect(leaf.key_alg_oid).to_equal("1.3.101.112")
+  })
+  it("marks unknown critical extensions and name constraints", fn() {
+    expect(one("crit_leaf").has_unknown_critical).to_be_true()
+    expect(one("nc_inter").name_constraints_present).to_be_true()
+  })
+  it("refuses trailing data after the certificate", fn() {
+    _, err := x509.parse(leaf.raw + string([]byte{0}))
+    expect(err.Error()).to_contain("trailing data")
+  })
+  it("refuses indefinite lengths", fn() {
+    raw := leaf.raw[0:1] + string([]byte{0x80}) + leaf.raw[4:len(leaf.raw)]
+    _, err := x509.parse(raw)
+    expect(err.Error()).to_contain("indefinite length")
+  })
+  it("refuses non-minimal lengths", fn() {
+    raw := leaf.raw[0:1] + string([]byte{0x83, 0}) + leaf.raw[2:len(leaf.raw)]
+    _, err := x509.parse(raw)
+    expect(err.Error()).to_contain("non-minimal length")
+  })
+  it("refuses empty input and garbage", fn() {
+    _, err := x509.parse("")
+    expect(err).not_().to_be_nil()
+    _, err = x509.parse("hello, world")
+    expect(err).not_().to_be_nil()
+  })
+})
+
+describe("x509.parse with hostile input", fn() {
+  it("never crashes on any truncation", fn() {
+    count := 0
+    for _, name := range []str{"leaf", "inter", "pss", "github_chain"} {
+      raw := one(name).raw
+      for n := 0; n < len(raw); n++ {
+        c, err := x509.parse(raw[0:n])
+        if c == nil && err != nil { count++ }
+      }
+    }
+    expect(count).to_be_greater_than(1000)
+  })
+  it("never crashes on random byte flips", fn() {
+    seed := 12345
+    raws := []str{leaf.raw, inter.raw, one("github_chain").raw, one("kernel_chain").raw, one("pss").raw}
+    refused := 0
+    for i := 0; i < 3000; i++ {
+      raw := raws[i % len(raws)]
+      b := []byte(raw)
+      flips := 1 + i % 3
+      for k := 0; k < flips; k++ {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        at := seed % len(b)
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        b[at] = byte((seed >> 8) & 255)
+      }
+      c, err := x509.parse(string(b))
+      if err != nil {
+        refused++
+      } else {
+        # whatever parsed must still be safe to use
+        x509.match_hostname(c, "example.test")
+        x509.verify(c, opts("", []*x509.Certificate{inter}))
+      }
+    }
+    expect(refused).to_be_greater_than(100)
+  })
+  it("never crashes on random bytes", fn() {
+    seed := 99
+    for i := 0; i < 500; i++ {
+      b := []byte{0x30}
+      for k := 0; k < i % 64; k++ {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        b = append(b, byte((seed >> 8) & 255))
+      }
+      _, err := x509.parse(string(b))
+      expect(err).not_().to_be_nil()
+    }
+  })
+})
+
+describe("x509.parse_pem", fn() {
+  it("reads every certificate block", fn() {
+    expect(len(load("github_chain"))).to_equal(3)
+  })
+  it("refuses text without certificates", fn() {
+    _, err := x509.parse_pem("nothing here")
+    expect(err).to_be_error("x509: no certificate in PEM data")
+  })
+  it("refuses bad base64", fn() {
+    _, err := x509.parse_pem("-----BEGIN CERTIFICATE-----\nMII*\n-----END CERTIFICATE-----\n")
+    expect(err.Error()).to_start_with("x509: bad base64")
+  })
+  it("refuses a block without its END line", fn() {
+    _, err := x509.parse_pem("-----BEGIN CERTIFICATE-----\nMIIB\n")
+    expect(err).not_().to_be_nil()
+  })
+})
+
+describe("real certificates", fn() {
+  it("reads github.com's chain", fn() {
+    cs := load("github_chain")
+    expect(cs[0].subject).to_equal("CN=github.com")
+    expect(cs[0].issuer).to_equal("CN=Sectigo Public Server Authentication CA DV E36, O=Sectigo Limited, C=GB")
+    expect(cs[0].dns_names).to_equal([]str{"github.com", "www.github.com"})
+    expect(x509.format_time(cs[0].not_before)).to_equal("2026-10-30 00:00:00 UTC")
+    expect(x509.format_time(cs[0].not_after)).to_equal("2027-01-27 23:59:59 UTC")
+    expect(cs[0].sig_alg_oid).to_equal("1.2.840.10045.4.3.2")
+    expect(hex.encode(cs[0].serial)).to_equal("3e1d6026b4b0aea279dca2efbbced82b")
+    expect(cs[1].is_ca).to_be_true()
+    expect(cs[1].path_len).to_equal(0)
+    expect(cs[2].issuer).to_equal("CN=USERTrust ECC Certification Authority, O=The USERTRUST Network, L=Jersey City, ST=New Jersey, C=US")
+    expect(cs[0].authority_key_id).to_equal(cs[1].subject_key_id)
+    expect(x509.match_hostname(cs[0], "www.github.com")).to_be_nil()
+  })
+  it("maps ECDSA signatures with the issuer's curve", fn() {
+    cs := load("github_chain")
+    a, _ := x509.signature_algorithm(cs[0], cs[1].spki)
+    expect(a).to_equal("ecdsa-p256-sha256")
+    b, _ := x509.signature_algorithm(cs[1], cs[2].spki)
+    expect(b).to_equal("ecdsa-p384-sha384")
+  })
+  it("reads kernel.org's RSA chain", fn() {
+    cs := load("kernel_chain")
+    expect(cs[0].dns_names).to_equal([]str{"cdn.kernel.org", "kernel.org", "www.kernel.org"})
+    expect(cs[2].issuer).to_equal("CN=GlobalSign, O=GlobalSign, OU=GlobalSign Root CA - R3")
+    a, _ := x509.signature_algorithm(cs[0], cs[1].spki)
+    expect(a).to_equal("rsa-pkcs1-sha256")
+    b, _ := x509.signature_algorithm(cs[1], cs[2].spki)
+    expect(b).to_equal("rsa-pkcs1-sha384")
+  })
+  it("maps RSASSA-PSS with its hash parameters", fn() {
+    c := one("pss")
+    a, err := x509.signature_algorithm(c, c.spki)
+    expect(err).to_be_nil()
+    expect(a).to_equal("rsa-pss-sha384")
+  })
+  it("maps Ed25519", fn() {
+    a, _ := x509.signature_algorithm(leaf, inter.spki)
+    expect(a).to_equal("ed25519")
+  })
+})
+
+describe("x509.system_roots", fn() {
+  it("loads more than 50 roots, once", fn() {
+    rs, err := x509.system_roots()
+    expect(err).to_be_nil()
+    expect(len(rs)).to_be_greater_than(50)
+    rs2, _ := x509.system_roots()
+    expect(rs2[0] == rs[0]).to_be_true()
+  })
+  it("loads a bundle from a file", fn() {
+    rs, err := x509.load_roots("testdata/x509/kernel_chain.pem")
+    expect(err).to_be_nil()
+    expect(len(rs)).to_equal(3)
+  })
+})
+
+describe("x509.match_hostname", fn() {
+  it("accepts the exact names, ignoring case and a final dot", fn() {
+    expect(x509.match_hostname(leaf, "example.test")).to_be_nil()
+    expect(x509.match_hostname(leaf, "WWW.Example.Test.")).to_be_nil()
+  })
+  it("accepts one label under a wildcard", fn() {
+    expect(x509.match_hostname(leaf, "api.wild.example.test")).to_be_nil()
+  })
+  it("refuses a wildcard for zero or two labels", fn() {
+    expect(host_err(leaf, "wild.example.test")).not_().to_equal("")
+    expect(host_err(leaf, "a.b.wild.example.test")).not_().to_equal("")
+  })
+  it("says which names the certificate is valid for", fn() {
+    expect(host_err(leaf, "other.test")).to_equal("x509: certificate is valid for example.test, www.example.test, *.wild.example.test, not other.test")
+  })
+  it("matches IP addresses against the IP SANs only", fn() {
+    expect(x509.match_hostname(leaf, "127.0.0.1")).to_be_nil()
+    expect(x509.match_hostname(leaf, "::1")).to_be_nil()
+    expect(x509.match_hostname(leaf, "[0:0:0:0:0:0:0:1]")).to_be_nil()
+    expect(host_err(leaf, "10.0.0.1")).to_equal("x509: certificate is valid for 127.0.0.1, ::1, not 10.0.0.1")
+  })
+  it("never falls back to the common name", fn() {
+    c := one("cn_leaf")
+    expect(c.common_name).to_equal("example.test")
+    expect(host_err(c, "example.test")).to_contain("no DNS names")
+  })
+  it("refuses bare and public-suffix wildcards and partial ones", fn() {
+    c := &x509.Certificate{dns_names: []str{"*", "*.com", "f*.example.com", "*.*.example.org"}}
+    expect(host_err(c, "a.com")).not_().to_equal("")
+    expect(host_err(c, "com")).not_().to_equal("")
+    expect(host_err(c, "foo.example.com")).not_().to_equal("")
+    expect(host_err(c, "a.b.example.org")).not_().to_equal("")
+    expect(host_err(c, "*.com")).to_contain("invalid host name")
+  })
+})
+
+describe("x509.parse_ip and format_ip", fn() {
+  it("round-trips IPv4 and IPv6", fn() {
+    expect(x509.format_ip(x509.parse_ip("192.168.0.1"))).to_equal("192.168.0.1")
+    expect(x509.format_ip(x509.parse_ip("2001:DB8:0:0:1:0:0:1"))).to_equal("2001:db8::1:0:0:1")
+    expect(x509.format_ip(x509.parse_ip("::ffff:10.0.0.1"))).to_equal("::ffff:a00:1")
+    expect(x509.format_ip(x509.parse_ip("fe80::"))).to_equal("fe80::")
+  })
+  it("refuses what is not an address", fn() {
+    expect(x509.parse_ip("example.com")).to_equal("")
+    expect(x509.parse_ip("256.1.1.1")).to_equal("")
+    expect(x509.parse_ip("1::2::3")).to_equal("")
+    expect(x509.parse_ip("01.1.1.1")).to_equal("")
+  })
+})
+
+describe("x509.verify", fn() {
+  it("builds the chain leaf, intermediate, root", fn() {
+    chain, err := x509.verify(leaf, opts("example.test", []*x509.Certificate{inter}))
+    expect(err).to_be_nil()
+    expect(subjects(chain)).to_equal([]str{"example.test", "Caju Test Intermediate", "Caju Test Root"})
+  })
+  it("ignores unrelated and duplicate intermediates", fn() {
+    inters := []*x509.Certificate{one("evil_root"), leaf, inter, inter, one("noca_inter")}
+    chain, err := x509.verify(leaf, opts("www.example.test", inters))
+    expect(err).to_be_nil()
+    expect(len(chain)).to_equal(3)
+  })
+  it("accepts a trusted root as the leaf", fn() {
+    chain, err := x509.verify(root, opts("", nil))
+    expect(err).to_be_nil()
+    expect(len(chain)).to_equal(1)
+  })
+  it("refuses the wrong host name", fn() {
+    expect(verify_err(leaf, opts("example.org", []*x509.Certificate{inter}))).to_equal("x509: certificate is valid for example.test, www.example.test, *.wild.example.test, not example.org")
+  })
+  it("checks wildcards", fn() {
+    expect(verify_err(leaf, opts("x.wild.example.test", []*x509.Certificate{inter}))).to_equal("")
+    expect(verify_err(leaf, opts("x.y.wild.example.test", []*x509.Certificate{inter}))).to_start_with("x509: certificate is valid for")
+  })
+  it("refuses an expired leaf", fn() {
+    o := opts("example.test", []*x509.Certificate{inter})
+    o.now = leaf.not_after + 1
+    expect(verify_err(leaf, o)).to_equal("x509: certificate expired on " + x509.format_time(leaf.not_after) + ": CN=example.test, O=Caju Test")
+  })
+  it("refuses a leaf that is not valid yet", fn() {
+    o := opts("example.test", []*x509.Certificate{inter})
+    o.now = leaf.not_before - 1
+    expect(verify_err(leaf, o)).to_start_with("x509: certificate is not valid before")
+  })
+  it("refuses a leaf signed by an untrusted root", fn() {
+    expect(verify_err(one("evil_leaf"), opts("example.test", []*x509.Certificate{one("evil_root")}))).to_start_with("x509: certificate signed by unknown authority")
+  })
+  it("refuses a chain when the intermediate is missing", fn() {
+    expect(verify_err(leaf, opts("example.test", nil))).to_equal("x509: certificate signed by unknown authority (issuer \"CN=Caju Test Intermediate, O=Caju Test, C=BR\")")
+  })
+  it("uses the system roots when none are given", fn() {
+    o := opts("example.test", []*x509.Certificate{inter})
+    o.roots = nil
+    expect(verify_err(leaf, o)).to_start_with("x509: certificate signed by unknown authority")
+  })
+  it("refuses an intermediate without the CA flag", fn() {
+    expect(verify_err(one("noca_leaf"), opts("example.test", []*x509.Certificate{one("noca_inter")}))).to_contain("is not a CA")
+  })
+  it("refuses an intermediate whose keyUsage lacks keyCertSign", fn() {
+    expect(verify_err(one("noku_leaf"), opts("example.test", []*x509.Certificate{one("noku_inter")}))).to_contain("without keyCertSign")
+  })
+  it("refuses a chain longer than a path length allows", fn() {
+    inters := []*x509.Certificate{inter, one("sub_inter")}
+    expect(verify_err(one("sub_leaf"), opts("example.test", inters))).to_contain("path length constraint of \"CN=Caju Test Intermediate")
+  })
+  it("refuses an unknown critical extension", fn() {
+    expect(verify_err(one("crit_leaf"), opts("example.test", []*x509.Certificate{inter}))).to_contain("unsupported critical extension")
+  })
+  it("refuses a leaf only good for client authentication", fn() {
+    expect(verify_err(one("client_leaf"), opts("example.test", []*x509.Certificate{inter}))).to_contain("not valid for server authentication")
+  })
+  it("refuses a CA with name constraints", fn() {
+    expect(verify_err(one("nc_leaf"), opts("example.test", []*x509.Certificate{one("nc_inter")}))).to_contain("name constraints, which are not supported")
+  })
+  it("refuses a tampered certificate", fn() {
+    b := []byte(leaf.raw)
+    b[15] = b[15] ^ 1    # first byte of the serial number
+    c, err := x509.parse(string(b))
+    expect(err).to_be_nil()
+    expect(verify_err(c, opts("example.test", []*x509.Certificate{inter}))).to_start_with("x509: bad signature on \"CN=example.test, O=Caju Test\"")
+  })
+  it("refuses an expired intermediate", fn() {
+    # gen.sh makes the intermediate before the leaf, so it expires a moment earlier
+    expect(inter.not_after).to_be_less_than(leaf.not_after)
+    o := opts("example.test", []*x509.Certificate{inter})
+    o.now = inter.not_after + 1
+    expect(verify_err(leaf, o)).to_equal("x509: certificate expired on " + x509.format_time(inter.not_after) + ": CN=Caju Test Intermediate, O=Caju Test, C=BR")
+  })
+})

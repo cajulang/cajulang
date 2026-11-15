@@ -1,0 +1,1155 @@
+# std/x509: X.509 certificates for a TLS client: strict DER parsing, PEM, the system roots,
+# chain building and verification, and hostname matching (RFC 5280, RFC 6125).
+#
+#   certs, err := x509.parse_pem(pem_text)
+#   chain, err := x509.verify(certs[0], &x509.VerifyOptions{dns_name: "example.com", intermediates: certs[1:]})
+#
+# Signatures are checked with std/pubkey (RSA PKCS#1 v1.5 and PSS, ECDSA P-256/P-384, Ed25519).
+# Not supported: name constraints (a chain whose CA has them is refused), revocation (CRL, OCSP)
+# and certificate policies.
+
+import "std/os"
+import "std/strings"
+import "std/base64"
+import "std/hex"
+import "std/pubkey"
+
+# key usage bits (Certificate.key_usage)
+export const KU_DIGITAL_SIGNATURE = 1
+export const KU_CONTENT_COMMITMENT = 2
+export const KU_KEY_ENCIPHERMENT = 4
+export const KU_DATA_ENCIPHERMENT = 8
+export const KU_KEY_AGREEMENT = 16
+export const KU_CERT_SIGN = 32
+export const KU_CRL_SIGN = 64
+export const KU_ENCIPHER_ONLY = 128
+export const KU_DECIPHER_ONLY = 256
+
+# extended key usages (Certificate.ext_key_usage holds dotted OIDs)
+export const EKU_ANY = "2.5.29.37.0"
+export const EKU_SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
+export const EKU_CLIENT_AUTH = "1.3.6.1.5.5.7.3.2"
+
+const MAX_DEPTH = 8
+
+export struct Certificate {
+  raw: str                    # the whole certificate (DER)
+  tbs: str                    # the DER of tbsCertificate (the signed bytes)
+  version: int                # 1, 2 or 3
+  serial: str                 # the INTEGER's content bytes
+  sig_alg_oid: str            # signatureAlgorithm, dotted
+  sig_alg_params: str         # its parameters (DER), "" if absent
+  signature: str              # the BIT STRING's bytes
+  issuer_raw: str             # DER of the issuer Name
+  subject_raw: str            # DER of the subject Name
+  issuer: str                 # "CN=..., O=..., C=..." (most specific first)
+  subject: str
+  common_name: str            # the subject's last CN ("" if none)
+  not_before: int             # unix seconds
+  not_after: int
+  spki: str                   # DER of SubjectPublicKeyInfo
+  key_alg_oid: str            # the SPKI algorithm, dotted
+  key_params: str             # its parameters (DER), "" if absent (the curve OID for EC keys)
+  dns_names: []str            # subjectAltName dNSName entries
+  ip_addresses: []str         # subjectAltName iPAddress entries, as text
+  email_addresses: []str      # subjectAltName rfc822Name entries
+  uris: []str                 # subjectAltName URI entries
+  has_basic_constraints: bool
+  is_ca: bool
+  path_len: int               # -1 if absent
+  has_key_usage: bool
+  key_usage: int              # KU_* bits
+  ext_key_usage: []str        # dotted OIDs
+  has_unknown_critical: bool  # a critical extension this module does not understand
+  subject_key_id: str
+  authority_key_id: str
+  name_constraints_present: bool
+}
+
+export struct VerifyOptions {
+  dns_name: str                  # host name or IP address to check ("" skips the check)
+  roots: []*Certificate          # trust anchors (nil: system_roots())
+  intermediates: []*Certificate  # untrusted certificates that may complete the chain
+  now: int                       # unix seconds (0: the current time)
+}
+
+# ---------------------------------------------------------------- DER reader
+
+fn bad(what: str) -> error { return errors.New("x509: malformed certificate: " + what) }
+
+# a cursor over the elements inside s[p:end]; after next(), tag/start/end of the element read
+struct Der {
+  s: str
+  p: int
+  lim: int
+  tag: int
+  hdr: int    # where the element read last starts (its tag)
+  start: int  # where its content starts
+  end: int    # where it ends
+}
+
+fn der(s: str, start: int, end: int) -> *Der { return &Der{s: s, p: start, lim: end} }
+
+fn (d: *Der) more() -> bool { return d.p < d.lim }
+
+# the tag of the next element, or -1 at the end
+fn (d: *Der) peek() -> int {
+  if d.p >= d.lim { return -1 }
+  return int(d.s[d.p])
+}
+
+# reads the next element (strict DER: one-byte tags, definite minimal lengths); want = -1 accepts any tag
+fn (d: *Der) next(want: int, what: str) -> error {
+  s := d.s
+  p := d.p
+  if p + 2 > d.lim { return bad("truncated " + what) }
+  tag := int(s[p])
+  if (tag & 0x1f) == 0x1f { return bad("multi-byte tag in " + what) }
+  if want >= 0 && tag != want { return bad("expected " + what) }
+  n := int(s[p + 1])
+  p += 2
+  if n == 0x80 { return bad("indefinite length in " + what) }
+  if n > 0x80 {
+    k := n - 0x80
+    if k > 4 { return bad("length too long in " + what) }
+    if p + k > d.lim { return bad("truncated length in " + what) }
+    if int(s[p]) == 0 { return bad("non-minimal length in " + what) }
+    n = 0
+    for i := 0; i < k; i++ { n = (n << 8) | int(s[p + i]) }
+    p += k
+    if n < 0x80 { return bad("non-minimal length in " + what) }
+  }
+  if n > d.lim - p { return bad("length past the end in " + what) }
+  d.tag = tag
+  d.hdr = d.p
+  d.start = p
+  d.end = p + n
+  d.p = p + n
+  return nil
+}
+
+# the content of the element read last, and the whole element (header included)
+fn (d: *Der) content() -> str { return d.s[d.start:d.end] }
+fn (d: *Der) whole() -> str { return d.s[d.hdr:d.end] }
+# a cursor over the content of the element read last
+fn (d: *Der) inside() -> *Der { return der(d.s, d.start, d.end) }
+
+# dotted text of an OBJECT IDENTIFIER's content
+fn oid_text(c: str) -> (str, error) {
+  if len(c) == 0 { return "", bad("empty OID") }
+  b := strings.Builder{}
+  v := 0
+  first := true
+  start := true
+  for i := 0; i < len(c); i++ {
+    x := int(c[i])
+    if start && x == 0x80 { return "", bad("non-minimal OID") }
+    if v > (1 << 50) { return "", bad("OID arc too large") }
+    v = (v << 7) | (x & 0x7f)
+    start = false
+    if (x & 0x80) == 0 {
+      if first {
+        if v < 40 {
+          b.write("0." + str(v))
+        } else if v < 80 {
+          b.write("1." + str(v - 40))
+        } else {
+          b.write("2." + str(v - 80))
+        }
+        first = false
+      } else {
+        b.write("." + str(v))
+      }
+      v = 0
+      start = true
+    }
+  }
+  if !start { return "", bad("truncated OID") }
+  return b.string(), nil
+}
+
+# reads an OID element
+fn (d: *Der) oid(what: str) -> (str, error) {
+  err := d.next(0x06, what)
+  if err != nil { return "", err }
+  return oid_text(d.content())
+}
+
+# a small non-negative INTEGER (version, pathLen)
+fn small_int(c: str, what: str) -> (int, error) {
+  if len(c) == 0 || len(c) > 4 { return 0, bad(what) }
+  if int(c[0]) >= 0x80 { return 0, bad("negative " + what) }
+  if len(c) > 1 && int(c[0]) == 0 && int(c[1]) < 0x80 { return 0, bad("non-minimal " + what) }
+  v := 0
+  for i := 0; i < len(c); i++ { v = (v << 8) | int(c[i]) }
+  return v, nil
+}
+
+# a DER BOOLEAN's content
+fn bool_value(c: str) -> (bool, error) {
+  if len(c) != 1 { return false, bad("BOOLEAN") }
+  if int(c[0]) == 0 { return false, nil }
+  if int(c[0]) == 0xff { return true, nil }
+  return false, bad("BOOLEAN")
+}
+
+# an AlgorithmIdentifier: OID and the raw parameters ("" if absent)
+fn (d: *Der) alg_id(what: str) -> (str, str, error) {
+  err := d.next(0x30, what)
+  if err != nil { return "", "", err }
+  a := d.inside()
+  o, err2 := a.oid(what)
+  if err2 != nil { return "", "", err2 }
+  params := ""
+  if a.more() {
+    err = a.next(-1, what + " parameters")
+    if err != nil { return "", "", err }
+    params = a.whole()
+  }
+  if a.more() { return "", "", bad("trailing data in " + what) }
+  return o, params, nil
+}
+
+# ---------------------------------------------------------------- names
+
+fn attr_short(o: str) -> str {
+  switch o {
+  case "2.5.4.3": return "CN"
+  case "2.5.4.6": return "C"
+  case "2.5.4.7": return "L"
+  case "2.5.4.8": return "ST"
+  case "2.5.4.9": return "STREET"
+  case "2.5.4.10": return "O"
+  case "2.5.4.11": return "OU"
+  case "2.5.4.5": return "SERIALNUMBER"
+  case "2.5.4.17": return "POSTALCODE"
+  case "1.2.840.113549.1.9.1": return "emailAddress"
+  case "0.9.2342.19200300.100.1.25": return "DC"
+  case "0.9.2342.19200300.100.1.1": return "UID"
+  }
+  return o
+}
+
+# text of a directory string (UTF8, Printable, IA5, T61, BMP, Universal)
+fn string_value(tag: int, c: str) -> str {
+  if tag == 0x1e {   # BMPString: UTF-16BE
+    b := strings.Builder{}
+    i := 0
+    while i + 1 < len(c) {
+      r := (int(c[i]) << 8) | int(c[i + 1])
+      i += 2
+      if r >= 0xd800 && r < 0xdc00 && i + 1 < len(c) {
+        lo := (int(c[i]) << 8) | int(c[i + 1])
+        if lo >= 0xdc00 && lo < 0xe000 {
+          r = 0x10000 + ((r - 0xd800) << 10) + (lo - 0xdc00)
+          i += 2
+        }
+      }
+      b.write_rune(r)
+    }
+    return b.string()
+  }
+  if tag == 0x1c {   # UniversalString: UCS-4BE
+    b := strings.Builder{}
+    i := 0
+    while i + 3 < len(c) {
+      r := (int(c[i]) << 24) | (int(c[i + 1]) << 16) | (int(c[i + 2]) << 8) | int(c[i + 3])
+      if r < 0x110000 { b.write_rune(r) }
+      i += 4
+    }
+    return b.string()
+  }
+  return c
+}
+
+# parses a Name; returns the readable text (most specific RDN first) and the last CN
+fn parse_name(raw: str) -> (str, str, error) {
+  top := der(raw, 0, len(raw))
+  err := top.next(0x30, "Name")
+  if err != nil { return "", "", err }
+  if top.more() { return "", "", bad("trailing data after Name") }
+  rdns := []str{}
+  cn := ""
+  seq := top.inside()
+  while seq.more() {
+    err = seq.next(0x31, "RDN")
+    if err != nil { return "", "", err }
+    set := seq.inside()
+    parts := []str{}
+    if !set.more() { return "", "", bad("empty RDN") }
+    while set.more() {
+      err = set.next(0x30, "AttributeTypeAndValue")
+      if err != nil { return "", "", err }
+      atv := set.inside()
+      o, err2 := atv.oid("attribute type")
+      if err2 != nil { return "", "", err2 }
+      err = atv.next(-1, "attribute value")
+      if err != nil { return "", "", err }
+      if atv.more() { return "", "", bad("trailing data in attribute") }
+      v := ""
+      if atv.tag == 0x0c || atv.tag == 0x13 || atv.tag == 0x16 || atv.tag == 0x14 || atv.tag == 0x1e || atv.tag == 0x1c || atv.tag == 0x1a {
+        v = string_value(atv.tag, atv.content())
+      } else {
+        v = "#" + hex.encode(atv.whole())
+      }
+      if o == "2.5.4.3" { cn = v }
+      parts = append(parts, attr_short(o) + "=" + v)
+    }
+    rdns = append(rdns, strings.join(parts, "+"))
+  }
+  out := []str{}
+  i := len(rdns) - 1
+  while i >= 0 {
+    out = append(out, rdns[i])
+    i--
+  }
+  return strings.join(out, ", "), cn, nil
+}
+
+# ---------------------------------------------------------------- time
+
+fn digits(s: str, at: int, n: int) -> int {
+  v := 0
+  for i := 0; i < n; i++ {
+    c := int(s[at + i])
+    if c < 48 || c > 57 { return -1 }
+    v = v * 10 + c - 48
+  }
+  return v
+}
+
+# days since 1970-01-01 of a civil date (proleptic Gregorian)
+fn days_from_civil(y0: int, m: int, d: int) -> int {
+  y := y0
+  if m <= 2 { y-- }
+  era := y / 400
+  if y < 0 && y % 400 != 0 { era-- }
+  yoe := y - era * 400
+  mp := (m + 9) % 12
+  doy := (153 * mp + 2) / 5 + d - 1
+  doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+  return era * 146097 + doe - 719468
+}
+
+fn month_days(y: int, m: int) -> int {
+  if m == 2 {
+    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { return 29 }
+    return 28
+  }
+  if m == 4 || m == 6 || m == 9 || m == 11 { return 30 }
+  return 31
+}
+
+# UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ) to unix seconds
+fn parse_time(tag: int, c: str) -> (int, error) {
+  y := 0
+  at := 0
+  if tag == 0x17 {
+    if len(c) != 13 { return 0, bad("UTCTime") }
+    y = digits(c, 0, 2)
+    if y < 0 { return 0, bad("UTCTime") }
+    if y < 50 { y += 2000 } else { y += 1900 }
+    at = 2
+  } else if tag == 0x18 {
+    if len(c) != 15 { return 0, bad("GeneralizedTime") }
+    y = digits(c, 0, 4)
+    if y < 0 { return 0, bad("GeneralizedTime") }
+    at = 4
+  } else {
+    return 0, bad("time")
+  }
+  if int(c[len(c) - 1]) != 90 { return 0, bad("time not in UTC") }
+  mo := digits(c, at, 2)
+  d := digits(c, at + 2, 2)
+  h := digits(c, at + 4, 2)
+  mi := digits(c, at + 6, 2)
+  se := digits(c, at + 8, 2)
+  if mo < 1 || mo > 12 || d < 1 || h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 59 { return 0, bad("time") }
+  if d > month_days(y, mo) { return 0, bad("time") }
+  return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se, nil
+}
+
+fn pad2(n: int) -> str {
+  if n < 10 { return "0" + str(n) }
+  return str(n)
+}
+
+# "2025-01-31 12:00:00 UTC"
+export fn format_time(t: int) -> str {
+  z := t / 86400
+  secs := t - z * 86400
+  if secs < 0 {
+    secs += 86400
+    z--
+  }
+  z += 719468
+  era := z / 146097
+  if z < 0 && z % 146097 != 0 { era-- }
+  doe := z - era * 146097
+  yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  y := yoe + era * 400
+  doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
+  mp := (5 * doy + 2) / 153
+  d := doy - (153 * mp + 2) / 5 + 1
+  m := mp + 3
+  if m > 12 { m -= 12 }
+  if m <= 2 { y++ }
+  ys := str(y)
+  while len(ys) < 4 { ys = "0" + ys }
+  return ys + "-" + pad2(m) + "-" + pad2(d) + " " + pad2(secs / 3600) + ":" + pad2((secs / 60) % 60) + ":" + pad2(secs % 60) + " UTC"
+}
+
+# ---------------------------------------------------------------- IP addresses
+
+fn hex4(x: int) -> str {
+  digs := "0123456789abcdef"
+  if x == 0 { return "0" }
+  s := ""
+  while x > 0 {
+    s = digs[x & 15:(x & 15) + 1] + s
+    x = x >> 4
+  }
+  return s
+}
+
+# text of a 4- or 16-byte address (IPv6 in the RFC 5952 form)
+export fn format_ip(b: str) -> str {
+  if len(b) == 4 { return str(int(b[0])) + "." + str(int(b[1])) + "." + str(int(b[2])) + "." + str(int(b[3])) }
+  if len(b) != 16 { return "?" + hex.encode(b) }
+  g := make([]int, 8)
+  for i := 0; i < 8; i++ { g[i] = (int(b[2 * i]) << 8) | int(b[2 * i + 1]) }
+  # the longest run of zero groups (at least 2) becomes "::"
+  best := -1
+  best_n := 0
+  i := 0
+  while i < 8 {
+    if g[i] == 0 {
+      j := i
+      while j < 8 && g[j] == 0 { j++ }
+      if j - i > best_n && j - i >= 2 {
+        best = i
+        best_n = j - i
+      }
+      i = j
+    } else {
+      i++
+    }
+  }
+  s := ""
+  i = 0
+  while i < 8 {
+    if i == best {
+      s = s + "::"
+      i += best_n
+      continue
+    }
+    if len(s) > 0 && !strings.has_suffix(s, ":") { s = s + ":" }
+    s = s + hex4(g[i])
+    i++
+  }
+  return s
+}
+
+fn parse_ipv4(s: str) -> str {
+  parts := strings.split(s, ".")
+  if len(parts) != 4 { return "" }
+  out := []byte{}
+  for _, p := range parts {
+    if len(p) == 0 || len(p) > 3 { return "" }
+    if len(p) > 1 && int(p[0]) == 48 { return "" }
+    v := digits(p, 0, len(p))
+    if v < 0 || v > 255 { return "" }
+    out = append(out, byte(v))
+  }
+  return string(out)
+}
+
+fn hex_val(c: int) -> int {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return -1
+}
+
+# the groups of one side of "::" (each 0..0xffff); nil if bad; an IPv4 tail counts as two groups
+fn ipv6_groups(s: str, allow_v4: bool) -> []int {
+  out := []int{}
+  if s == "" { return out }
+  parts := strings.split(s, ":")
+  for k, p := range parts {
+    if k == len(parts) - 1 && allow_v4 && strings.contains(p, ".") {
+      v4 := parse_ipv4(p)
+      if v4 == "" { return nil }
+      out = append(out, (int(v4[0]) << 8) | int(v4[1]))
+      out = append(out, (int(v4[2]) << 8) | int(v4[3]))
+      continue
+    }
+    if len(p) == 0 || len(p) > 4 { return nil }
+    v := 0
+    for i := 0; i < len(p); i++ {
+      h := hex_val(int(p[i]))
+      if h < 0 { return nil }
+      v = v * 16 + h
+    }
+    out = append(out, v)
+  }
+  return out
+}
+
+# the 4 or 16 bytes of an IP address text, or "" if s is not one ("[::1]" accepted)
+export fn parse_ip(s0: str) -> str {
+  s := s0
+  if strings.has_prefix(s, "[") && strings.has_suffix(s, "]") { s = s[1:len(s) - 1] }
+  if !strings.contains(s, ":") { return parse_ipv4(s) }
+  groups := []int{}
+  k := strings.index(s, "::")
+  if k >= 0 {
+    left := ipv6_groups(s[0:k], false)
+    right := ipv6_groups(s[k + 2:len(s)], true)
+    if left == nil || right == nil { return "" }
+    if strings.contains(s[k + 2:len(s)], "::") { return "" }
+    if len(left) + len(right) > 7 { return "" }
+    groups = left
+    for i := 0; i < 8 - len(left) - len(right); i++ { groups = append(groups, 0) }
+    for _, x := range right { groups = append(groups, x) }
+  } else {
+    groups = ipv6_groups(s, true)
+    if groups == nil || len(groups) != 8 { return "" }
+  }
+  out := []byte{}
+  for _, x := range groups {
+    out = append(out, byte(x >> 8))
+    out = append(out, byte(x & 255))
+  }
+  return string(out)
+}
+
+# ---------------------------------------------------------------- extensions
+
+fn parse_bits(c: str, what: str) -> (str, int, error) {
+  if len(c) == 0 { return "", 0, bad(what) }
+  unused := int(c[0])
+  if unused > 7 || (len(c) == 1 && unused != 0) { return "", 0, bad(what) }
+  if unused > 0 && (int(c[len(c) - 1]) & ((1 << unused) - 1)) != 0 { return "", 0, bad(what) }
+  return c[1:len(c)], unused, nil
+}
+
+fn parse_extension(c: *Certificate, o: str, critical: bool, v: str) -> error {
+  d := der(v, 0, len(v))
+  let err: error = nil
+  switch o {
+  case "2.5.29.19":   # basicConstraints
+    err = d.next(0x30, "basicConstraints")
+    if err != nil { return err }
+    b := d.inside()
+    c.has_basic_constraints = true
+    if b.peek() == 0x01 {
+      err = b.next(0x01, "cA")
+      if err != nil { return err }
+      ca, err2 := bool_value(b.content())
+      if err2 != nil { return err2 }
+      c.is_ca = ca
+    }
+    if b.peek() == 0x02 {
+      err = b.next(0x02, "pathLenConstraint")
+      if err != nil { return err }
+      n, err3 := small_int(b.content(), "pathLenConstraint")
+      if err3 != nil { return err3 }
+      c.path_len = n
+    }
+    if b.more() { return bad("trailing data in basicConstraints") }
+  case "2.5.29.15":   # keyUsage
+    err = d.next(0x03, "keyUsage")
+    if err != nil { return err }
+    bits, _, err4 := parse_bits(d.content(), "keyUsage")
+    if err4 != nil { return err4 }
+    ku := 0
+    for i := 0; i < len(bits) && i < 2; i++ {
+      x := int(bits[i])
+      for j := 0; j < 8; j++ {
+        if (x & (0x80 >> j)) != 0 { ku = ku | (1 << (i * 8 + j)) }
+      }
+    }
+    c.has_key_usage = true
+    c.key_usage = ku
+  case "2.5.29.37":   # extKeyUsage
+    err = d.next(0x30, "extKeyUsage")
+    if err != nil { return err }
+    e := d.inside()
+    while e.more() {
+      u, err5 := e.oid("key purpose")
+      if err5 != nil { return err5 }
+      c.ext_key_usage = append(c.ext_key_usage, u)
+    }
+  case "2.5.29.17":   # subjectAltName
+    err = d.next(0x30, "subjectAltName")
+    if err != nil { return err }
+    g := d.inside()
+    while g.more() {
+      err = g.next(-1, "GeneralName")
+      if err != nil { return err }
+      switch g.tag {
+      case 0x81: c.email_addresses = append(c.email_addresses, g.content())
+      case 0x82: c.dns_names = append(c.dns_names, g.content())
+      case 0x86: c.uris = append(c.uris, g.content())
+      case 0x87:
+        ip := g.content()
+        if len(ip) != 4 && len(ip) != 16 { return bad("iPAddress length") }
+        c.ip_addresses = append(c.ip_addresses, format_ip(ip))
+      }
+    }
+  case "2.5.29.14":   # subjectKeyIdentifier
+    err = d.next(0x04, "subjectKeyIdentifier")
+    if err != nil { return err }
+    c.subject_key_id = d.content()
+  case "2.5.29.35":   # authorityKeyIdentifier
+    err = d.next(0x30, "authorityKeyIdentifier")
+    if err != nil { return err }
+    a := d.inside()
+    while a.more() {
+      err = a.next(-1, "authorityKeyIdentifier field")
+      if err != nil { return err }
+      if a.tag == 0x80 { c.authority_key_id = a.content() }
+    }
+  case "2.5.29.30":   # nameConstraints: recognised, but verify() refuses chains through it
+    err = d.next(0x30, "nameConstraints")
+    if err != nil { return err }
+    c.name_constraints_present = true
+  case "2.5.29.32", "2.5.29.31", "1.3.6.1.5.5.7.1.1", "1.3.6.1.4.1.11129.2.4.2":
+    # certificatePolicies, CRL distribution points, authority info access, SCTs: not used
+    err = d.next(-1, "extension")
+    if err != nil { return err }
+  default:
+    if critical { c.has_unknown_critical = true }
+    return nil
+  }
+  if d.more() { return bad("trailing data in extension " + o) }
+  return nil
+}
+
+fn parse_extensions(c: *Certificate, d: *Der) -> error {
+  err := d.next(0x30, "Extensions")
+  if err != nil { return err }
+  if d.more() { return bad("trailing data after Extensions") }
+  exts := d.inside()
+  if !exts.more() { return bad("empty Extensions") }
+  seen := map[str]bool{}
+  while exts.more() {
+    err = exts.next(0x30, "Extension")
+    if err != nil { return err }
+    e := exts.inside()
+    o, err2 := e.oid("extnID")
+    if err2 != nil { return err2 }
+    if seen[o] { return bad("duplicate extension " + o) }
+    seen[o] = true
+    critical := false
+    if e.peek() == 0x01 {
+      err = e.next(0x01, "critical")
+      if err != nil { return err }
+      critical, err = bool_value(e.content())
+      if err != nil { return err }
+    }
+    err = e.next(0x04, "extnValue")
+    if err != nil { return err }
+    if e.more() { return bad("trailing data in Extension") }
+    err = parse_extension(c, o, critical, e.content())
+    if err != nil { return err }
+  }
+  return nil
+}
+
+# ---------------------------------------------------------------- parse
+
+# parses one certificate in DER; strict: no indefinite or non-minimal lengths, no trailing data
+export fn parse(raw: str) -> (*Certificate, error) {
+  c := &Certificate{raw: raw, path_len: -1, dns_names: []str{}, ip_addresses: []str{}, email_addresses: []str{}, uris: []str{}, ext_key_usage: []str{}}
+  top := der(raw, 0, len(raw))
+  err := top.next(0x30, "Certificate")
+  if err != nil { return nil, err }
+  if top.more() { return nil, bad("trailing data after the certificate") }
+  cert := top.inside()
+  err = cert.next(0x30, "tbsCertificate")
+  if err != nil { return nil, err }
+  c.tbs = cert.whole()
+  tbs := cert.inside()
+  outer_alg, outer_params, err2 := cert.alg_id("signatureAlgorithm")
+  if err2 != nil { return nil, err2 }
+  c.sig_alg_oid = outer_alg
+  c.sig_alg_params = outer_params
+  err = cert.next(0x03, "signatureValue")
+  if err != nil { return nil, err }
+  sig, unused, err3 := parse_bits(cert.content(), "signatureValue")
+  if err3 != nil { return nil, err3 }
+  if unused != 0 { return nil, bad("signatureValue with unused bits") }
+  c.signature = sig
+  if cert.more() { return nil, bad("trailing data in Certificate") }
+
+  # version
+  c.version = 1
+  if tbs.peek() == 0xa0 {
+    err = tbs.next(0xa0, "version")
+    if err != nil { return nil, err }
+    vd := tbs.inside()
+    err = vd.next(0x02, "version")
+    if err != nil { return nil, err }
+    if vd.more() { return nil, bad("trailing data in version") }
+    v, err4 := small_int(vd.content(), "version")
+    if err4 != nil { return nil, err4 }
+    if v > 2 { return nil, bad("version " + str(v + 1)) }
+    c.version = v + 1
+  }
+  err = tbs.next(0x02, "serialNumber")
+  if err != nil { return nil, err }
+  if tbs.end == tbs.start { return nil, bad("empty serialNumber") }
+  c.serial = tbs.content()
+  inner_alg, inner_params, err5 := tbs.alg_id("signature")
+  if err5 != nil { return nil, err5 }
+  if inner_alg != outer_alg || inner_params != outer_params { return nil, bad("signature algorithms differ") }
+  err = tbs.next(0x30, "issuer")
+  if err != nil { return nil, err }
+  c.issuer_raw = tbs.whole()
+  c.issuer, _, err = parse_name(c.issuer_raw)
+  if err != nil { return nil, err }
+  err = tbs.next(0x30, "validity")
+  if err != nil { return nil, err }
+  val := tbs.inside()
+  err = val.next(-1, "notBefore")
+  if err != nil { return nil, err }
+  c.not_before, err = parse_time(val.tag, val.content())
+  if err != nil { return nil, err }
+  err = val.next(-1, "notAfter")
+  if err != nil { return nil, err }
+  c.not_after, err = parse_time(val.tag, val.content())
+  if err != nil { return nil, err }
+  if val.more() { return nil, bad("trailing data in validity") }
+  err = tbs.next(0x30, "subject")
+  if err != nil { return nil, err }
+  c.subject_raw = tbs.whole()
+  c.subject, c.common_name, err = parse_name(c.subject_raw)
+  if err != nil { return nil, err }
+  err = tbs.next(0x30, "subjectPublicKeyInfo")
+  if err != nil { return nil, err }
+  c.spki = tbs.whole()
+  sp := tbs.inside()
+  c.key_alg_oid, c.key_params, err = sp.alg_id("subjectPublicKeyInfo algorithm")
+  if err != nil { return nil, err }
+  err = sp.next(0x03, "subjectPublicKey")
+  if err != nil { return nil, err }
+  _, _, err = parse_bits(sp.content(), "subjectPublicKey")
+  if err != nil { return nil, err }
+  if sp.more() { return nil, bad("trailing data in subjectPublicKeyInfo") }
+  if tbs.peek() == 0x81 {
+    err = tbs.next(0x81, "issuerUniqueID")
+    if err != nil { return nil, err }
+  }
+  if tbs.peek() == 0x82 {
+    err = tbs.next(0x82, "subjectUniqueID")
+    if err != nil { return nil, err }
+  }
+  if tbs.peek() == 0xa3 {
+    if c.version != 3 { return nil, bad("extensions in a v" + str(c.version) + " certificate") }
+    err = tbs.next(0xa3, "extensions")
+    if err != nil { return nil, err }
+    err = parse_extensions(c, tbs.inside())
+    if err != nil { return nil, err }
+  }
+  if tbs.more() { return nil, bad("trailing data in tbsCertificate") }
+  return c, nil
+}
+
+# the DER of every "CERTIFICATE" block of a PEM text
+fn pem_blocks(pem: str) -> ([]str, error) {
+  begin := "-----BEGIN CERTIFICATE-----"
+  end := "-----END CERTIFICATE-----"
+  out := []str{}
+  p := 0
+  while true {
+    i := strings.index_from(pem, begin, p)
+    if i < 0 { break }
+    j := strings.index_from(pem, end, i + len(begin))
+    if j < 0 { return out, errors.New("x509: PEM block without END line") }
+    body := pem[i + len(begin):j]
+    b := strings.Builder{}
+    for k := 0; k < len(body); k++ {
+      ch := int(body[k])
+      if ch != 10 && ch != 13 && ch != 32 && ch != 9 { b.write_byte(ch) }
+    }
+    raw, err := base64.decode(b.string())
+    if err != nil { return out, errors.New("x509: bad base64 in PEM block " + str(len(out) + 1) + ": " + err.Error()) }
+    out = append(out, raw)
+    p = j + len(end)
+  }
+  return out, nil
+}
+
+# parses every "-----BEGIN CERTIFICATE-----" block of a PEM text
+export fn parse_pem(pem: str) -> ([]*Certificate, error) {
+  blocks, err := pem_blocks(pem)
+  if err != nil { return nil, err }
+  if len(blocks) == 0 { return nil, errors.New("x509: no certificate in PEM data") }
+  out := []*Certificate{}
+  for i, raw := range blocks {
+    c, err2 := parse(raw)
+    if err2 != nil { return nil, errors.New(err2.Error() + " (PEM block " + str(i + 1) + ")") }
+    out = append(out, c)
+  }
+  return out, nil
+}
+
+# ---------------------------------------------------------------- system roots
+
+let roots_loaded: bool = false
+let roots_cache: []*Certificate = nil
+let roots_error: error = nil
+
+let ROOT_FILES = []str{
+  "/etc/ssl/certs/ca-certificates.crt",
+  "/etc/pki/tls/certs/ca-bundle.crt",
+  "/etc/ssl/ca-bundle.pem",
+  "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+  "/etc/ssl/cert.pem",
+}
+
+# reads a PEM bundle, skipping the certificates that do not parse
+export fn load_roots(file: str) -> ([]*Certificate, error) {
+  text, err := os.read_file(file)
+  if err != nil { return nil, errors.New("x509: reading roots: " + err.Error()) }
+  blocks, _ := pem_blocks(text)
+  out := []*Certificate{}
+  for _, raw := range blocks {
+    c, err2 := parse(raw)
+    if err2 == nil { out = append(out, c) }
+  }
+  if len(out) == 0 { return nil, errors.New("x509: no usable certificate in " + file) }
+  return out, nil
+}
+
+# the system's trusted roots ($SSL_CERT_FILE, or the distribution's bundle); loaded once
+export fn system_roots() -> ([]*Certificate, error) {
+  if roots_loaded { return roots_cache, roots_error }
+  roots_loaded = true
+  file := os.getenv("SSL_CERT_FILE")
+  if file == "" {
+    for _, f := range ROOT_FILES {
+      if os.exists(f) {
+        file = f
+        break
+      }
+    }
+  }
+  if file == "" {
+    roots_error = errors.New("x509: no system root certificates found (set SSL_CERT_FILE)")
+    return nil, roots_error
+  }
+  roots_cache, roots_error = load_roots(file)
+  return roots_cache, roots_error
+}
+
+# ---------------------------------------------------------------- signatures
+
+fn hash_oid_name(o: str) -> str {
+  switch o {
+  case "2.16.840.1.101.3.4.2.1": return "sha256"
+  case "2.16.840.1.101.3.4.2.2": return "sha384"
+  case "2.16.840.1.101.3.4.2.3": return "sha512"
+  }
+  return ""
+}
+
+fn hash_len(name: str) -> int {
+  if name == "sha256" { return 32 }
+  if name == "sha384" { return 48 }
+  return 64
+}
+
+# the hash of RSASSA-PSS parameters (MGF1 with the same hash, salt = hash length)
+fn pss_hash(params: str) -> (str, error) {
+  unsup := errors.New("x509: unsupported RSASSA-PSS parameters")
+  d := der(params, 0, len(params))
+  if d.next(0x30, "RSASSA-PSS-params") != nil || d.more() { return "", unsup }
+  p := d.inside()
+  h := ""
+  mgf := ""
+  salt := 20
+  if p.peek() == 0xa0 {
+    if p.next(0xa0, "hashAlgorithm") != nil { return "", unsup }
+    a := p.inside()
+    o, _, err := a.alg_id("hashAlgorithm")
+    if err != nil || a.more() { return "", unsup }
+    h = hash_oid_name(o)
+  }
+  if p.peek() == 0xa1 {
+    if p.next(0xa1, "maskGenAlgorithm") != nil { return "", unsup }
+    a := p.inside()
+    o, mp, err := a.alg_id("maskGenAlgorithm")
+    if err != nil || a.more() || o != "1.2.840.113549.1.1.8" { return "", unsup }
+    m := der(mp, 0, len(mp))
+    o2, _, err2 := m.alg_id("MGF1 hash")
+    if err2 != nil || m.more() { return "", unsup }
+    mgf = hash_oid_name(o2)
+  }
+  if p.peek() == 0xa2 {
+    if p.next(0xa2, "saltLength") != nil { return "", unsup }
+    a := p.inside()
+    if a.next(0x02, "saltLength") != nil || a.more() { return "", unsup }
+    n, err := small_int(a.content(), "saltLength")
+    if err != nil { return "", unsup }
+    salt = n
+  }
+  if p.peek() == 0xa3 {
+    if p.next(0xa3, "trailerField") != nil { return "", unsup }
+    a := p.inside()
+    if a.next(0x02, "trailerField") != nil || a.more() || a.content() != string([]byte{1}) { return "", unsup }
+  }
+  if p.more() { return "", unsup }
+  if h == "" || mgf != h || salt != hash_len(h) { return "", unsup }
+  return h, nil
+}
+
+fn curve_of(issuer_spki: str) -> str {
+  d := der(issuer_spki, 0, len(issuer_spki))
+  if d.next(0x30, "SubjectPublicKeyInfo") != nil { return "" }
+  s := d.inside()
+  o, params, err := s.alg_id("algorithm")
+  if err != nil || o != "1.2.840.10045.2.1" { return "" }
+  p := der(params, 0, len(params))
+  curve, err2 := p.oid("namedCurve")
+  if err2 != nil { return "" }
+  if curve == "1.2.840.10045.3.1.7" { return "p256" }
+  if curve == "1.3.132.0.34" { return "p384" }
+  return ""
+}
+
+# the std/pubkey algorithm name for c's signature made with issuer_spki's key
+export fn signature_algorithm(c: *Certificate, issuer_spki: str) -> (str, error) {
+  o := c.sig_alg_oid
+  p := c.sig_alg_params
+  # RSA PKCS#1 v1.5: parameters must be NULL or absent
+  if strings.has_prefix(o, "1.2.840.113549.1.1.") && o != "1.2.840.113549.1.1.10" {
+    if p != "" && p != string([]byte{5, 0}) { return "", errors.New("x509: bad parameters for " + o) }
+  }
+  switch o {
+  case "1.2.840.113549.1.1.11": return "rsa-pkcs1-sha256", nil
+  case "1.2.840.113549.1.1.12": return "rsa-pkcs1-sha384", nil
+  case "1.2.840.113549.1.1.13": return "rsa-pkcs1-sha512", nil
+  case "1.2.840.113549.1.1.5": return "rsa-pkcs1-sha1", nil
+  case "1.2.840.113549.1.1.10":
+    h, err := pss_hash(p)
+    if err != nil { return "", err }
+    return "rsa-pss-" + h, nil
+  case "1.3.101.112":
+    if p != "" { return "", errors.New("x509: Ed25519 signature with parameters") }
+    return "ed25519", nil
+  case "1.2.840.10045.4.3.2", "1.2.840.10045.4.3.3":
+    if p != "" { return "", errors.New("x509: ECDSA signature with parameters") }
+    curve := curve_of(issuer_spki)
+    if curve == "" { return "", errors.New("x509: ECDSA signature, but the issuer key is not P-256 or P-384") }
+    if o == "1.2.840.10045.4.3.2" { return "ecdsa-" + curve + "-sha256", nil }
+    return "ecdsa-" + curve + "-sha384", nil
+  }
+  return "", errors.New("x509: unsupported signature algorithm " + o)
+}
+
+# checks that parent's key signed c (no other check)
+export fn check_signature_from(c: *Certificate, parent: *Certificate) -> error {
+  alg, err := signature_algorithm(c, parent.spki)
+  if err != nil { return err }
+  err = pubkey.verify_signature(alg, parent.spki, c.tbs, c.signature)
+  if err != nil { return errors.New("x509: bad signature on \"" + c.subject + "\" by \"" + parent.subject + "\": " + err.Error()) }
+  return nil
+}
+
+# ---------------------------------------------------------------- hostnames
+
+fn trim_dot(s: str) -> str {
+  if strings.has_suffix(s, ".") { return s[0:len(s) - 1] }
+  return s
+}
+
+fn match_dns(pattern0: str, host: str) -> bool {
+  pattern := strings.to_lower(trim_dot(pattern0))
+  if pattern == "" { return false }
+  if pattern == host { return true }
+  if !strings.has_prefix(pattern, "*.") { return false }
+  rest := pattern[2:len(pattern)]
+  # "*" alone, "*.com", and wildcards in other labels never match
+  if !strings.contains(rest, ".") || strings.contains(rest, "*") { return false }
+  dot := strings.index_byte(host, 46)
+  if dot <= 0 { return false }
+  return host[dot + 1:len(host)] == rest
+}
+
+# checks that c is valid for host (a DNS name or an IP address); the common name is never used
+export fn match_hostname(c: *Certificate, host0: str) -> error {
+  ip := parse_ip(host0)
+  if ip != "" {
+    for _, a := range c.ip_addresses {
+      if parse_ip(a) == ip { return nil }
+    }
+    if len(c.ip_addresses) == 0 { return errors.New("x509: certificate has no IP addresses, not valid for " + host0) }
+    return errors.New("x509: certificate is valid for " + strings.join(c.ip_addresses, ", ") + ", not " + host0)
+  }
+  host := strings.to_lower(trim_dot(host0))
+  if host == "" || strings.contains(host, "*") { return errors.New("x509: invalid host name \"" + host0 + "\"") }
+  for _, n := range c.dns_names {
+    if match_dns(n, host) { return nil }
+  }
+  if len(c.dns_names) == 0 { return errors.New("x509: certificate has no DNS names (the common name is not used), not valid for " + host0) }
+  return errors.New("x509: certificate is valid for " + strings.join(c.dns_names, ", ") + ", not " + host0)
+}
+
+# ---------------------------------------------------------------- verify
+
+fn check_time(c: *Certificate, now: int) -> error {
+  if now < c.not_before { return errors.New("x509: certificate is not valid before " + format_time(c.not_before) + ": " + c.subject) }
+  if now > c.not_after { return errors.New("x509: certificate expired on " + format_time(c.not_after) + ": " + c.subject) }
+  return nil
+}
+
+# can parent issue a certificate at position depth of the chain (1 = it signs the leaf)?
+fn check_issuer(parent: *Certificate, is_root: bool, depth: int, now: int) -> error {
+  if !parent.is_ca {
+    if !(is_root && parent.version < 3 && !parent.has_basic_constraints) {
+      return errors.New("x509: \"" + parent.subject + "\" is not a CA (basicConstraints), it cannot sign certificates")
+    }
+  }
+  if parent.has_key_usage && (parent.key_usage & KU_CERT_SIGN) == 0 {
+    return errors.New("x509: \"" + parent.subject + "\" has a keyUsage without keyCertSign")
+  }
+  # intermediates between parent and the leaf
+  if parent.path_len >= 0 && depth - 1 > parent.path_len {
+    return errors.New("x509: path length constraint of \"" + parent.subject + "\" exceeded (pathlen " + str(parent.path_len) + ")")
+  }
+  if parent.name_constraints_present {
+    return errors.New("x509: \"" + parent.subject + "\" has name constraints, which are not supported")
+  }
+  if !is_root && parent.has_unknown_critical {
+    return errors.New("x509: \"" + parent.subject + "\" has an unsupported critical extension")
+  }
+  return check_time(parent, now)
+}
+
+# the candidates for c's issuer in pool, those with c's authority key id first
+fn candidates(c: *Certificate, pool: []*Certificate) -> []*Certificate {
+  first := []*Certificate{}
+  rest := []*Certificate{}
+  for _, p := range pool {
+    if p.subject_raw != c.issuer_raw { continue }
+    if c.authority_key_id != "" && p.subject_key_id == c.authority_key_id {
+      first = append(first, p)
+    } else {
+      rest = append(rest, p)
+    }
+  }
+  for _, p := range rest { first = append(first, p) }
+  return first
+}
+
+fn in_chain(chain: []*Certificate, c: *Certificate) -> bool {
+  for _, x := range chain {
+    if x.raw == c.raw { return true }
+  }
+  return false
+}
+
+struct Search {
+  roots: []*Certificate
+  inters: []*Certificate
+  now: int
+  err: error   # the first reason a candidate was refused
+}
+
+fn (s: *Search) note(err: error) {
+  if s.err == nil { s.err = err }
+}
+
+# extends chain (ending at the certificate to be issued) to a root; nil if no way works
+fn (s: *Search) extend(chain: []*Certificate) -> []*Certificate {
+  c := chain[len(chain) - 1]
+  depth := len(chain)
+  for pass := 0; pass < 2; pass++ {
+    is_root := pass == 0
+    pool := s.inters
+    if is_root { pool = s.roots }
+    for _, p := range candidates(c, pool) {
+      if in_chain(chain, p) { continue }
+      err := check_signature_from(c, p)
+      if err != nil {
+        s.note(err)
+        continue
+      }
+      err = check_issuer(p, is_root, depth, s.now)
+      if err != nil {
+        s.note(err)
+        continue
+      }
+      next := []*Certificate{}
+      for _, x := range chain { next = append(next, x) }
+      next = append(next, p)
+      if is_root { return next }
+      if len(next) >= MAX_DEPTH {
+        s.note(errors.New("x509: chain longer than " + str(MAX_DEPTH) + " certificates"))
+        continue
+      }
+      got := s.extend(next)
+      if got != nil { return got }
+    }
+  }
+  return nil
+}
+
+# verifies leaf for a TLS server: builds a chain to a trusted root (through o.intermediates),
+# checks signatures, dates, CA flags, key usages, path lengths, critical extensions and the
+# host name. Returns the chain used (leaf first, root last).
+export fn verify(leaf: *Certificate, o: *VerifyOptions) -> ([]*Certificate, error) {
+  now := o.now
+  if now == 0 { now = os.unix_time() }
+  roots := o.roots
+  if roots == nil {
+    sys, err := system_roots()
+    if err != nil { return nil, err }
+    roots = sys
+  }
+  err = check_time(leaf, now)
+  if err != nil { return nil, err }
+  if leaf.has_unknown_critical { return nil, errors.New("x509: certificate has an unsupported critical extension: " + leaf.subject) }
+  if len(leaf.ext_key_usage) > 0 {
+    ok := false
+    for _, u := range leaf.ext_key_usage {
+      if u == EKU_SERVER_AUTH || u == EKU_ANY { ok = true }
+    }
+    if !ok { return nil, errors.New("x509: certificate is not valid for server authentication (extKeyUsage): " + leaf.subject) }
+  }
+  if o.dns_name != "" {
+    err = match_hostname(leaf, o.dns_name)
+    if err != nil { return nil, err }
+  }
+  # a leaf that is itself a trusted root
+  for _, r := range roots {
+    if r.raw == leaf.raw { return []*Certificate{leaf}, nil }
+  }
+  inters := o.intermediates
+  if inters == nil { inters = []*Certificate{} }
+  s := &Search{roots: roots, inters: inters, now: now}
+  chain := s.extend([]*Certificate{leaf})
+  if chain != nil { return chain, nil }
+  if s.err != nil { return nil, s.err }
+  return nil, errors.New("x509: certificate signed by unknown authority (issuer \"" + chain_tip_issuer(leaf, inters) + "\")")
+}
+
+# the issuer of the last certificate reachable from leaf through inters (for the error message)
+fn chain_tip_issuer(leaf: *Certificate, inters: []*Certificate) -> str {
+  c := leaf
+  for n := 0; n < MAX_DEPTH; n++ {
+    found := false
+    for _, p := range inters {
+      if p.subject_raw == c.issuer_raw && p.raw != c.raw {
+        c = p
+        found = true
+        break
+      }
+    }
+    if !found { break }
+  }
+  return c.issuer
+}
