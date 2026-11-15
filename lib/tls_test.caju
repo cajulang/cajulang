@@ -1,4 +1,4 @@
-# std/tls against `openssl s_server` (TLS 1.3, test certificates in testdata/tls/, made by gen.sh),
+# std/tls against `openssl s_server` (TLS 1.3 and 1.2, test certificates in testdata/tls/, made by gen.sh),
 # and std/http's https:// client on top of it. With CAJU_NET_TESTS=1, also real servers.
 import "std/tls"
 import "std/http"
@@ -115,8 +115,54 @@ describe("tls client", fn() {
     expect(r2).to_start_with("error: tls: certificate signed by unknown authority")
     expect(r3).to_start_with("HTTP/1.0 200 ok")
   })
-  it("refuses a server that only speaks TLS 1.2", fn() {
+  it("speaks TLS 1.2 with each ECDHE suite, with ECDSA and RSA certificates", fn() {
+    cases := [][]str{
+      []str{"ecdsa", "ECDHE-ECDSA-AES128-GCM-SHA256", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"},
+      []str{"ecdsa", "ECDHE-ECDSA-AES256-GCM-SHA384", "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"},
+      []str{"ecdsa", "ECDHE-ECDSA-CHACHA20-POLY1305", "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"},
+      []str{"rsa", "ECDHE-RSA-AES128-GCM-SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+      []str{"rsa", "ECDHE-RSA-AES256-GCM-SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"},
+      []str{"rsa", "ECDHE-RSA-CHACHA20-POLY1305", "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"},
+    }
+    for _, k := range cases {
+      serve(k[0], "-tls1_2 -cipher " + k[1])
+      c, err := tls.dial("127.0.0.1", port, &tls.Config{server_name: "localhost", roots: roots()})
+      got := ""
+      if err != nil { got = err.Error() } else {
+        got = c.cipher_suite + " " + str(c.version)
+        c.write("GET / HTTP/1.0\r\n\r\n")
+        data, _ := c.read(100)
+        got = got + " " + data[0:15]
+        c.close()
+      }
+      stop()
+      expect(got).to_equal(k[2] + " 771 HTTP/1.0 200 ok")
+    }
+  })
+  it("speaks TLS 1.2 with P-256 and P-384 key exchange and RSA PKCS#1 signatures", fn() {
+    serve("ecdsa", "-tls1_2 -groups P-256")
+    r1 := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    serve("ecdsa", "-tls1_2 -groups P-384")
+    r3 := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    expect(r3).to_start_with("HTTP/1.0 200 ok")
+    serve("rsa", "-tls1_2 -sigalgs RSA+SHA256")
+    r2 := get(&tls.Config{server_name: "localhost", roots: roots()})
+    stop()
+    expect(r1).to_start_with("HTTP/1.0 200 ok")
+    expect(r2).to_start_with("HTTP/1.0 200 ok")
+  })
+  it("checks TLS 1.2 certificates too, and refuses 1.2 with min_version 1.3", fn() {
     serve("ecdsa", "-tls1_2")
+    r1 := get(&tls.Config{server_name: "other.test", roots: roots()})
+    r2 := get(&tls.Config{server_name: "localhost", roots: roots(), min_version: 0x0304})
+    stop()
+    expect(r1).to_start_with("error: tls: certificate is valid for localhost")
+    expect(r2).to_start_with("error: tls:")
+  })
+  it("refuses TLS 1.2 suites without ECDHE or AEAD", fn() {
+    serve("rsa", "-tls1_2 -cipher AES128-SHA256")
     r := get(&tls.Config{server_name: "localhost", roots: roots()})
     stop()
     expect(r).to_start_with("error: tls:")

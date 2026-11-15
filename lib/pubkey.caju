@@ -936,3 +936,70 @@ export fn verify_signature(alg: str, spki: str, msg: str, sig: str) -> error {
   if scheme == "pss" { return rsa_pss_verify(key, hname, msg, sig) }
   return rsa_pkcs1_verify(key, hname, msg, sig)
 }
+
+# ---------------------------------------------------------------- ECDH on P-256 (for TLS 1.2 servers without X25519)
+
+# k * P (k: scalar bytes, P: a point), in affine coordinates (ordinary form); false at infinity.
+# Double and add every bit, keeping the sum only when the bit is set, so the work does not depend
+# on the bits (the field arithmetic itself is not constant-time; the keys are ephemeral).
+fn ec_mul(c: *Curve, k: str, px: []int, py: []int) -> ([]int, []int, bool) {
+  kb := bn_from_bytes(k, c.n.n)
+  p := c.point(c.p.to_m(px), c.p.to_m(py))
+  acc := &Pt{x: make([]int, c.p.n), y: make([]int, c.p.n), z: make([]int, c.p.n)}
+  tmp := &Pt{x: make([]int, c.p.n), y: make([]int, c.p.n), z: make([]int, c.p.n)}
+  i := c.bits - 1
+  while i >= 0 {
+    c.double(acc)
+    c.set(tmp, acc)
+    c.add_pt(tmp, p)
+    if bn_bit(kb, i) == 1 { c.set(acc, tmp) }
+    i--
+  }
+  if bn_is_zero(acc.z) { return nil, nil, false }
+  zi := c.p.pow_m(acc.z, bn_sub_small(c.p.m, 2))
+  zi2 := make([]int, c.p.n)
+  c.mul(zi2, zi, zi)
+  x := make([]int, c.p.n)
+  c.mul(x, acc.x, zi2)
+  zi3 := make([]int, c.p.n)
+  c.mul(zi3, zi2, zi)
+  y := make([]int, c.p.n)
+  c.mul(y, acc.y, zi3)
+  return c.p.from_m(x), c.p.from_m(y), true
+}
+
+fn ecdh_curve(name: str) -> *Curve {
+  if name == "p384" { return p384() }
+  return p256()
+}
+
+# a new key pair on curve "p256" or "p384": the private scalar (1 <= d < n) and the public point,
+# uncompressed (0x04 || x || y)
+export fn ecdh_generate(curve: str) -> (str, str, error) {
+  c := ecdh_curve(curve)
+  while true {
+    d, err := crypto.random_bytes(c.size)
+    if err != nil { return "", "", err }
+    db := bn_from_bytes(d, c.n.n)
+    if bn_is_zero(db) || bn_cmp(db, c.n.m) >= 0 { continue }
+    x, y, ok := ec_mul(c, d, c.p.from_m(c.gx), c.p.from_m(c.gy))
+    if !ok { continue }
+    return d, string([]byte{byte(4)}) + bn_to_bytes(x, c.size) + bn_to_bytes(y, c.size), nil
+  }
+  return "", "", nil
+}
+
+# the shared secret (the x coordinate) of a private scalar and the other side's public point
+# (uncompressed, on the curve)
+export fn ecdh(curve: str, private: str, peer: str) -> (str, error) {
+  c := ecdh_curve(curve)
+  if len(private) != c.size { return "", errors.New("pubkey: bad ECDH private key size") }
+  k, err := parse_ec(peer, c)
+  if err != nil { return "", err }
+  x, _, ok := ec_mul(c, private, k.x, k.y)
+  if !ok { return "", errors.New("pubkey: ECDH result is the point at infinity") }
+  return bn_to_bytes(x, c.size), nil
+}
+
+export fn p256_generate() -> (str, str, error) { return ecdh_generate("p256") }
+export fn p256_ecdh(private: str, peer: str) -> (str, error) { return ecdh("p256", private, peer) }

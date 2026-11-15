@@ -7,18 +7,20 @@ notes from the section of its version here (`tools/changelog.sh`).
 ## [Unreleased]
 
 ### Added
-- `std/tls`: TLS 1.3 clients (RFC 8446): `tls.dial(host, port, config)` and `tls.client(sock, name,
-  config)` give a `*tls.Conn` with `read`, `write`, `close`. X25519 key exchange; cipher suites
-  TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; SNI, ALPN,
-  KeyUpdate; the certificate chain is verified against the system's roots and the host name.
-  No session resumption, 0-RTT or client certificates; TLS 1.2-only servers get an error.
+- `std/tls`: TLS 1.3 and 1.2 clients: `tls.dial(host, port, config)` and `tls.client(sock, name,
+  config)` give a `*tls.Conn` with `read`, `write`, `close`. TLS 1.3 with X25519 and
+  TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; TLS 1.2 with
+  ECDHE (X25519, P-256, P-384) and AES-GCM or ChaCha20-Poly1305 only, the extended master secret,
+  and the RFC 8446 downgrade check. SNI, ALPN, KeyUpdate; the certificate chain is verified against
+  the system's roots and the host name. No session resumption, 0-RTT or client certificates.
   `docs/tls.md`.
 - `std/http`'s client speaks `https://` (`ClientRequest.tls` for another `*tls.Config`).
 - `std/x509`: X.509 certificates: strict DER parsing (`parse`, `parse_pem`), the system's roots
   (`system_roots`, `$SSL_CERT_FILE`), chain verification with dates, CA flags, key usage, path
   length, extended key usage and host names (`verify`, `match_hostname`). `docs/x509.md`.
 - `std/pubkey`: signature verification for RSA (PKCS#1 v1.5 and PSS), ECDSA P-256/P-384 and
-  Ed25519 keys given as SubjectPublicKeyInfo (`verify_signature`, `key_info`). `docs/pubkey.md`.
+  Ed25519 keys given as SubjectPublicKeyInfo (`verify_signature`, `key_info`), and ECDH on P-256
+  and P-384 (`ecdh_generate`, `ecdh`). `docs/pubkey.md`.
 - `std/cipher`: AES-GCM (128/192/256) and ChaCha20-Poly1305 (`aes_gcm_seal`/`open`,
   `chacha20_poly1305_seal`/`open`, and `new_aes_gcm`/`new_chacha20_poly1305` for many messages
   with one key). `docs/cipher.md`.

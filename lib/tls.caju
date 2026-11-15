@@ -6,9 +6,11 @@
 #
 #   c2, err3 := tls.dial("10.0.0.5", 8443, &tls.Config{server_name: "api.internal", roots: my_roots})
 #
-# Only TLS 1.3 is spoken (servers that offer only 1.2 get an error), with X25519 key exchange and
-# the cipher suites TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
-# TLS_CHACHA20_POLY1305_SHA256. The server's certificate chain is verified with std/x509 against
+# TLS 1.3 is preferred, with X25519 key exchange and the cipher suites TLS_AES_128_GCM_SHA256,
+# TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256. TLS 1.2 servers are accepted with
+# ECDHE (X25519 or P-256) and AEAD suites only (ECDHE_ECDSA/ECDHE_RSA with AES-GCM or
+# ChaCha20-Poly1305) and the extended master secret when the server supports it; RSA key
+# exchange, CBC, RC4 and renegotiation are refused. Config.min_version = 0x0304 refuses 1.2. The server's certificate chain is verified with std/x509 against
 # the system's roots (or Config.roots) and the host name, and its CertificateVerify signature with
 # std/pubkey. There is no session resumption, 0-RTT or client certificate (a server that asks for
 # one gets an empty Certificate).
@@ -26,6 +28,7 @@ export struct Config {
   insecure_skip_verify: bool    # accept any certificate (tests only: anyone in the middle can read and change everything)
   alpn: []str                   # application protocols offered ("http/1.1", "h2")
   timeout_ms: int               # connect, handshake and each read/write (0: 30 s)
+  min_version: int              # 0x0303 (TLS 1.2, the default) or 0x0304 (TLS 1.3 only)
 }
 
 export struct Conn {
@@ -49,6 +52,9 @@ export struct Conn {
   s_ap: str                     # the server's application traffic secret (KeyUpdate)
   c_ap: str
   got_close: bool
+  version: int                  # 0x0304 or 0x0303
+  tls12: bool
+  gcm12: bool                   # TLS 1.2 AES-GCM: an explicit 8-byte nonce in each record
 }
 
 const REC_CCS = 20
@@ -198,6 +204,7 @@ fn (c: *Conn) send_record(t: int, data: str) -> error {
     b.write(vec(2, data))
     return c.sock.write(b.string())
   }
+  if c.tls12 { return c.send_record12(t, data) }
   inner := data + string([]byte{byte(t)})
   n := len(inner) + c.write_aead.overhead()
   head := strings.Builder{}
@@ -208,6 +215,56 @@ fn (c: *Conn) send_record(t: int, data: str) -> error {
   sealed := c.write_aead.seal(nonce_for(c.write_iv, c.write_seq), inner, h)
   c.write_seq++
   return c.sock.write(h + sealed)
+}
+
+fn seq8(seq: int) -> str {
+  b := strings.Builder{}
+  for i := 7; i >= 0; i-- { b.write_byte((seq >> (8 * i)) & 255) }
+  return b.string()
+}
+
+# TLS 1.2 AEAD records (RFC 5288, RFC 7905): AAD = seq, type, version, length
+fn (c: *Conn) send_record12(t: int, data: str) -> error {
+  ab := strings.Builder{}
+  ab.write(seq8(c.write_seq))
+  u8s(&ab, t)
+  u16s(&ab, 0x0303)
+  u16s(&ab, len(data))
+  payload := ""
+  if c.gcm12 {
+    explicit := seq8(c.write_seq)
+    payload = explicit + c.write_aead.seal(c.write_iv + explicit, data, ab.string())
+  } else {
+    payload = c.write_aead.seal(nonce_for(c.write_iv, c.write_seq), data, ab.string())
+  }
+  c.write_seq++
+  b := strings.Builder{}
+  u8s(&b, t)
+  u16s(&b, 0x0303)
+  b.write(vec(2, payload))
+  return c.sock.write(b.string())
+}
+
+fn (c: *Conn) open_record12(t: int, body: str) -> (str, error) {
+  ct := body
+  nonce := ""
+  if c.gcm12 {
+    if len(body) < 8 + 16 { return "", c.fail(20, "record too short") }
+    nonce = c.read_iv + body[0:8]
+    ct = body[8:len(body)]
+  } else {
+    nonce = nonce_for(c.read_iv, c.read_seq)
+  }
+  if len(ct) < 16 { return "", c.fail(20, "record too short") }
+  ab := strings.Builder{}
+  ab.write(seq8(c.read_seq))
+  u8s(&ab, t)
+  u16s(&ab, 0x0303)
+  u16s(&ab, len(ct) - 16)
+  plain, err := c.read_aead.open(nonce, ct, ab.string())
+  if err != nil { return "", c.fail(20, "bad record MAC") }
+  c.read_seq++
+  return plain, nil
 }
 
 # the next record: (type, plaintext); type 0 with a nil error when the socket closed
@@ -221,6 +278,13 @@ fn (c: *Conn) next_record() -> (int, str, error) {
         head := c.inbuf[0:5]
         body := c.inbuf[5:5 + n]
         c.inbuf = c.inbuf[5 + n:len(c.inbuf)]
+        if c.tls12 {
+          # TLS 1.2: ChangeCipherSpec goes to the handshake; after it everything is encrypted
+          if t == REC_CCS || c.read_aead == nil { return t, body, nil }
+          plain, oerr := c.open_record12(t, body)
+          if oerr != nil { return 0, "", oerr }
+          return t, plain, nil
+        }
         if t == REC_CCS && c.read_aead != nil && body == string([]byte{byte(1)}) { continue }   # compatibility
         if c.read_aead == nil || t != REC_APP {
           if c.read_aead != nil && t != REC_ALERT { return 0, "", c.fail(10, "unencrypted record after the handshake keys") }
@@ -323,12 +387,18 @@ fn client_hello(cfg: *Config, name: str, random: str, session_id: str, share: st
     u16s(&ext, 0)
     ext.write(vec(2, vec(2, sni.string())))
   }
-  u16s(&ext, 10)                                  # supported_groups: x25519
-  ext.write(vec(2, vec(2, from_hex("001d"))))
+  u16s(&ext, 10)                                  # supported_groups: x25519, secp256r1, secp384r1
+  ext.write(vec(2, vec(2, from_hex("001d00170018"))))
+  u16s(&ext, 11)                                  # ec_point_formats: uncompressed (TLS 1.2)
+  ext.write(vec(2, vec(1, from_hex("00"))))
+  u16s(&ext, 23)                                  # extended_master_secret (TLS 1.2, RFC 7627)
+  ext.write(vec(2, ""))
+  u16s(&ext, 0xff01)                              # renegotiation_info: none (TLS 1.2, RFC 5746)
+  ext.write(vec(2, vec(1, "")))
   u16s(&ext, 13)                                  # signature_algorithms
   ext.write(vec(2, vec(2, from_hex("04030503080408050806080708090804080a080b04010501060102010201"))))
-  u16s(&ext, 43)                                  # supported_versions: TLS 1.3
-  ext.write(vec(2, vec(1, from_hex("0304"))))
+  u16s(&ext, 43)                                  # supported_versions: TLS 1.3, and 1.2 unless min_version
+  if cfg.min_version == 0x0304 { ext.write(vec(2, vec(1, from_hex("0304")))) } else { ext.write(vec(2, vec(1, from_hex("03040303")))) }
   u16s(&ext, 45)                                  # psk_key_exchange_modes (expected by some servers)
   ext.write(vec(2, vec(1, from_hex("01"))))
   ks := strings.Builder{}
@@ -346,13 +416,31 @@ fn client_hello(cfg: *Config, name: str, random: str, session_id: str, share: st
   u16s(&body, 0x0303)
   body.write(random)
   body.write(vec(1, session_id))
-  body.write(vec(2, from_hex("130113031302")))   # AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM
+  # TLS 1.3: AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM; TLS 1.2: ECDHE with the same AEADs
+  suites := "130113031302"
+  if cfg.min_version != 0x0304 { suites = suites + "c02bc02fcca9cca8c02cc030" }
+  body.write(vec(2, from_hex(suites)))
   body.write(vec(1, string([]byte{byte(0)})))
   body.write(vec(2, ext.string()))
   m := strings.Builder{}
   u8s(&m, HS_CLIENT_HELLO)
   m.write(vec(3, body.string()))
   return m.string()
+}
+
+# parses the server's certificates and verifies the chain and the name (unless insecure)
+fn (c: *Conn) check_certificates(certs: []str, name: str, cfg: *Config) -> error {
+  for _, der := range certs {
+    pc, perr := x509.parse(der)
+    if perr != nil { return c.fail(42, "bad certificate: " + perr.Error()) }
+    c.peer_certificates = append(c.peer_certificates, pc)
+  }
+  if cfg.insecure_skip_verify { return nil }
+  inter := []*x509.Certificate{}
+  for i := 1; i < len(c.peer_certificates); i++ { inter = append(inter, c.peer_certificates[i]) }
+  _, verr := x509.verify(c.peer_certificates[0], &x509.VerifyOptions{dns_name: name, roots: cfg.roots, intermediates: inter})
+  if verr != nil { return c.fail(42, strings.trim_prefix(verr.Error(), "x509: ")) }
+  return nil
 }
 
 # connects to host:port and handshakes
@@ -394,33 +482,43 @@ export fn client(sock: *net.Conn, server_name: str, cfg: *Config) -> (*Conn, err
   ty, sh, err3 := c.next_handshake()
   if err3 != nil {
     # an alert right after ClientHello: almost always a server without TLS 1.3
-    if strings.has_prefix(err3.Error(), "tls: the server sent ") { return nil, errors.New(err3.Error() + " in answer to the handshake (the server may not support TLS 1.3, the only version std/tls speaks)") }
+    if strings.has_prefix(err3.Error(), "tls: the server sent ") { return nil, errors.New(err3.Error() + " in answer to the handshake (it may support none of what std/tls offers: TLS 1.2 or 1.3 with ECDHE and AES-GCM or ChaCha20-Poly1305)") }
     return nil, err3
   }
   if ty != HS_SERVER_HELLO { return nil, c.fail(10, "expected ServerHello") }
   r := &Reader{s: sh, p: 4}
-  r.u16()
+  legacy := r.u16()
   srandom := r.bytes(32)
   if srandom == from_hex(HRR_RANDOM) { return nil, c.fail(40, "the server asked for another key exchange (only X25519 is supported)") }
-  tail := srandom[24:32]
-  if tail == "DOWNGRD" + string([]byte{byte(1)}) || tail == "DOWNGRD" + string([]byte{byte(0)}) { return nil, c.fail(47, "the server does not support TLS 1.3 (downgrade)") }
-  if r.vec(1) != session_id { return nil, c.fail(47, "ServerHello does not echo the session id") }
+  echoed := r.vec(1)
   suite := r.u16()
   if r.u8() != 0 { return nil, c.fail(47, "compression") }
   exts := &Reader{s: r.vec(2)}
   version := 0
   server_share := ""
+  ems := false
   while exts.left() > 0 && !exts.bad {
     et := exts.u16()
     ed := &Reader{s: exts.vec(2)}
     if et == 43 { version = ed.u16() }
+    if et == 23 { ems = true }
     if et == 51 {
       if ed.u16() != 0x001d { return nil, c.fail(47, "the server chose a key exchange group that was not offered") }
       server_share = ed.vec(2)
     }
   }
   if r.bad || exts.bad { return nil, c.fail(50, "malformed ServerHello") }
-  if version != 0x0304 { return nil, c.fail(70, "the server does not support TLS 1.3") }
+  if version == 0 && legacy == 0x0303 {
+    # TLS 1.2. A server that also speaks 1.3 marks its random when something in the middle made
+    # it pick 1.2 (RFC 8446 4.1.3): that is a downgrade attack
+    tail := srandom[24:32]
+    if tail == "DOWNGRD" + string([]byte{byte(1)}) || tail == "DOWNGRD" + string([]byte{byte(0)}) { return nil, c.fail(47, "downgrade detected: the server speaks TLS 1.3 but answered with 1.2") }
+    if cfg.min_version == 0x0304 { return nil, c.fail(70, "the server does not support TLS 1.3 (Config.min_version)") }
+    return c.handshake12(cfg, name, ch, sh, random, srandom, suite, ems, secret)
+  }
+  if version != 0x0304 { return nil, c.fail(70, "the server does not support TLS 1.2 or 1.3") }
+  if echoed != session_id { return nil, c.fail(47, "ServerHello does not echo the session id") }
+  c.version = 0x0304
   switch suite {
   case 0x1301:
     c.cipher_suite = "TLS_AES_128_GCM_SHA256"
@@ -488,17 +586,8 @@ export fn client(sock: *net.Conn, server_name: str, cfg: *Config) -> (*Conn, err
         lst.vec(2)
       }
       if mr.bad || lst.bad || len(certs) == 0 { return nil, c.fail(50, "malformed or empty Certificate") }
-      for _, der := range certs {
-        pc, perr := x509.parse(der)
-        if perr != nil { return nil, c.fail(42, "bad certificate: " + perr.Error()) }
-        c.peer_certificates = append(c.peer_certificates, pc)
-      }
-      if !cfg.insecure_skip_verify {
-        inter := []*x509.Certificate{}
-        for i := 1; i < len(c.peer_certificates); i++ { inter = append(inter, c.peer_certificates[i]) }
-        _, verr := x509.verify(c.peer_certificates[0], &x509.VerifyOptions{dns_name: name, roots: cfg.roots, intermediates: inter})
-        if verr != nil { return nil, c.fail(42, strings.trim_prefix(verr.Error(), "x509: ")) }
-      }
+      cerr := c.check_certificates(certs, name, cfg)
+      if cerr != nil { return nil, cerr }
       transcript = transcript + m
       continue
     }
@@ -559,6 +648,203 @@ export fn client(sock: *net.Conn, server_name: str, cfg: *Config) -> (*Conn, err
   if err != nil { return nil, err }
   c.write_seq = 0
   return c, nil
+}
+
+# ---------------------------------------------------------------- TLS 1.2 (RFC 5246)
+
+# PRF(secret, label, seed) of RFC 5246 section 5 with the suite's hash (P_SHA256 or P_SHA384)
+fn (c: *Conn) prf(secret: str, label: str, seed: str, length: int) -> str {
+  s := label + seed
+  out := strings.Builder{}
+  a := c.hmac(secret, s)
+  while out.len() < length {
+    out.write(c.hmac(secret, a + s))
+    a = c.hmac(secret, a)
+  }
+  return out.string()[0:length]
+}
+
+# the pubkey algorithm of a TLS 1.2 signature scheme for the server's key
+fn signature_alg12(scheme: int, spki: str) -> str {
+  switch scheme {
+  case 0x0401: return "rsa-pkcs1-sha256"
+  case 0x0501: return "rsa-pkcs1-sha384"
+  case 0x0601: return "rsa-pkcs1-sha512"
+  case 0x0403, 0x0503:
+    kind, _, err := pubkey.key_info(spki)
+    if err != nil || (kind != "ecdsa-p256" && kind != "ecdsa-p384") { return "" }
+    if scheme == 0x0403 { return kind + "-sha256" }
+    return kind + "-sha384"
+  }
+  return signature_alg(scheme)
+}
+
+fn (c: *Conn) handshake12(cfg: *Config, name: str, ch: str, sh: str, crandom: str, srandom: str, suite: int, ems: bool, secret: str) -> (*Conn, error) {
+  c.version = 0x0303
+  c.tls12 = true
+  klen := 16
+  switch suite {
+  case 0xc02b, 0xc02f:
+    c.cipher_suite = "TLS_ECDHE_" + suite_auth(suite) + "_WITH_AES_128_GCM_SHA256"
+    c.hash = "sha256"
+    c.gcm12 = true
+  case 0xc02c, 0xc030:
+    c.cipher_suite = "TLS_ECDHE_" + suite_auth(suite) + "_WITH_AES_256_GCM_SHA384"
+    c.hash = "sha384"
+    c.gcm12 = true
+    klen = 32
+  case 0xcca9, 0xcca8:
+    c.cipher_suite = "TLS_ECDHE_" + suite_auth(suite) + "_WITH_CHACHA20_POLY1305_SHA256"
+    c.hash = "sha256"
+    klen = 32
+  default:
+    return nil, c.fail(47, "the server chose a cipher suite that was not offered")
+  }
+  c.hlen = 32
+  if c.hash == "sha384" { c.hlen = 48 }
+  transcript := ch + sh
+  cert_requested := false
+  shared := ""
+  client_share := ""
+  while true {
+    mt, m, err := c.next_handshake()
+    if err != nil { return nil, err }
+    mr := &Reader{s: m, p: 4}
+    if mt == HS_CERTIFICATE {
+      lst := &Reader{s: mr.vec(3)}
+      certs := []str{}
+      while lst.left() > 0 && !lst.bad { certs = append(certs, lst.vec(3)) }
+      if mr.bad || lst.bad || len(certs) == 0 { return nil, c.fail(50, "malformed or empty Certificate") }
+      cerr := c.check_certificates(certs, name, cfg)
+      if cerr != nil { return nil, cerr }
+      transcript = transcript + m
+      continue
+    }
+    if mt == 22 {                                     # CertificateStatus (OCSP stapling): not checked
+      transcript = transcript + m
+      continue
+    }
+    if mt == 12 {                                     # ServerKeyExchange: ECDHE parameters, signed
+      if len(c.peer_certificates) == 0 { return nil, c.fail(10, "ServerKeyExchange without a certificate") }
+      if mr.u8() != 3 { return nil, c.fail(47, "only named curves are supported") }
+      group := mr.u16()
+      point := mr.vec(1)
+      params := m[4:mr.p]
+      scheme := mr.u16()
+      sig := mr.vec(2)
+      if mr.bad || mr.left() != 0 { return nil, c.fail(50, "malformed ServerKeyExchange") }
+      if !cfg.insecure_skip_verify {
+        spki := c.peer_certificates[0].spki
+        alg := signature_alg12(scheme, spki)
+        if alg == "" { return nil, c.fail(47, "unsupported signature scheme " + str(scheme)) }
+        serr := pubkey.verify_signature(alg, spki, crandom + srandom + params, sig)
+        if serr != nil { return nil, c.fail(51, "the server's key exchange signature is invalid: " + serr.Error()) }
+      }
+      if group == 0x001d {
+        if len(point) != 32 { return nil, c.fail(47, "bad X25519 key share") }
+        client_share, err = crypto.x25519_base(secret)
+        if err != nil { return nil, err }
+        shared, err = crypto.x25519(secret, point)
+        if err != nil { return nil, c.fail(47, "invalid key share") }
+      } else if group == 0x0017 || group == 0x0018 {
+        curve := "p256"
+        if group == 0x0018 { curve = "p384" }
+        priv, pub, gerr := pubkey.ecdh_generate(curve)
+        if gerr != nil { return nil, gerr }
+        client_share = pub
+        shared, err = pubkey.ecdh(curve, priv, point)
+        if err != nil { return nil, c.fail(47, "invalid key share: " + err.Error()) }
+      } else {
+        return nil, c.fail(47, "the server chose a curve that was not offered")
+      }
+      transcript = transcript + m
+      continue
+    }
+    if mt == HS_CERTIFICATE_REQUEST {
+      cert_requested = true
+      transcript = transcript + m
+      continue
+    }
+    if mt == 14 {                                     # ServerHelloDone
+      transcript = transcript + m
+      break
+    }
+    return nil, c.fail(10, "unexpected handshake message " + str(mt))
+  }
+  if shared == "" { return nil, c.fail(10, "no ServerKeyExchange (only ECDHE suites are supported)") }
+
+  # our flight: [Certificate (empty)], ClientKeyExchange, ChangeCipherSpec, Finished
+  if cert_requested {
+    cm := strings.Builder{}
+    u8s(&cm, HS_CERTIFICATE)
+    cm.write(vec(3, vec(3, "")))
+    msg := cm.string()
+    err := c.send_record(REC_HANDSHAKE, msg)
+    if err != nil { return nil, err }
+    transcript = transcript + msg
+  }
+  cke := strings.Builder{}
+  u8s(&cke, 16)
+  cke.write(vec(3, vec(1, client_share)))
+  ckm := cke.string()
+  err2 := c.send_record(REC_HANDSHAKE, ckm)
+  if err2 != nil { return nil, errors.New("tls: " + err2.Error()) }
+  transcript = transcript + ckm
+  master := ""
+  if ems { master = c.prf(shared, "extended master secret", c.digest(transcript), 48) } else { master = c.prf(shared, "master secret", crandom + srandom, 48) }
+  ivlen := 4
+  if !c.gcm12 { ivlen = 12 }
+  kb := c.prf(master, "key expansion", srandom + crandom, 2 * klen + 2 * ivlen)
+  ckey := kb[0:klen]
+  skey := kb[klen:2 * klen]
+  civ := kb[2 * klen:2 * klen + ivlen]
+  siv := kb[2 * klen + ivlen:2 * klen + 2 * ivlen]
+  c.sock.write(from_hex("140303000101"))
+  ca, e1 := new_aead12(c, ckey)
+  if e1 != nil { return nil, e1 }
+  c.write_aead = ca
+  c.write_iv = civ
+  c.write_seq = 0
+  fin := strings.Builder{}
+  u8s(&fin, HS_FINISHED)
+  fin.write(vec(3, c.prf(master, "client finished", c.digest(transcript), 12)))
+  finm := fin.string()
+  err3 := c.send_record(REC_HANDSHAKE, finm)
+  if err3 != nil { return nil, errors.New("tls: " + err3.Error()) }
+  transcript = transcript + finm
+
+  # the server's ChangeCipherSpec, then its Finished under the new keys
+  while true {
+    t, body, err4 := c.next_record()
+    if err4 != nil { return nil, err4 }
+    if t == 0 { return nil, errors.New("tls: the connection closed during the handshake") }
+    if t == REC_ALERT { return nil, alert_error(body) }
+    if t == REC_CCS {
+      if body != string([]byte{byte(1)}) || c.hs != "" { return nil, c.fail(10, "bad ChangeCipherSpec") }
+      break
+    }
+    return nil, c.fail(10, "expected ChangeCipherSpec")
+  }
+  sa, e2 := new_aead12(c, skey)
+  if e2 != nil { return nil, e2 }
+  c.read_aead = sa
+  c.read_iv = siv
+  c.read_seq = 0
+  mt2, m2, err5 := c.next_handshake()
+  if err5 != nil { return nil, err5 }
+  want := c.prf(master, "server finished", c.digest(transcript), 12)
+  if mt2 != HS_FINISHED || len(m2) != 16 || !crypto.constant_time_eq(m2[4:16], want) { return nil, c.fail(51, "the server's Finished is invalid") }
+  return c, nil
+}
+
+fn suite_auth(suite: int) -> str {
+  if suite == 0xc02b || suite == 0xc02c || suite == 0xcca9 { return "ECDSA" }
+  return "RSA"
+}
+
+fn new_aead12(c: *Conn, key: str) -> (*cipher.Aead, error) {
+  if c.gcm12 { return cipher.new_aes_gcm(key) }
+  return cipher.new_chacha20_poly1305(key)
 }
 
 # ---------------------------------------------------------------- application data
@@ -623,7 +909,12 @@ fn (c: *Conn) post_handshake() -> error {
     m := c.hs[0:4 + n]
     c.hs = c.hs[4 + n:len(c.hs)]
     if t == HS_NEW_SESSION_TICKET { continue }
-    if t == HS_KEY_UPDATE {
+    if c.tls12 && t == 0 {
+      # HelloRequest: renegotiation is not supported; a no_renegotiation warning declines it
+      c.send_record(REC_ALERT, string([]byte{byte(1), byte(100)}))
+      continue
+    }
+    if t == HS_KEY_UPDATE && !c.tls12 {
       if n != 1 { return c.fail(50, "malformed KeyUpdate") }
       c.s_ap = c.expand_label(c.s_ap, "traffic upd", "", c.hlen)
       a, iv, err := c.traffic_keys(c.s_ap)

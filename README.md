@@ -80,7 +80,7 @@ and generated help, `docs/cli.md`), `testing`.
 - `std/http`: an HTTP/1.1 server with keep-alive and an event loop (epoll); several processes on the
   same port with `http.listen_and_serve_workers(host, port, n)`. And a client: `http.get(url)`,
   `http.post(url, content_type, body)`, `http.request(&http.ClientRequest{...})`, with kept-alive
-  connections, redirects, chunked bodies and timeouts, over `http://` and `https://` (TLS 1.3,
+  connections, redirects, chunked bodies and timeouts, over `http://` and `https://` (TLS 1.3 and 1.2,
   certificates checked against the system's roots). See `docs/http.md`.
 - `std/net`: TCP sockets, and `net.resolve(host)` for host names (`/etc/hosts` and DNS).
 - `std/websocket`: WebSocket clients (`websocket.dial`, blocking `read`, pings, reconnection) and
@@ -89,7 +89,7 @@ and generated help, `docs/cli.md`), `testing`.
 - `std/cipher`: authenticated encryption for TLS 1.3, AES-GCM and ChaCha20-Poly1305
   (`cipher.aes_gcm_seal`, `cipher.new_chacha20_poly1305(key)`...); HKDF and SHA-384 are in
   `std/crypto`. See `docs/cipher.md`.
-- `std/tls`: TLS 1.3 clients (`tls.dial(host, 443, nil)`), with `std/x509` (certificates, chains,
+- `std/tls`: TLS 1.3 and 1.2 clients (`tls.dial(host, 443, nil)`), with `std/x509` (certificates, chains,
   host names, the system's roots) and `std/pubkey` (RSA, ECDSA P-256/P-384 and Ed25519
   signatures). `std/crypto` has X25519 and Ed25519. See `docs/tls.md`.
 

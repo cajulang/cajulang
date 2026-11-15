@@ -485,3 +485,24 @@ describe("pubkey.key_info", fn() {
     expect(bits).to_equal(256)
   })
 })
+
+describe("pubkey.ecdh", fn() {
+  it("gives both sides the same secret on P-256 and P-384", fn() {
+    for _, curve := range []str{"p256", "p384"} {
+      a, pa, e1 := pubkey.ecdh_generate(curve)
+      b, pb, e2 := pubkey.ecdh_generate(curve)
+      expect(e1).to_be_nil()
+      expect(e2).to_be_nil()
+      s1, _ := pubkey.ecdh(curve, a, pb)
+      s2, _ := pubkey.ecdh(curve, b, pa)
+      expect(len(s1)).to_equal(len(a))
+      expect(s1).to_equal(s2)
+    }
+  })
+  it("refuses a peer point that is not on the curve", fn() {
+    a, pa, _ := pubkey.ecdh_generate("p256")
+    bad := pa[0:64] + string([]byte{byte(int(pa[64]) ^ 1)})
+    _, err := pubkey.ecdh("p256", a, bad)
+    expect(err).not_().to_be_nil()
+  })
+})
