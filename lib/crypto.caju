@@ -1,5 +1,5 @@
-# std/crypto: cryptographic hashes (SHA-256, SHA-512, SHA-1, MD5), HMAC, PBKDF2, constant-time
-# comparison and secure random bytes.
+# std/crypto: cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1, MD5), HMAC, HKDF, PBKDF2,
+# constant-time comparison, secure random bytes and Ed25519 signatures.
 #
 # The digests are binary strings (32 bytes for SHA-256); the *_hex functions give the usual
 # lowercase hexadecimal form. SHA-1 and MD5 are broken for security: use them only to talk to
@@ -45,6 +45,7 @@ const ALG_SHA256 = 1
 const ALG_SHA512 = 2
 const ALG_SHA1 = 3
 const ALG_MD5 = 4
+const ALG_SHA384 = 5
 
 # Hasher: an incremental hash. Feed it with write() as many times as needed; sum() gives the
 # digest of everything written so far (the hasher can keep receiving data after it).
@@ -69,6 +70,11 @@ fn new_hasher(algo: int) -> *Hasher {
     x.dsize = 64
     x.h = []int{0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
       0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179}
+  } else if algo == ALG_SHA384 {
+    x.block = 128
+    x.dsize = 48
+    x.h = []int{0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+      0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4}
   } else if algo == ALG_SHA1 {
     x.dsize = 20
     x.h = []int{0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0}
@@ -88,11 +94,11 @@ export fn new_md5() -> *Hasher { return new_hasher(ALG_MD5) }
 
 # the digest size in bytes
 export fn (x: *Hasher) size() -> int { return x.dsize }
-# the block size in bytes (64, or 128 for SHA-512)
+# the block size in bytes (64, or 128 for SHA-512 and SHA-384)
 export fn (x: *Hasher) block_size() -> int { return x.block }
 
 fn (x: *Hasher) compress(p: int) {
-  if x.algo == ALG_SHA256 { sha256_block(x.h, x.w, p) } else if x.algo == ALG_SHA512 { sha512_block(x.h, x.w, p) } else if x.algo == ALG_SHA1 { sha1_block(x.h, x.w, p) } else { md5_block(x.h, p) }
+  if x.algo == ALG_SHA256 { sha256_block(x.h, x.w, p) } else if x.block == 128 { sha512_block(x.h, x.w, p) } else if x.algo == ALG_SHA1 { sha1_block(x.h, x.w, p) } else { md5_block(x.h, p) }
 }
 
 fn (x: *Hasher) write_raw(p: int, n: int) {
@@ -165,7 +171,9 @@ export fn (x: *Hasher) sum() -> str {
   out := __newstr(y.dsize)
   o := out + 8
   for k, v := range y.h {
-    if y.algo == ALG_SHA512 { store_be64(o + 8 * k, v) } else if y.algo == ALG_MD5 { store_le32(o + 4 * k, v) } else { store_be32(o + 4 * k, v) }
+    if y.block == 128 {
+      if 8 * k < y.dsize { store_be64(o + 8 * k, v) }
+    } else if y.algo == ALG_MD5 { store_le32(o + 4 * k, v) } else { store_be32(o + 4 * k, v) }
   }
   return __pstr(out)
 }
@@ -1102,4 +1110,75 @@ export fn x25519_base(scalar: str) -> (str, error) {
   nine := __newstr(32)
   __store8(nine + 8, 9)
   return x25519(scalar, __pstr(nine))
+
+# ---------------------------------------------------------------- SHA-384 (FIPS 180-4)
+#
+# SHA-512 with other initial values, truncated to 48 bytes.
+
+export fn new_sha384() -> *Hasher { return new_hasher(ALG_SHA384) }
+export fn sha384(s: str) -> str { return digest(ALG_SHA384, s) }
+export fn sha384_hex(s: str) -> str { return hex.encode(sha384(s)) }
+
+export fn new_hmac_sha384(key: str) -> *Hmac { return new_hmac(ALG_SHA384, key) }
+export fn hmac_sha384(key: str, msg: str) -> str {
+  m := new_hmac(ALG_SHA384, key)
+  m.write(msg)
+  return m.sum()
+}
+export fn hmac_sha384_hex(key: str, msg: str) -> str { return hex.encode(hmac_sha384(key, msg)) }
+
+# ---------------------------------------------------------------- HKDF (RFC 5869)
+#
+# hash names the HMAC hash: "sha256" or "sha384" (the TLS 1.3 cipher suites).
+
+fn hkdf_algo(hash: str) -> int {
+  if hash == "sha256" { return ALG_SHA256 }
+  if hash == "sha384" { return ALG_SHA384 }
+  if hash == "sha512" { return ALG_SHA512 }
+  return 0
+}
+
+fn hkdf_hash_error(hash: str) -> error { return errors.New("crypto: unknown HKDF hash \"" + hash + "\" (use \"sha256\" or \"sha384\")") }
+
+# HKDF-Extract: the pseudorandom key (hash-sized) of the input keying material ikm; an empty salt
+# means hash-size zero bytes. Panics on an unknown hash name.
+export fn hkdf_extract(hash: str, salt: str, ikm: str) -> str {
+  algo := hkdf_algo(hash)
+  if algo == 0 { panic(hkdf_hash_error(hash).Error()) }
+  m := new_hmac(algo, salt)
+  m.write(ikm)
+  return m.sum()
+}
+
+# HKDF-Expand: length bytes of output keying material from the pseudorandom key prk and the
+# context info; length is at most 255 times the hash size
+export fn hkdf_expand(hash: str, prk: str, info: str, length: int) -> (str, error) {
+  algo := hkdf_algo(hash)
+  if algo == 0 { return "", hkdf_hash_error(hash) }
+  base := new_hmac(algo, prk)
+  hlen := base.inner.dsize
+  if length < 0 || length > 255 * hlen { return "", errors.New("crypto: HKDF length " + str(length) + " out of range (0 to " + str(255 * hlen) + ")") }
+  out := __newstr(length)
+  o := out + 8
+  done := 0
+  t := ""
+  i := 1
+  ib := __newstr(1)
+  while done < length {
+    m := base.clone()
+    m.write(t)
+    m.write(info)
+    __store8(ib + 8, i)
+    m.write(__pstr(ib))
+    t = m.sum()
+    tp := __strp(t) + 8
+    j := 0
+    while j < hlen && done < length {
+      __store8(o + done, __load8(tp + j))
+      done++
+      j++
+    }
+    i++
+  }
+  return __pstr(out), nil
 }

@@ -345,5 +345,101 @@ describe("crypto.x25519", fn() {
     expect(err).not_().to_be_nil()
     _, err2 := crypto.x25519("short", "x")
     expect(err2).not_().to_be_nil()
+
+describe("crypto.sha384", fn() {
+  it("hashes empty text to the known digest", fn() {
+    expect(crypto.sha384_hex("")).to_equal("38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b")
+  })
+  it("hashes \"abc\" to the known digest", fn() {
+    expect(crypto.sha384_hex("abc")).to_equal("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")
+  })
+  it("hashes the 896-bit message of FIPS 180 to the known digest", fn() {
+    expect(crypto.sha384_hex("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")).to_equal("09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039")
+  })
+  it("hashes a million \"a\" to the known digest", fn() {
+    expect(crypto.sha384_hex(strings.repeat("a", 1000000))).to_equal("9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985")
+  })
+  it("returns a binary digest of 48 bytes", fn() {
+    expect(len(crypto.sha384("x"))).to_equal(48)
+  })
+  it("handles lengths around the padding boundaries", fn() {
+    got := []str{}
+    for _, n := range []int{111, 112, 127, 128, 129} { got = append(got, crypto.sha384_hex(strings.repeat("z", n))[0:16]) }
+    expect(got).to_equal([]str{"08f1a449817274d0", "8aefe51f78a651da", "f55702fae4378f84", "922b510dc9118027", "1ee17618b82c5bda"})
+  })
+})
+
+describe("crypto.new_sha384", fn() {
+  it("gives the same digest written in pieces, and keeps going after sum", fn() {
+    h := crypto.new_sha384()
+    expect(h.size()).to_equal(48)
+    expect(h.block_size()).to_equal(128)
+    h.write("ab")
+    h.write("c")
+    expect(h.sum_hex()).to_equal(crypto.sha384_hex("abc"))
+    h.write("def")
+    expect(h.sum()).to_equal(crypto.sha384("abcdef"))
+    expect(h.clone().sum()).to_equal(crypto.sha384("abcdef"))
+  })
+})
+
+describe("crypto.hmac_sha384", fn() {
+  it("matches RFC 4231 test case 2", fn() {
+    expect(crypto.hmac_sha384_hex("Jefe", "what do ya want for nothing?")).to_equal("af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649")
+  })
+  it("gives the same MAC incrementally", fn() {
+    m := crypto.new_hmac_sha384("Jefe")
+    m.write("what do ya want ")
+    m.write("for nothing?")
+    expect(m.sum()).to_equal(crypto.hmac_sha384("Jefe", "what do ya want for nothing?"))
+  })
+})
+
+# the bytes first, first + 1, ... (n of them)
+fn seq(first: int, n: int) -> str {
+  digits := "0123456789abcdef"
+  h := ""
+  i := 0
+  while i < n {
+    x := first + i
+    h = h + digits[x >> 4:(x >> 4) + 1] + digits[x & 15:(x & 15) + 1]
+    i++
+  }
+  return unhex(h)
+}
+
+describe("crypto.hkdf", fn() {
+  it("matches RFC 5869 test case 1", fn() {
+    prk := crypto.hkdf_extract("sha256", unhex("000102030405060708090a0b0c"), unhex(strings.repeat("0b", 22)))
+    expect(hex.encode(prk)).to_equal("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+    okm, err := crypto.hkdf_expand("sha256", prk, unhex("f0f1f2f3f4f5f6f7f8f9"), 42)
+    expect(err).to_be_nil()
+    expect(hex.encode(okm)).to_equal("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+  })
+  it("matches RFC 5869 test case 2 (long inputs)", fn() {
+    prk := crypto.hkdf_extract("sha256", seq(0x60, 80), seq(0, 80))
+    expect(hex.encode(prk)).to_equal("06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244")
+    okm, _ := crypto.hkdf_expand("sha256", prk, seq(0xb0, 80), 82)
+    expect(hex.encode(okm)).to_equal("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")
+  })
+  it("matches RFC 5869 test case 3 (empty salt and info)", fn() {
+    prk := crypto.hkdf_extract("sha256", "", unhex(strings.repeat("0b", 22)))
+    expect(hex.encode(prk)).to_equal("19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")
+    okm, _ := crypto.hkdf_expand("sha256", prk, "", 42)
+    expect(hex.encode(okm)).to_equal("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+  })
+  it("works with sha384", fn() {
+    prk := crypto.hkdf_extract("sha384", "salt", "ikm")
+    expect(len(prk)).to_equal(48)
+    okm, _ := crypto.hkdf_expand("sha384", prk, "info", 100)
+    expect(hex.encode(okm)).to_equal("8a4904829f7acb5fe62bfbce3ed1a2d9428bdcba65d4db11e7471f3b7ab9eaffb058cfdad0c509f3ccd90685666fa8b2b2f6091d3ee2045886335d2ca8524330e16c90401b1abee7254ae0c6b5b131af1911199e43bcd263f5441c7f63e41578237236b6")
+  })
+  it("refuses a length above 255 times the hash size", fn() {
+    _, err := crypto.hkdf_expand("sha256", strings.repeat("k", 32), "", 255 * 32 + 1)
+    expect(err).to_be_error("crypto: HKDF length 8161 out of range (0 to 8160)")
+  })
+  it("refuses an unknown hash", fn() {
+    _, err := crypto.hkdf_expand("md5", "k", "", 16)
+    expect(err).to_be_error("crypto: unknown HKDF hash \"md5\" (use \"sha256\" or \"sha384\")")
   })
 })

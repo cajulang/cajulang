@@ -72,7 +72,7 @@ Details in `docs/wasm.md`.
 ## Standard library
 
 `import "std/x"`: `strings`, `strconv`, `math`, `bytes`, `os`, `fs`, `path`, `net`, `http`, `websocket`, `json`,
-`toml`, `crypto`, `hash`, `hex`, `base64`, `cli` (command line programs: commands, flags, arguments
+`toml`, `crypto`, `cipher`, `hash`, `hex`, `base64`, `cli` (command line programs: commands, flags, arguments
 and generated help, `docs/cli.md`), `testing`.
 
 - `std/json`: `json.marshal(v)` / `json.unmarshal(text, &v)` for structs, lists, maps and `any`,
@@ -86,6 +86,9 @@ and generated help, `docs/cli.md`), `testing`.
 - `std/websocket`: WebSocket clients (`websocket.dial`, blocking `read`, pings, reconnection) and
   servers inside `std/http`'s event loop (`websocket.accept(req, res)` and callbacks). `ws://`
   only. See `docs/websocket.md`.
+- `std/cipher`: authenticated encryption for TLS 1.3, AES-GCM and ChaCha20-Poly1305
+  (`cipher.aes_gcm_seal`, `cipher.new_chacha20_poly1305(key)`...); HKDF and SHA-384 are in
+  `std/crypto`. See `docs/cipher.md`.
 
 For REST APIs there is a Gin-style framework, [`github.com/cajulang/web`](https://github.com/cajulang/web):
 
