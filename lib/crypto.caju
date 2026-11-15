@@ -570,3 +570,458 @@ export fn random_bytes(n: int) -> (str, error) {
   }
   return __pstr(m), nil
 }
+
+# ---------------------------------------------------------------- Ed25519 (RFC 8032)
+#
+# Signatures: a private key is a 32-byte seed (crypto.random_bytes(32)), its public key has 32
+# bytes and a signature 64. ed25519_verify refuses non-canonical signatures (S >= L) and public
+# keys that are not points of the curve. The arithmetic follows TweetNaCl: field elements are 16
+# limbs of 16 bits, and the scalar multiplication swaps points with masks instead of branches.
+
+export const ED25519_SEED_SIZE = 32
+export const ED25519_PUBLIC_KEY_SIZE = 32
+export const ED25519_SIGNATURE_SIZE = 64
+
+let ED_D = []int{0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203}
+let ED_D2 = []int{0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406}
+let ED_X = []int{0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169}
+let ED_Y = []int{0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666}
+let ED_I = []int{0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83}
+# the order of the base point, little-endian bytes
+let ED_L = []int{0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10}
+
+fn fe() -> []int { return make([]int, 16) }
+
+fn fe_one() -> []int {
+  o := make([]int, 16)
+  o[0] = 1
+  return o
+}
+
+fn fe_copy(o: []int, a: []int) {
+  i := 0
+  while i < 16 {
+    o[i] = a[i]
+    i++
+  }
+}
+
+fn fe_carry(o: []int) {
+  i := 0
+  while i < 16 {
+    o[i] += 1 << 16
+    c := o[i] >> 16
+    if i < 15 { o[i + 1] += c - 1 } else { o[0] += 38 * (c - 1) }
+    o[i] -= c << 16
+    i++
+  }
+}
+
+# swaps p and q when b is 1, keeps them when b is 0 (without a branch on b)
+fn fe_select(p: []int, q: []int, b: int) {
+  c := (b - 1) ^ -1
+  i := 0
+  while i < 16 {
+    t := c & (p[i] ^ q[i])
+    p[i] = p[i] ^ t
+    q[i] = q[i] ^ t
+    i++
+  }
+}
+
+# the 32 little-endian bytes of n, fully reduced mod 2^255 - 19
+fn fe_pack(n: []int) -> []int {
+  t := fe()
+  m := fe()
+  fe_copy(t, n)
+  fe_carry(t)
+  fe_carry(t)
+  fe_carry(t)
+  j := 0
+  while j < 2 {
+    m[0] = t[0] - 0xffed
+    i := 1
+    while i < 15 {
+      m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1)
+      m[i - 1] = m[i - 1] & 0xffff
+      i++
+    }
+    m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1)
+    b := (m[15] >> 16) & 1
+    m[14] = m[14] & 0xffff
+    fe_select(t, m, 1 - b)
+    j++
+  }
+  o := make([]int, 32)
+  k := 0
+  while k < 16 {
+    o[2 * k] = t[k] & 0xff
+    o[2 * k + 1] = (t[k] >> 8) & 0xff
+    k++
+  }
+  return o
+}
+
+fn fe_equal(a: []int, b: []int) -> bool {
+  x := fe_pack(a)
+  y := fe_pack(b)
+  d := 0
+  i := 0
+  while i < 32 {
+    d = d | (x[i] ^ y[i])
+    i++
+  }
+  return d == 0
+}
+
+fn fe_parity(a: []int) -> int { return fe_pack(a)[0] & 1 }
+
+fn fe_unpack(o: []int, n: []int) {
+  i := 0
+  while i < 16 {
+    o[i] = n[2 * i] + (n[2 * i + 1] << 8)
+    i++
+  }
+  o[15] = o[15] & 0x7fff
+}
+
+fn fe_add(o: []int, a: []int, b: []int) {
+  i := 0
+  while i < 16 {
+    o[i] = a[i] + b[i]
+    i++
+  }
+}
+
+fn fe_sub(o: []int, a: []int, b: []int) {
+  i := 0
+  while i < 16 {
+    o[i] = a[i] - b[i]
+    i++
+  }
+}
+
+fn fe_mul(o: []int, a: []int, b: []int) {
+  t := make([]int, 31)
+  i := 0
+  while i < 16 {
+    ai := a[i]
+    j := 0
+    while j < 16 {
+      t[i + j] += ai * b[j]
+      j++
+    }
+    i++
+  }
+  k := 0
+  while k < 15 {
+    t[k] += 38 * t[k + 16]
+    k++
+  }
+  fe_copy(o, t)
+  fe_carry(o)
+  fe_carry(o)
+}
+
+fn fe_inv(o: []int, x: []int) {
+  c := fe()
+  fe_copy(c, x)
+  a := 253
+  while a >= 0 {
+    fe_mul(c, c, c)
+    if a != 2 && a != 4 { fe_mul(c, c, x) }
+    a--
+  }
+  fe_copy(o, c)
+}
+
+fn fe_pow2523(o: []int, x: []int) {
+  c := fe()
+  fe_copy(c, x)
+  a := 250
+  while a >= 0 {
+    fe_mul(c, c, c)
+    if a != 1 { fe_mul(c, c, x) }
+    a--
+  }
+  fe_copy(o, c)
+}
+
+# a point in extended coordinates (X, Y, Z, T)
+fn ed_point() -> [][]int { return [][]int{fe(), fe(), fe(), fe()} }
+
+# p += q (q may be p)
+fn ed_add(p: [][]int, q: [][]int) {
+  a := fe()
+  b := fe()
+  c := fe()
+  d := fe()
+  t := fe()
+  e := fe()
+  f := fe()
+  g := fe()
+  h := fe()
+  fe_sub(a, p[1], p[0])
+  fe_sub(t, q[1], q[0])
+  fe_mul(a, a, t)
+  fe_add(b, p[0], p[1])
+  fe_add(t, q[0], q[1])
+  fe_mul(b, b, t)
+  fe_mul(c, p[3], q[3])
+  fe_mul(c, c, ED_D2)
+  fe_mul(d, p[2], q[2])
+  fe_add(d, d, d)
+  fe_sub(e, b, a)
+  fe_sub(f, d, c)
+  fe_add(g, d, c)
+  fe_add(h, b, a)
+  fe_mul(p[0], e, f)
+  fe_mul(p[1], h, g)
+  fe_mul(p[2], g, f)
+  fe_mul(p[3], e, h)
+}
+
+fn ed_swap(p: [][]int, q: [][]int, b: int) {
+  i := 0
+  while i < 4 {
+    fe_select(p[i], q[i], b)
+    i++
+  }
+}
+
+fn ed_pack(p: [][]int) -> []int {
+  tx := fe()
+  ty := fe()
+  zi := fe()
+  fe_inv(zi, p[2])
+  fe_mul(tx, p[0], zi)
+  fe_mul(ty, p[1], zi)
+  r := fe_pack(ty)
+  r[31] = r[31] ^ (fe_parity(tx) << 7)
+  return r
+}
+
+# p = s * q (s: 32 little-endian bytes); q is changed
+fn ed_scalarmult(p: [][]int, q: [][]int, s: []int) {
+  fe_copy(p[0], fe())
+  fe_copy(p[1], fe_one())
+  fe_copy(p[2], fe_one())
+  fe_copy(p[3], fe())
+  i := 255
+  while i >= 0 {
+    b := (s[i / 8] >> (i & 7)) & 1
+    ed_swap(p, q, b)
+    ed_add(q, p)
+    ed_add(p, p)
+    ed_swap(p, q, b)
+    i--
+  }
+}
+
+fn ed_scalarbase(p: [][]int, s: []int) {
+  q := ed_point()
+  fe_copy(q[0], ED_X)
+  fe_copy(q[1], ED_Y)
+  fe_copy(q[2], fe_one())
+  fe_mul(q[3], ED_X, ED_Y)
+  ed_scalarmult(p, q, s)
+}
+
+# x (64 limbs, little-endian bytes of a number below 2^512, changed) mod L, in 32 bytes
+fn ed_mod_l(x: []int) -> []int {
+  carry := 0
+  i := 63
+  while i >= 32 {
+    carry = 0
+    j := i - 32
+    while j < i - 12 {
+      x[j] += carry - 16 * x[i] * ED_L[j - (i - 32)]
+      carry = (x[j] + 128) >> 8
+      x[j] -= carry << 8
+      j++
+    }
+    x[j] += carry
+    x[i] = 0
+    i--
+  }
+  carry = 0
+  k := 0
+  while k < 32 {
+    x[k] += carry - (x[31] >> 4) * ED_L[k]
+    carry = x[k] >> 8
+    x[k] = x[k] & 255
+    k++
+  }
+  k = 0
+  while k < 32 {
+    x[k] -= carry * ED_L[k]
+    k++
+  }
+  r := make([]int, 32)
+  k = 0
+  while k < 32 {
+    x[k + 1] += x[k] >> 8
+    r[k] = x[k] & 255
+    k++
+  }
+  return r
+}
+
+# a 64-byte hash read as a little-endian number, mod L
+fn ed_reduce(h: str) -> []int {
+  x := make([]int, 64)
+  i := 0
+  while i < 64 {
+    x[i] = int(h[i])
+    i++
+  }
+  return ed_mod_l(x)
+}
+
+fn ed_bytes(s: str) -> []int {
+  o := make([]int, len(s))
+  i := 0
+  while i < len(s) {
+    o[i] = int(s[i])
+    i++
+  }
+  return o
+}
+
+fn ed_str(b: []int) -> str {
+  m := __newstr(len(b))
+  i := 0
+  while i < len(b) {
+    __store8(m + 8 + i, b[i] & 255)
+    i++
+  }
+  return __pstr(m)
+}
+
+# the clamped secret scalar (first 32 bytes) and the nonce prefix (last 32) of a seed
+fn ed_expand(seed: str) -> []int {
+  d := ed_bytes(sha512(seed))
+  d[0] = d[0] & 248
+  d[31] = d[31] & 127
+  d[31] = d[31] | 64
+  return d
+}
+
+fn ed_check_seed(seed: str) -> error {
+  if len(seed) != ED25519_SEED_SIZE { return errors.New("crypto: an Ed25519 seed has 32 bytes, not " + str(len(seed))) }
+  return nil
+}
+
+# the public key (32 bytes) of a 32-byte seed
+export fn ed25519_public_key(seed: str) -> (str, error) {
+  err := ed_check_seed(seed)
+  if err != nil { return "", err }
+  p := ed_point()
+  ed_scalarbase(p, ed_expand(seed))
+  return ed_str(ed_pack(p)), nil
+}
+
+# the signature (64 bytes) of msg with the private key seed (32 bytes)
+export fn ed25519_sign(seed: str, msg: str) -> (str, error) {
+  err := ed_check_seed(seed)
+  if err != nil { return "", err }
+  d := ed_expand(seed)
+  p := ed_point()
+  ed_scalarbase(p, d)
+  pk := ed_str(ed_pack(p))
+  hr := new_sha512()
+  hr.write(ed_str(d[32:64]))
+  hr.write(msg)
+  r := ed_reduce(hr.sum())
+  pr := ed_point()
+  ed_scalarbase(pr, r)
+  big_r := ed_str(ed_pack(pr))
+  hh := new_sha512()
+  hh.write(big_r)
+  hh.write(pk)
+  hh.write(msg)
+  h := ed_reduce(hh.sum())
+  x := make([]int, 64)
+  i := 0
+  while i < 32 {
+    x[i] = r[i]
+    i++
+  }
+  i = 0
+  while i < 32 {
+    j := 0
+    while j < 32 {
+      x[i + j] += h[i] * d[j]
+      j++
+    }
+    i++
+  }
+  return big_r + ed_str(ed_mod_l(x)), nil
+}
+
+# -A from the 32 bytes of a public key A, or false if they are not a point of the curve
+fn ed_unpack_neg(r: [][]int, p: []int) -> bool {
+  t := fe()
+  chk := fe()
+  num := fe()
+  den := fe()
+  den2 := fe()
+  den4 := fe()
+  den6 := fe()
+  fe_copy(r[2], fe_one())
+  fe_unpack(r[1], p)
+  fe_mul(num, r[1], r[1])
+  fe_mul(den, num, ED_D)
+  fe_sub(num, num, r[2])
+  fe_add(den, r[2], den)
+  fe_mul(den2, den, den)
+  fe_mul(den4, den2, den2)
+  fe_mul(den6, den4, den2)
+  fe_mul(t, den6, num)
+  fe_mul(t, t, den)
+  fe_pow2523(t, t)
+  fe_mul(t, t, num)
+  fe_mul(t, t, den)
+  fe_mul(t, t, den)
+  fe_mul(r[0], t, den)
+  fe_mul(chk, r[0], r[0])
+  fe_mul(chk, chk, den)
+  if !fe_equal(chk, num) { fe_mul(r[0], r[0], ED_I) }
+  fe_mul(chk, r[0], r[0])
+  fe_mul(chk, chk, den)
+  if !fe_equal(chk, num) { return false }
+  if fe_parity(r[0]) == (p[31] >> 7) { fe_sub(r[0], fe(), r[0]) }
+  fe_mul(r[3], r[0], r[1])
+  return true
+}
+
+# is S (32 little-endian bytes) below L? (a signature with S >= L is refused: malleability)
+fn ed_canonical(s: []int) -> bool {
+  i := 31
+  while i >= 0 {
+    if s[i] < ED_L[i] { return true }
+    if s[i] > ED_L[i] { return false }
+    i--
+  }
+  return false
+}
+
+# is sig a valid signature of msg by the holder of public_key (32 bytes)?
+export fn ed25519_verify(public_key: str, msg: str, sig: str) -> bool {
+  if len(public_key) != ED25519_PUBLIC_KEY_SIZE || len(sig) != ED25519_SIGNATURE_SIZE { return false }
+  s := ed_bytes(sig[32:64])
+  if !ed_canonical(s) { return false }
+  q := ed_point()
+  if !ed_unpack_neg(q, ed_bytes(public_key)) { return false }
+  hh := new_sha512()
+  hh.write(sig[0:32])
+  hh.write(public_key)
+  hh.write(msg)
+  h := ed_reduce(hh.sum())
+  p := ed_point()
+  ed_scalarmult(p, q, h)
+  b := ed_point()
+  ed_scalarbase(b, s)
+  ed_add(p, b)
+  return constant_time_eq(ed_str(ed_pack(p)), sig[0:32])
+}
