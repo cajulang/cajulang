@@ -1,0 +1,5 @@
+import "./closure_mod"
+closure_mod.run(closure_mod.make())
+closure_mod.local_var()
+f := closure_mod.nested()
+print(f(20))

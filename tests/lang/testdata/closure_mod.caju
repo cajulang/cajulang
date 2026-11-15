@@ -1,0 +1,18 @@
+# closures that call their own function-valued parameters and locals, in an imported module
+export fn run(f: fn(fn())) {
+  f(fn() { print("parameter ran") })
+}
+export fn make() -> fn(fn()) {
+  return fn(done: fn()) { done() }
+}
+export fn local_var() {
+  g := fn() { print("local ran") }
+  h := fn() { g() }
+  h()
+}
+export fn nested() -> fn(int) -> int {
+  return fn(n: int) -> int {
+    twice := fn(k: int) -> int { return k * 2 }
+    return twice(n) + 1
+  }
+}

@@ -14,6 +14,11 @@ notes from the section of its version here (`tools/changelog.sh`).
   library, `os.sleep` uses the intrinsic `__sleep`, which each runtime implements (Linux, Windows,
   WebAssembly).
 
+### Fixed
+- In an imported module, a closure that called one of its own function-valued parameters or
+  locals (`return fn(done: fn()) { done() }`) failed with "The function "done" does not exist":
+  the linker renamed the parameter but not the call.
+
 ## [0.8.0] - 2026-11-15
 
 ### Added

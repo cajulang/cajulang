@@ -47,6 +47,26 @@ fn walk_declared(n: *ast.Node, names: map[str]bool) {
   walk_declared(n.otherwise, names)
   walk_declared(n.init, names)
   for _, c := range n.cases { walk_declared(c, names) }
+  # function literals inside expressions (a closure returned, passed or assigned): their
+  # parameters and locals are names of this file too, or a call to one of them inside the
+  # closure would keep its plain name while the parameter gets the module's
+  walk_literals(n, names)
+}
+fn walk_literals(n: *ast.Node, names: map[str]bool) {
+  if n == nil { return }
+  if n.kind == "FuncLit" {
+    if n.fn_ != nil { walk_declared(n.fn_, names) }
+    return
+  }
+  for _, k := range []*ast.Node{n.value, n.expr, n.left, n.right, n.arg, n.cond, n.obj, n.index, n.lo, n.hi, n.key, n.call, n.fn_, n.from_, n.to_, n.subject} {
+    if k != nil && k.kind == "FuncLit" { walk_declared(k, names) } else { walk_literals(k, names) }
+  }
+  for _, xs := range [][]*ast.Node{n.args, n.values, n.exprs, n.elems, n.targets} {
+    for _, x := range xs {
+      if x != nil && x.kind == "FuncLit" { walk_declared(x, names) } else { walk_literals(x, names) }
+    }
+  }
+  for _, f := range n.fields { walk_literals(f.value, names) }
 }
 
 fn (l: *Linker) load(name: str, from_: *ast.Node) {
